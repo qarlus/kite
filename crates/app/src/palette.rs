@@ -2,6 +2,7 @@
 use crate::app::{Kite, Overlay};
 use crate::keys::{self, Cmd};
 use crate::list::{keys_pills, overlay};
+use crate::theme::{RADIUS, RADIUS_SM};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
@@ -132,7 +133,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .justify_between()
                     .h(px(36.))
                     .px_3()
-                    .rounded(px(8.))
+                    .rounded(px(RADIUS_SM))
                     .when(selected, |d| d.bg(t.sel))
                     .when(!selected, |d| {
                         d.text_color(t.fg2).hover(|s| s.bg(t.bg3).text_color(t.fg))
@@ -144,16 +145,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             .child(cmd.title),
                     )
                     .when(selected, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .top_0()
-                                .w(px(2.))
-                                .h_full()
-                                .rounded_full()
-                                .bg(t.accent),
-                        )
+                        // DESIGN › Layout: the selected row glows accent on its left edge.
+                        d.child(crate::list::selection_edge(&t))
                     })
                     .child(keys_pills(&t, cmd.keys[0]))
                     .into_any_element(),
@@ -169,11 +162,10 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
             .test_support()
             .aria_label("Command palette")
             .w(px(600.))
-            .rounded(px(12.))
+            .rounded(px(RADIUS))
             .bg(t.bg2)
             .shadow(vec![
-                BoxShadow::new(px(0.), px(20.), crate::theme::Theme::alpha(t.bg, 0.65))
-                    .blur_radius(px(60.)),
+                BoxShadow::new(px(0.), px(20.), crate::theme::SHADOW.into()).blur_radius(px(60.)),
             ])
             .p_2()
             .flex()

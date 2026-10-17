@@ -1,6 +1,7 @@
 //! Account-scoped folder creation and moving the current selection.
 use crate::app::{Kite, Overlay};
 use crate::list::{keys_pills, overlay};
+use crate::theme::{RADIUS, RADIUS_SM};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -200,7 +201,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         .max_h(window.viewport_size().height * 0.78)
         .overflow_y_scroll()
         .bg(t.bg2)
-        .rounded(px(12.))
+        .rounded(px(RADIUS))
         .p_4()
         .flex()
         .flex_col()
@@ -209,8 +210,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         Overlay::Move(dialog) => {
             panel = panel.aria_label("Move to folder").child(
                 div()
-                    .text_size(t.px(16.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_size(t.px(15.))
+                    .font_weight(FontWeight(650.))
                     .child("Move to folder"),
             );
             let visible = ((window.viewport_size().height.as_f32() * 0.82 - 170.) / 48.)
@@ -224,13 +225,17 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         .test_support()
                         .aria_label(name.clone())
                         .aria_selected(dialog.selected == index)
+                        .relative()
                         .flex()
                         .items_center()
                         .h(px(36.))
                         .px_3()
-                        .rounded(px(6.))
+                        .rounded(px(RADIUS_SM))
                         .cursor_pointer()
                         .when(dialog.selected == index, |d| d.bg(t.sel))
+                        .when(dialog.selected == index, |d| {
+                            d.child(crate::list::selection_edge(&t))
+                        })
                         .hover(|s| s.bg(t.bg3))
                         .child(name.clone())
                         .on_click(cx.listener(move |this, _, _, cx| this.confirm_move(index, cx))),
@@ -304,8 +309,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                 .aria_label("New folder")
                 .child(
                     div()
-                        .text_size(t.px(16.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(t.px(15.))
+                        .font_weight(FontWeight(650.))
                         .child("New folder"),
                 )
                 .child(

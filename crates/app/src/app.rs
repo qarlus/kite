@@ -3,7 +3,7 @@
 //! Optimistic actions mutate local state and repaint *before* the engine is told,
 //! so every keystroke paints from local state on the same frame.
 use crate::keys::{self, Act, GO_MAILBOXES, cmd};
-use crate::theme::{self, BAR_H, MAX_COL, Theme};
+use crate::theme::{self, BAR_H, MAX_COL, RADIUS_SM, Theme};
 use crate::{folders, palette, snooze, thread};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -71,6 +71,8 @@ pub struct Tab {
 pub(crate) struct Toast {
     text: String,
     seq: u64,
+    /// A completed state change, which gets the DESIGN › Icons draw acknowledgement.
+    mark: bool,
 }
 
 pub struct Open {
@@ -350,12 +352,13 @@ impl Kite {
     }
 
     pub(crate) fn toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_toast(text.into(), false, cx);
+    }
+
+    fn show_toast(&mut self, text: String, mark: bool, cx: &mut Context<Self>) {
         self.seq += 1;
         let seq = self.seq;
-        self.toast = Some(Toast {
-            text: text.into(),
-            seq,
-        });
+        self.toast = Some(Toast { text, seq, mark });
         let timer = cx.background_executor().timer(Duration::from_secs(4));
         cx.spawn(async move |this, cx| {
             timer.await;
@@ -492,7 +495,8 @@ impl Kite {
                 return;
             }
         }
-        self.toast(text, cx);
+        let mark = matches!(action, MailAction::Archive);
+        self.show_toast(text.into(), mark, cx);
     }
 
     fn star(&mut self, cx: &mut Context<Self>) {
@@ -860,7 +864,7 @@ impl Kite {
 
     // ---- view --------------------------------------------------------------------
 
-    /// A toolbar icon that plays its DESIGN › Icons animation when its action runs.
+    /// A toolbar icon that plays its DESIGN › Icons animation when its action runs or on hover.
     pub(crate) fn action_icon(
         &self,
         cmd: u8,
@@ -871,26 +875,28 @@ impl Kite {
         let t = self.theme;
         let pulse = self.pulse.filter(|(c, _)| *c == cmd).map(|(_, seq)| seq);
         let base = Icon::new(icon).with_size(px(16.)).text_color(t.fg2);
-        // A fresh element id per (action, run) restarts the animation each time.
-        let key = cmd as usize * 64 + (pulse.unwrap_or(0) % 64) as usize;
+        // A fresh element id per run restarts the one-shot animation.
         let glyph = match pulse {
-            Some(_) => base
+            Some(seq) => base
                 .with_animation(
-                    ("icon", key),
+                    ("icon", seq as usize),
                     Animation::new(Duration::from_millis(220)).with_easing(ease_out_quint()),
                     move |icon, delta| {
+                        // 0 at both ends, 1 in the middle: one out-and-back pass.
                         let swing = 1. - (2. * delta - 1.).abs();
                         match cmd {
-                            cmd::DONE => icon.transform(Transformation::translate(point(
-                                px(0.),
-                                px(2. * swing),
-                            ))),
+                            // wiggle: ±12°, twice.
                             cmd::SNOOZE => icon.transform(Transformation::rotate(radians(
                                 (delta * std::f32::consts::TAU * 2.).sin() * 0.21,
                             ))),
-                            _ => icon.transform(Transformation::scale(size(
+                            cmd::STAR => icon.transform(Transformation::scale(size(
                                 1. + 0.18 * swing,
                                 1. + 0.18 * swing,
+                            ))),
+                            // nudge down: archive, and the folder move that shares its direction.
+                            _ => icon.transform(Transformation::translate(point(
+                                px(0.),
+                                px(2. * swing),
                             ))),
                         }
                     },
@@ -906,9 +912,16 @@ impl Kite {
             .items_center()
             .justify_center()
             .size(px(30.))
-            .rounded(px(6.))
+            .rounded(px(RADIUS_SM))
             .cursor_pointer()
             .hover(|s| s.bg(t.bg3))
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.seq += 1;
+                    this.pulse = Some((cmd, this.seq));
+                    cx.notify();
+                }
+            }))
             .on_click(cx.listener(move |this, _, window, cx| this.run(cmd, window, cx)))
             .child(glyph)
             .into_any_element()
@@ -941,7 +954,7 @@ impl Kite {
                     .cursor_pointer()
                     .text_size(t.px(13.))
                     .font_weight(if selected {
-                        FontWeight::SEMIBOLD
+                        FontWeight(650.)
                     } else {
                         FontWeight::MEDIUM
                     })
@@ -958,7 +971,7 @@ impl Kite {
                                 .right_3()
                                 .h(px(2.))
                                 .rounded_full()
-                                .bg(t.accent),
+                                .bg(theme::accent_glow(&t)),
                         )
                     })
                     .into_any_element()
@@ -998,7 +1011,9 @@ impl Kite {
                                 .gap_2()
                                 .px_2()
                                 .h(px(30.))
-                                .rounded(px(6.))
+                                .rounded(px(RADIUS_SM))
+                                .border_2()
+                                .border_color(Theme::alpha(t.accent, if focused { 1. } else { 0. }))
                                 .when(focused, |d| d.bg(t.bg3))
                                 .child(
                                     Icon::new(IconName::Search)
@@ -1032,7 +1047,7 @@ impl Kite {
                                 .justify_center()
                                 .h(px(30.))
                                 .px_2()
-                                .rounded(px(6.))
+                                .rounded(px(RADIUS_SM))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(t.bg3))
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -1073,7 +1088,7 @@ impl Kite {
             } else if self.accounts.is_empty() {
                 "No accounts connected"
             } else {
-                "All accounts"
+                "All inboxes"
             }
         });
         let count = self.rows.len();
@@ -1240,26 +1255,60 @@ impl Kite {
                 .flex()
                 .justify_center()
                 .child(
+                    // DESIGN › Icons: `draw` acknowledges a completed action as the toast appears.
                     div()
-                        .id("toast")
-                        .test_support()
-                        .aria_label(toast.text.clone())
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_full()
-                        .bg(t.bg2)
-                        .border_1()
-                        .border_color(t.line)
-                        .text_size(t.px(13.))
-                        .child(toast.text.clone())
-                        .when_some(
-                            Kbd::binding_for_action(&Act { cmd: cmd::UNDO }, Some("Kite"), window),
-                            |d, hint| d.child(hint.outline()),
+                        .with_animation(
+                            ("toast-in", toast.seq as usize),
+                            Animation::new(Duration::from_millis(180))
+                                .with_easing(ease_out_quint()),
+                            |toast, delta| toast.opacity(delta),
                         )
-                        .child(div().text_color(t.fg3).child("to undo")),
+                        .child(
+                            div()
+                                .id("toast")
+                                .test_support()
+                                .aria_label(toast.text.clone())
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .rounded_full()
+                                .bg(t.bg2)
+                                .border_1()
+                                .border_color(t.line)
+                                .text_size(t.px(13.))
+                                .when(toast.mark, |d| {
+                                    d.child(
+                                        Icon::new(IconName::Check)
+                                            .with_size(px(13.))
+                                            .text_color(t.ok)
+                                            .with_animation(
+                                                ("toast-mark", toast.seq as usize),
+                                                Animation::new(Duration::from_millis(220))
+                                                    .with_easing(ease_out_quint()),
+                                                |icon, delta| {
+                                                    icon.opacity(delta).transform(
+                                                        Transformation::scale(size(
+                                                            0.8 + 0.2 * delta,
+                                                            0.8 + 0.2 * delta,
+                                                        )),
+                                                    )
+                                                },
+                                            ),
+                                    )
+                                })
+                                .child(toast.text.clone())
+                                .when_some(
+                                    Kbd::binding_for_action(
+                                        &Act { cmd: cmd::UNDO },
+                                        Some("Kite"),
+                                        window,
+                                    ),
+                                    |d, hint| d.child(hint.outline()),
+                                )
+                                .child(div().text_color(t.fg3).child("to undo")),
+                        ),
                 )
                 .into_any_element(),
         )

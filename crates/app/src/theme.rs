@@ -1,6 +1,8 @@
 //! Design tokens from docs/DESIGN.md. The only place colours and sizes are defined.
 use gpui_kit::component::{ActiveTheme as _, Theme as UiTheme, ThemeMode};
-use gpui_kit::{App, Hsla, Rgba, WindowAppearance, px};
+use gpui_kit::{
+    App, Background, Hsla, Rgba, WindowAppearance, linear_color_stop, linear_gradient, px,
+};
 
 #[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
@@ -56,6 +58,11 @@ pub const PAPER: Theme = Theme {
 
 pub const ROW_H: f32 = 44.;
 pub const BAR_H: f32 = 44.;
+/// DESIGN › Tokens: the only two corner radii.
+pub const RADIUS: f32 = 10.;
+pub const RADIUS_SM: f32 = 6.;
+/// DESIGN › Layout: `#0008`, the shadow cast by floating panels in both appearances.
+pub const SHADOW: Rgba = rgba_const(0x00000088);
 /// Content column width for the thread view.
 pub const MAX_COL: f32 = 760.;
 #[cfg(target_os = "windows")]
@@ -134,6 +141,15 @@ impl Theme {
         h.a = a;
         h
     }
+}
+
+/// The Kite accent glow: the violet→sky gradient, reserved for focus and selection.
+pub fn accent_glow(t: &Theme) -> Background {
+    linear_gradient(
+        180.,
+        linear_color_stop(t.accent, 0.),
+        linear_color_stop(t.accent2, 1.),
+    )
 }
 
 /// The palette is owned by the view so imported themes need no leaked allocations.

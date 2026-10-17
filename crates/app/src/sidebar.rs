@@ -1,6 +1,6 @@
 //! Persistent account scope and mailbox navigation.
 use crate::app::Kite;
-use crate::theme::Theme;
+use crate::theme::{RADIUS, RADIUS_SM, Theme};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
@@ -135,7 +135,7 @@ impl Render for Sidebar {
                             .px_3()
                             .pb_3()
                             .text_size(t.px(10.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight::MEDIUM)
                             .text_color(t.fg3)
                             .child("MAIL"),
                     )
@@ -155,11 +155,11 @@ impl Render for Sidebar {
                             .h(px(36.))
                             .px_3()
                             .flex_shrink_0()
-                            .rounded(px(7.))
+                            .rounded(px(RADIUS_SM))
                             .cursor_pointer()
                             .text_size(t.px(13.))
                             .text_color(if selected { t.fg } else { t.fg2 })
-                            .when(selected, |d| d.bg(t.sel).font_weight(FontWeight::SEMIBOLD))
+                            .when(selected, |d| d.bg(t.sel).font_weight(FontWeight(650.)))
                             .when(!selected, |d| d.hover(|s| s.bg(t.bg3).text_color(t.fg)))
                             .child(Icon::new(*icon).with_size(px(16.)))
                             .child(*name)
@@ -232,7 +232,7 @@ impl Render for Sidebar {
                                     .flex_col()
                                     .px_3()
                                     .py_2()
-                                    .rounded(px(7.))
+                                    .rounded(px(RADIUS_SM))
                                     .cursor_pointer()
                                     .when(selected, |d| d.bg(t.sel))
                                     .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
@@ -279,7 +279,7 @@ impl Render for Sidebar {
                             .gap_3()
                             .px_3()
                             .h(px(36.))
-                            .rounded(px(7.))
+                            .rounded(px(RADIUS_SM))
                             .cursor_pointer()
                             .text_size(t.px(13.))
                             .text_color(t.fg2)
@@ -336,7 +336,7 @@ impl Sidebar {
             .px_2()
             .py_3()
             .mt_1()
-            .rounded(px(8.))
+            .rounded(px(RADIUS_SM))
             .cursor_pointer()
             .hover(|s| s.bg(t.bg3))
             .child(if account.is_none() && self.accounts.len() > 1 {
@@ -380,7 +380,7 @@ impl Sidebar {
                         div()
                             .truncate()
                             .text_size(t.px(12.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight(650.))
                             .child(title.to_string()),
                     )
                     .child(
@@ -428,7 +428,7 @@ fn avatar(name: &str, theme: Theme) -> Div {
         .items_center()
         .justify_center()
         .text_size(theme.px(11.))
-        .font_weight(FontWeight::SEMIBOLD)
+        .font_weight(FontWeight(650.))
         .child(initials)
 }
 
@@ -459,7 +459,7 @@ pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
         .bg(t.bg2)
         .border_1()
         .border_color(t.line)
-        .rounded(px(12.))
+        .rounded(px(RADIUS))
         .shadow_lg()
         .occlude()
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
@@ -487,7 +487,7 @@ pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
                 .gap_3()
                 .px_3()
                 .py_3()
-                .rounded(px(7.))
+                .rounded(px(RADIUS_SM))
                 .cursor_pointer()
                 .when(selected == index, |d| d.bg(t.sel))
                 .hover(|s| s.bg(t.bg3))

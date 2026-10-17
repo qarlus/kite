@@ -124,7 +124,7 @@ fn moving_to_a_custom_folder_and_undoing_changes_the_visible_mail(cx: &mut TestA
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(window.find("inbox-zero").label(), Some("No conversations"));
+        assert_eq!(window.find("inbox-zero").label(), Some("Work is empty"));
         window.click(("mailbox", Mailbox::Inbox as usize), cx);
     })
     .unwrap();

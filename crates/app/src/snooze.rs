@@ -1,6 +1,7 @@
 //! Snooze picker: four presets and a tiny natural-language parser.
 use crate::app::{Kite, Overlay};
 use crate::list::overlay;
+use crate::theme::{RADIUS, RADIUS_SM};
 use chrono::{DateTime, Datelike as _, Duration, Local, NaiveTime, TimeZone as _, Timelike as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -199,7 +200,7 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
         .test_support()
         .aria_label("Snooze")
         .w(px(340.))
-        .rounded(px(12.))
+        .rounded(px(RADIUS))
         .bg(t.bg2)
         .border_1()
         .border_color(t.line)
@@ -233,11 +234,13 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .flex()
                 .items_center()
                 .justify_between()
+                .relative()
                 .h(px(32.))
                 .px_3()
-                .rounded(px(8.))
+                .rounded(px(RADIUS_SM))
                 .text_size(t.px(13.))
                 .when(selected, |d| d.bg(t.sel))
+                .when(selected, |d| d.child(crate::list::selection_edge(&t)))
                 .child(*name)
                 .child(
                     div()
