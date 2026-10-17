@@ -120,11 +120,13 @@ INSERT INTO splits(id, name, query, position) VALUES (2, 'Other', '-is:important
 "#;
 
 /// Schema v2 adds the custom folder catalog and the index that makes a `View::folder` lookup one
-/// indexed query. `IF NOT EXISTS` keeps this safe for databases created before the catalog existed.
+/// indexed query. Folder identities are account-scoped, so two accounts may own the same provider
+/// folder id. `IF NOT EXISTS` keeps this safe for databases created before the catalog existed.
 const SCHEMA_V2: &str = r#"
 CREATE TABLE IF NOT EXISTS folders (
-  id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
-  name TEXT NOT NULL, created INTEGER NOT NULL
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  id TEXT NOT NULL, name TEXT NOT NULL, created INTEGER NOT NULL,
+  PRIMARY KEY (account_id, id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS folders_account_name ON folders(account_id, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder);
@@ -291,20 +293,9 @@ impl Store {
         if taken {
             bail!("folder {name:?} already exists in account {account}");
         }
-        // A provider identity is unique in the catalog; a different account owning it must fail
-        // loudly rather than silently reassigning the folder.
-        if let Some(owner) = tx
-            .query_row("SELECT account_id FROM folders WHERE id=?1", [id], |r| {
-                r.get::<_, Id>(0)
-            })
-            .optional()?
-            && owner != account
-        {
-            bail!("folder id {id:?} already belongs to account {owner}");
-        }
         tx.execute(
-            "INSERT INTO folders(id, account_id, name, created) VALUES (?1,?2,?3,?4)",
-            params![id, account, name, now_ms()],
+            "INSERT INTO folders(account_id, id, name, created) VALUES (?1,?2,?3,?4)",
+            params![account, id, name, now_ms()],
         )?;
         tx.commit()?;
         Ok(Folder {
@@ -314,13 +305,12 @@ impl Store {
         })
     }
 
-    pub fn folder_owner(&self, folder: &str) -> Result<Option<Id>> {
-        Ok(self
-            .conn
-            .query_row("SELECT account_id FROM folders WHERE id=?1", [folder], |r| {
-                r.get(0)
-            })
-            .optional()?)
+    pub fn folder_exists(&self, account: Id, folder: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=?1 AND id=?2)",
+            params![account, folder],
+            |r| r.get(0),
+        )?)
     }
 }
 
@@ -766,23 +756,15 @@ impl Store {
         let mut ps: Vec<Value> = Vec::new();
         match &view.folder {
             // A folder belongs to exactly one account and supersedes the standard mailbox filter.
+            // `View.folder` is always paired with an account (see docs/ARCHITECTURE.md).
             Some(folder) => {
+                let Some(account) = view.account_id else {
+                    bail!("a folder view requires an account_id");
+                };
+                conds.push("t.account_id=?".into());
+                ps.push(Value::Integer(account));
                 conds.push(FOLDER_IN.into());
                 ps.push(Value::Text(folder.clone()));
-                match view.account_id {
-                    Some(a) => {
-                        conds.push("t.account_id=?".into());
-                        ps.push(Value::Integer(a));
-                    }
-                    // No explicit account: the folder's owner decides. An unknown folder matches
-                    // nothing, because `account_id = NULL` is never true.
-                    None => {
-                        conds.push(
-                            "t.account_id=(SELECT account_id FROM folders WHERE id=?)".into(),
-                        );
-                        ps.push(Value::Text(folder.clone()));
-                    }
-                }
             }
             None => {
                 conds.push(mailbox_cond(view.mailbox).to_string());
@@ -958,15 +940,15 @@ impl Store {
             let Some(account_id) = account_id else {
                 continue;
             };
-            // Moving into a folder that belongs to another account is a caller bug: reject it
+            // Moving into a folder the message's account does not own is a caller bug: reject it
             // before anything local changes. Dropping `tx` rolls back the whole action.
             if let Action::Move { folder } = action {
-                let owner: Option<Id> = tx
-                    .query_row("SELECT account_id FROM folders WHERE id=?1", [folder], |r| {
-                        r.get(0)
-                    })
-                    .optional()?;
-                if owner != Some(account_id) {
+                let owned: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=?1 AND id=?2)",
+                    params![account_id, folder],
+                    |r| r.get(0),
+                )?;
+                if !owned {
                     bail!("folder {folder:?} does not belong to account {account_id}");
                 }
             }
