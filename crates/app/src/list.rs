@@ -99,7 +99,7 @@ impl Kite {
         } else if self.accounts.is_empty() {
             (
                 "Welcome to Kite".to_string(),
-                "Sign-in isn't available in this build yet, so nothing has synced.",
+                "Connect Proton Bridge or Outlook to start syncing your mail.",
             )
         } else {
             match self.view.mailbox {

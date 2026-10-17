@@ -45,7 +45,7 @@ fn an_unconnected_app_does_not_claim_the_inbox_is_cleared(cx: &mut TestAppContex
         assert_eq!(window.find("inbox-zero").label(), Some("Welcome to Kite"));
         assert_eq!(
             window.find("empty-note").label(),
-            Some("Sign-in isn't available in this build yet, so nothing has synced.")
+            Some("Connect Proton Bridge or Outlook to start syncing your mail.")
         );
     })
     .unwrap();
