@@ -27,12 +27,25 @@ pub struct Rendered {
 
 /// Lays out and rasterises `html` at `width` logical px. `scale` is the window's DPI scale.
 pub fn render(html: &str, width: f32, scale: f32, dark: bool) -> Rendered {
-    // Defaults only: mail that sets its own colours keeps them.
-    let base = if dark {
-        "<style>html{background:#15161c;color:#e9e9ee;font-family:system-ui,sans-serif;font-size:15px}a{color:#8b7cff}</style>"
-    } else {
-        "<style>html{background:#fff;color:#16171d;font-family:system-ui,sans-serif;font-size:15px}a{color:#6b5bff}</style>"
-    };
+    render_styled(html, width, scale, *crate::theme::pick(dark), "system-ui")
+}
+
+pub fn render_styled(
+    html: &str,
+    width: f32,
+    scale: f32,
+    theme: crate::theme::Theme,
+    font: &str,
+) -> Rendered {
+    // Font family is validated before preferences reach the renderer.
+    let base = format!(
+        "<style>html{{background:{};color:{};font-family:'{}',sans-serif;font-size:{}px}}a{{color:{}}}</style>",
+        crate::theme::hex(theme.bg2),
+        crate::theme::hex(theme.fg),
+        font,
+        15. * theme.scale,
+        crate::theme::hex(theme.accent)
+    );
     let pw = (width * scale).ceil() as u32;
     let mut doc = HtmlDocument::from_html(
         &format!("{base}{html}"),
@@ -40,7 +53,7 @@ pub fn render(html: &str, width: f32, scale: f32, dark: bool) -> Rendered {
             viewport: Some(Viewport {
                 window_size: (pw, 1),
                 hidpi_scale: scale,
-                color_scheme: if dark {
+                color_scheme: if theme.dark {
                     ColorScheme::Dark
                 } else {
                     ColorScheme::Light

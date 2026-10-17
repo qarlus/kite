@@ -9,17 +9,23 @@ use kite_core::model::{
 };
 use std::sync::Arc;
 
-struct Empty;
+struct Empty {
+    settings_path: std::path::PathBuf,
+}
 
 impl Mail for Empty {
     fn accounts(&self) -> anyhow::Result<Vec<Account>> {
         Ok(Vec::new())
     }
     fn add_proton(&self, _: ProtonLogin) -> anyhow::Result<Account> {
-        anyhow::bail!("no engine yet")
+        anyhow::bail!(
+            "Account connection requires the mail engine, which is not connected in this build."
+        )
     }
     fn add_microsoft(&self) -> anyhow::Result<Account> {
-        anyhow::bail!("no engine yet")
+        anyhow::bail!(
+            "Account connection requires the mail engine, which is not connected in this build."
+        )
     }
     fn remove_account(&self, _: Id) -> anyhow::Result<()> {
         Ok(())
@@ -55,10 +61,10 @@ impl Mail for Empty {
         Ok(())
     }
     fn settings(&self) -> anyhow::Result<Settings> {
-        Ok(Settings::default())
+        kite::preferences::read_settings(&self.settings_path)
     }
-    fn set_settings(&self, _: Settings) -> anyhow::Result<()> {
-        Ok(())
+    fn set_settings(&self, settings: Settings) -> anyhow::Result<()> {
+        kite::preferences::write_settings(&self.settings_path, &settings)
     }
     fn set_ai_key(&self, _: &str) -> anyhow::Result<()> {
         Ok(())
@@ -78,18 +84,38 @@ impl Mail for Empty {
 }
 
 fn main() {
-    gpui_kit::application().with_assets(kite::Assets).run(|cx| {
-        gpui_kit::init(cx);
-        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-        gpui_kit::open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(720.), px(480.))),
-                ..TitleBar::window_options()
-            },
-            cx,
-            |window, cx| cx.new(|cx| kite::app::Kite::new(Arc::new(Empty), window, cx)),
-        )
-        .expect("failed to open window");
-    });
+    let directory = std::env::var_os("APPDATA")
+        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Kite");
+    gpui_kit::application()
+        .with_assets(kite::Assets)
+        .run(move |cx| {
+            gpui_kit::init(cx);
+            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(size(px(720.), px(480.))),
+                    ..TitleBar::window_options()
+                },
+                cx,
+                |window, cx| {
+                    cx.new(|cx| {
+                        kite::app::Kite::new(
+                            Arc::new(Empty {
+                                settings_path: directory.join("settings.json"),
+                            }),
+                            window,
+                            cx,
+                        )
+                    })
+                },
+            )
+            .expect("failed to open window");
+        });
 }

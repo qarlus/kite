@@ -6,7 +6,7 @@ The north star is Superhuman: calm, dense but airy, typographic, and keyboard-le
 1. **Content is the UI.** No visible borders where spacing can do the job. No icons where a word or a shortcut hint is clearer.
 2. **Teach shortcuts in place.** Every hover/tooltip/palette row shows its key in a `<kbd>` pill.
 3. **Instant, then animated.** State changes paint on the same frame. Motion is decorative only (≤ 140 ms, `cubic-bezier(.2,.8,.2,1)`), never blocks input, and is disabled under `prefers-reduced-motion`.
-4. **Two themes, both first-class.** `dark` is the default ("Carbon"), and `light` is "Paper". The theme follows the OS unless overridden.
+4. **Light and dark, equally considered.** Carbon and Paper are joined by Midnight and Linen. Match system follows OS appearance; imported palettes and typography are applied throughout the native client.
 
 ## Tokens (`crates/app/src/theme.rs`: `CARBON` dark / `PAPER` light)
 ```
@@ -29,7 +29,7 @@ mono:        "SF Mono" / "Cascadia Code"
 Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread subject · 24 mailbox heading · 28 empty-state. Weights: 400 / 500 / 650. Letter-spacing −0.01em at ≥ 15px. No fonts are bundled, which keeps the binary small.
 
 ## Layout
-- **Persistent sidebar:** 216px wide, or 180px below a 900px window. Account choices precede the standard mailboxes; custom folders and New folder follow. The sidebar remains present while reading. Active account uses `bg3`, active mailbox/folder uses `sel`, with quiet Lucide icons and no invented unread totals. The whole sidebar scrolls in short windows.
+- **Persistent sidebar:** 216px wide, or 180px below a 900px window. Mailboxes start at the top; custom folders and New folder follow. Settings and an avatar/email account switcher are anchored at the bottom. Only the folder/navigation region scrolls, so account selection stays reachable in short windows. The sidebar remains present while reading. Active account uses `bg3`, active mailbox/folder uses `sel`, with quiet Lucide icons and no invented unread totals. The switcher opens an anchored account menu with All inboxes, individual accounts and Manage accounts.
 - **Chrome:** the 44px titlebar contains the quiet Kite wordmark, split tabs with a 2px accent underline, search, and the command shortcut. Mail actions live beside the mailbox heading instead of crowding the titlebar. The mailbox header uses 32px horizontal / 24px vertical padding, with the account identity beneath the heading. A 38px footer teaches navigation, opening, and archive shortcuts and opens keyboard help.
 - **List row:** grid `[sender 180px] [subject + snippet 1fr] [labels auto] [time 64px]`, inset 20px from the content pane edges. The sender narrows to 112px when the content pane is below 700px. Combined views show the owning account beneath the sender. A separate selection target avoids opening the conversation when multi-selecting. The subject is `fg` and the snippet is `fg2`, on one line with an ellipsis. Snippets shrink before the fixed timestamp column; unread subjects have medium weight. Hovering shows inline action hints (`e` done · `h` remind) in place of the time. A star is visible beside starred conversations.
 - **Thread view** replaces the list (it does not split). The content column is max 760px and centred in the space remaining beside the sidebar. HTML layout and prefetch widths subtract the sidebar, content margins and card padding. The subject is 20px/650. Expanded message cards show full From/To/Cc addresses, date and time with UTC offset, a differing per-message subject, and attachment controls. Each card has the sender and body: the HTML part rendered by Blitz (`html.rs`) with our theme defaults injected, or the plain text part as GPUI text with clickable links. The reply box is docked at the bottom and expands on `r`.
@@ -38,7 +38,7 @@ Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread su
 - The palette shows at most nine commands and keeps the keyboard selection visible as it advances. Commands work by click as well as keyboard; the footer shows navigation and execution hints. Empty searches say “No matching commands.”
 - **Toasts** (gpui-component notifications, restyled) appear bottom-centre, pill shaped, e.g. "Marked done · **z** to undo". They auto-dismiss after 4 s.
 - **Calendar sidebar** is 280px on the right, with an hour grid for today and event blocks tinted with `accent` at 18%.
-- **Empty inbox:** a full-bleed gradient wash (`accent`→`accent2` at 12% opacity), large "Inbox Zero" text and a single line of copy. No illustrations.
+- **Empty folders:** use the exact mailbox background, never a separate gradient. A quiet mailbox icon, 24px heading and one line of context sit in the centre; Inbox Zero remains specific to an empty inbox.
 - Empty non-inbox views name the relevant mailbox instead of claiming Inbox Zero. With no accounts, show “Welcome to Kite” and the current account-connection limitation; do not imply mail has synced.
 
 ## Icons (Lucide, animated)
@@ -60,3 +60,9 @@ Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread su
 Use visible focus rings (accent, 2px), with all actions reachable by keyboard. Contrast is ≥ 4.5:1 for `fg2` on `bg`. Every interactive element gets `.id(..).test_support().aria_label(..)`, which also feeds native accessibility.
 
 Folder dialogs use a 400px panel with an account choice, native text input, inline validation and a busy state. The dimmed overlay blocks clicks to the inbox. Move destinations are paged to fit the window, with Previous/More controls and arrow-key selection; mixed-account selections explain why custom folders are unavailable.
+
+## Settings
+
+Settings replaces the mail pane and keeps the sidebar. Appearance, Accounts and General are quiet horizontal tabs; the mail search, actions and shortcut footer are hidden. The page is centred at a maximum 820px, with 48px padding on wide windows and 24px in compact windows. Theme tiles use miniature native inbox previews: four across on wide windows, two across on compact windows. Typography has a live preview, 12–18px base size, installed font-family input and optional hex text colour. A contrast failure never replaces the applied appearance. Save/import feedback stays outside the scrolling form, visible at the bottom.
+
+Accounts show provider and full email with confirmed removal. Provider sign-in runs in the background. Bridge password entry is masked, cleared after an attempt, and never stored in appearance settings. General exposes the shortcut footer preference and the engine's undo-send window. Settings and account switching remain cached away from ordinary list navigation.

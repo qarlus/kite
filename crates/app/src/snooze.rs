@@ -214,7 +214,7 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .gap_2()
                 .h(px(36.))
                 .px_3()
-                .text_size(px(14.))
+                .text_size(t.px(14.))
                 .text_color(if snooze.buf.is_empty() { t.fg3 } else { t.fg })
                 .child(if snooze.buf.is_empty() {
                     "Later today, tomorrow 9am, fri 14:00…".to_string()
@@ -236,10 +236,15 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .h(px(32.))
                 .px_3()
                 .rounded(px(8.))
-                .text_size(px(13.))
+                .text_size(t.px(13.))
                 .when(selected, |d| d.bg(t.sel))
                 .child(*name)
-                .child(div().text_size(px(12.)).text_color(t.fg3).child(label(*ms))),
+                .child(
+                    div()
+                        .text_size(t.px(12.))
+                        .text_color(t.fg3)
+                        .child(label(*ms)),
+                ),
         );
     }
     if let Some(when) = parsed {
@@ -247,12 +252,12 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
             div()
                 .px_3()
                 .py_1()
-                .text_size(px(12.))
+                .text_size(t.px(12.))
                 .text_color(t.fg3)
                 .child(format!("Snooze until {}", label(when.timestamp_millis()))),
         );
     }
-    overlay(t, window.viewport_size().height * 0.3, false, panel).into_any_element()
+    overlay(&t, window.viewport_size().height * 0.3, false, panel).into_any_element()
 }
 
 fn label(ms: Ms) -> String {

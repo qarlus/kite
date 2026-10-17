@@ -4,6 +4,7 @@ pub mod html;
 pub mod keys;
 pub mod list;
 pub mod palette;
+pub mod preferences;
 pub mod sidebar;
 pub mod snooze;
 pub mod theme;
@@ -21,7 +22,9 @@ gpui_kit::assets::icon_assets!(
         Trash,
         Mails,
         FolderInput,
-        Paperclip
+        Paperclip,
+        Settings,
+        ChevronsUpDown
     ]
 );
 

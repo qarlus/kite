@@ -88,13 +88,17 @@ pub enum Overlay {
     Snooze(snooze::Snooze),
     Move(folders::MoveDialog),
     CreateFolder(folders::CreateDialog),
+    Accounts(usize),
 }
 
 pub struct Kite {
     pub(crate) mail: Arc<dyn Mail>,
-    pub(crate) theme: &'static Theme,
+    pub(crate) theme: Theme,
     pub(crate) dark: bool,
     pub(crate) settings: Settings,
+    pub(crate) preferences: Option<crate::preferences::Preferences>,
+    pub(crate) appearance_version: u64,
+    pub(crate) account_busy: bool,
     pub(crate) accounts: Vec<Account>,
     pub(crate) folders: Vec<Folder>,
     sidebar: Option<Entity<crate::sidebar::Sidebar>>,
@@ -151,9 +155,13 @@ impl Kite {
 
     pub fn new(mail: Arc<dyn Mail>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         keys::bind(cx);
-        let settings = mail.settings().unwrap_or_default();
-        let dark = theme::wants_dark(&settings.theme, window.appearance());
-        theme::install(theme::pick(dark), cx);
+        let mut settings = mail.settings().unwrap_or_default();
+        let appearance = theme::resolve(&settings, window.appearance()).unwrap_or_else(|_| {
+            settings = Settings::default();
+            *theme::pick(theme::wants_dark("system", window.appearance()))
+        });
+        let dark = appearance.dark;
+        theme::install(&appearance, theme::font(&settings), cx);
         // Escape clears the field; the resulting empty value leaves search mode.
         let search = cx.new(|cx| {
             InputState::new(window, cx)
@@ -176,9 +184,12 @@ impl Kite {
         }
         let mut this = Self {
             mail,
-            theme: theme::pick(dark),
+            theme: appearance,
             dark,
             settings,
+            preferences: None,
+            appearance_version: 0,
+            account_busy: false,
             accounts: Vec::new(),
             folders: Vec::new(),
             sidebar: None,
@@ -562,6 +573,29 @@ impl Kite {
         if matches!(self.overlay, Overlay::Snooze(_)) && id != cmd::BACK {
             return;
         }
+        if id == cmd::MANAGE_ACCOUNTS {
+            self.show_preferences(1, window, cx);
+            return;
+        }
+        if id == cmd::SETTINGS {
+            self.show_preferences(0, window, cx);
+            return;
+        }
+        if id == cmd::ACCOUNT_SWITCHER {
+            self.overlay = Overlay::Accounts(0);
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        if self.preferences.is_some() {
+            if id == cmd::BACK {
+                self.preferences = None;
+                self.sidebar_dirty = true;
+                window.focus(&self.focus, cx);
+                cx.notify();
+            }
+            return;
+        }
         match id {
             cmd::NEXT => self.next(1, cx),
             cmd::PREV => self.next(-1, cx),
@@ -661,6 +695,24 @@ impl Kite {
         let typed = typed_char(event);
         match &mut self.overlay {
             Overlay::None => {}
+            Overlay::Accounts(index) => {
+                match key {
+                    "escape" => self.overlay = Overlay::None,
+                    "up" => *index = index.saturating_sub(1),
+                    "down" => *index = (*index + 1).min(self.accounts.len()),
+                    "enter" => {
+                        let account = index
+                            .checked_sub(1)
+                            .and_then(|index| self.accounts.get(index))
+                            .map(|a| a.id);
+                        self.overlay = Overlay::None;
+                        self.select_account(account, window, cx);
+                    }
+                    _ => {}
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
             Overlay::Move(dialog) => {
                 match key {
                     "escape" => self.overlay = Overlay::None,
@@ -887,7 +939,7 @@ impl Kite {
                     .h_full()
                     .px_3()
                     .cursor_pointer()
-                    .text_size(px(13.))
+                    .text_size(t.px(13.))
                     .font_weight(if selected {
                         FontWeight::SEMIBOLD
                     } else {
@@ -929,70 +981,73 @@ impl Kite {
                         div()
                             .w(px(crate::sidebar::width(window) - 24.))
                             .px_3()
-                            .text_size(px(14.))
+                            .text_size(t.px(14.))
                             .font_weight(FontWeight(650.))
                             .child("Kite"),
                     )
-                    .when(self.view.mailbox == Mailbox::Inbox, |d| {
-                        d.child(div().flex().h_full().items_center().children(tabs))
-                    })
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_2()
-                            .h(px(30.))
-                            .rounded(px(6.))
-                            .when(focused, |d| d.bg(t.bg3))
-                            .child(
-                                Icon::new(IconName::Search)
-                                    .with_size(px(14.))
-                                    .text_color(t.fg2),
-                            )
-                            .child(
-                                Input::new(&self.search)
-                                    .id("search")
-                                    .aria_label("Search")
-                                    .appearance(false)
-                                    .bordered(false)
-                                    .w(px(if focused && window.viewport_size().width >= px(900.) {
-                                        210.
-                                    } else {
-                                        120.
-                                    }))
-                                    .text_size(px(13.))
-                                    .text_color(t.fg2),
-                            ),
+                    .when(
+                        self.view.mailbox == Mailbox::Inbox && self.preferences.is_none(),
+                        |d| d.child(div().flex().h_full().items_center().children(tabs)),
                     )
-                    .child(
-                        div()
-                            .id("palette-hint")
-                            .test_support()
-                            .aria_label("Command palette")
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .h(px(30.))
-                            .px_2()
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(t.bg3))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.run(cmd::PALETTE, window, cx)
-                                }),
-                            )
-                            .when_some(
-                                Kbd::binding_for_action(
-                                    &Act { cmd: cmd::PALETTE },
-                                    Some("Kite"),
-                                    window,
+                    .child(div().flex_1())
+                    .when(self.preferences.is_none(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_2()
+                                .h(px(30.))
+                                .rounded(px(6.))
+                                .when(focused, |d| d.bg(t.bg3))
+                                .child(
+                                    Icon::new(IconName::Search)
+                                        .with_size(px(14.))
+                                        .text_color(t.fg2),
+                                )
+                                .child(
+                                    Input::new(&self.search)
+                                        .id("search")
+                                        .aria_label("Search")
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .w(px(
+                                            if focused && window.viewport_size().width >= px(900.) {
+                                                210.
+                                            } else {
+                                                120.
+                                            },
+                                        ))
+                                        .text_size(t.px(13.))
+                                        .text_color(t.fg2),
                                 ),
-                                |d, hint| d.child(hint.outline()),
-                            ),
-                    ),
+                        )
+                        .child(
+                            div()
+                                .id("palette-hint")
+                                .test_support()
+                                .aria_label("Command palette")
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .h(px(30.))
+                                .px_2()
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.bg3))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.run(cmd::PALETTE, window, cx)
+                                }))
+                                .when_some(
+                                    Kbd::binding_for_action(
+                                        &Act { cmd: cmd::PALETTE },
+                                        Some("Kite"),
+                                        window,
+                                    ),
+                                    |d, hint| d.child(hint.outline()),
+                                ),
+                        )
+                    }),
             )
     }
 
@@ -1056,13 +1111,13 @@ impl Kite {
                         div()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(24.))
+                            .text_size(t.px(24.))
                             .font_weight(FontWeight(650.))
                             .child(title.to_string()),
                     )
                     .child(
                         div()
-                            .text_size(px(12.))
+                            .text_size(t.px(12.))
                             .text_color(t.fg2)
                             .child(identity.to_string()),
                     ),
@@ -1075,7 +1130,9 @@ impl Kite {
                     .when(!self.rows.is_empty(), |d| {
                         d.when(
                             !self.multi.is_empty() || window.viewport_size().width >= px(1000.),
-                            |d| d.child(div().text_size(px(12.)).text_color(t.fg2).child(summary)),
+                            |d| {
+                                d.child(div().text_size(t.px(12.)).text_color(t.fg2).child(summary))
+                            },
                         )
                         .child(div().w(px(1.)).h(px(18.)).bg(t.line))
                         .child(
@@ -1118,7 +1175,7 @@ impl Kite {
             .px_8()
             .border_t_1()
             .border_color(t.line)
-            .text_size(px(12.))
+            .text_size(t.px(12.))
             .text_color(t.fg2)
             .child(
                 div()
@@ -1130,7 +1187,7 @@ impl Kite {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(crate::list::keys_pills(t, "j k"))
+                            .child(crate::list::keys_pills(&t, "j k"))
                             .child("Navigate"),
                     )
                     .child(
@@ -1139,7 +1196,7 @@ impl Kite {
                             .items_center()
                             .gap_2()
                             .child(crate::list::keys_pills(
-                                t,
+                                &t,
                                 if self.open.is_some() { "u" } else { "enter" },
                             ))
                             .child(if self.open.is_some() { "Back" } else { "Open" }),
@@ -1150,7 +1207,7 @@ impl Kite {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .child(crate::list::keys_pills(t, "e"))
+                                .child(crate::list::keys_pills(&t, "e"))
                                 .child("Done"),
                         )
                     }),
@@ -1167,7 +1224,7 @@ impl Kite {
                     .hover(|s| s.text_color(t.fg))
                     .on_click(cx.listener(|this, _, window, cx| this.run(cmd::HELP, window, cx)))
                     .child("Shortcuts")
-                    .child(crate::list::keys_pills(t, "shift-/")),
+                    .child(crate::list::keys_pills(&t, "shift-/")),
             )
     }
 
@@ -1196,7 +1253,7 @@ impl Kite {
                         .bg(t.bg2)
                         .border_1()
                         .border_color(t.line)
-                        .text_size(px(13.))
+                        .text_size(t.px(13.))
                         .child(toast.text.clone())
                         .when_some(
                             Kbd::binding_for_action(&Act { cmd: cmd::UNDO }, Some("Kite"), window),
@@ -1233,12 +1290,14 @@ impl Render for Kite {
             self.refocus = false;
         }
         let dark = theme::wants_dark(&self.settings.theme, window.appearance());
-        if dark != self.dark {
+        if self.settings.theme == "system" && dark != self.dark {
             self.dark = dark;
-            self.theme = theme::pick(dark);
+            self.theme =
+                theme::resolve(&self.settings, window.appearance()).unwrap_or(*theme::pick(dark));
             self.sidebar_dirty = true;
-            theme::install(self.theme, cx);
+            theme::install(&self.theme, theme::font(&self.settings), cx);
             self.html_cache.clear();
+            self.appearance_version += 1;
         }
         if self.sidebar_dirty {
             let state = crate::sidebar::Sidebar::new(self, cx.entity().downgrade());
@@ -1258,7 +1317,10 @@ impl Render for Kite {
             .max(120.);
         self.html_scale = window.scale_factor();
         let open = self.open.is_some();
-        let body = if open {
+        let preferences_open = self.preferences.is_some();
+        let body = if preferences_open {
+            crate::preferences::render(self, window, cx)
+        } else if open {
             self.render_thread(window, cx)
         } else {
             self.render_list(window, cx)
@@ -1270,8 +1332,8 @@ impl Render for Kite {
             .flex_col()
             .bg(self.theme.bg)
             .text_color(self.theme.fg)
-            .font_family(theme::FONT)
-            .text_size(px(14.))
+            .font_family(theme::font(&self.settings).to_string())
+            .text_size(self.theme.px(14.))
             .key_context("Kite")
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::action))
@@ -1295,7 +1357,9 @@ impl Render for Kite {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .when(!open, |d| d.child(self.render_inbox_header(window, cx)))
+                            .when(!open && !preferences_open, |d| {
+                                d.child(self.render_inbox_header(window, cx))
+                            })
                             .child(
                                 div()
                                     .id("body")
@@ -1304,13 +1368,21 @@ impl Render for Kite {
                                     .flex()
                                     .flex_col()
                                     .overflow_hidden()
-                                    .key_context(if open { "KiteThread" } else { "KiteList" })
+                                    .key_context(if preferences_open {
+                                        "KitePreferences"
+                                    } else if open {
+                                        "KiteThread"
+                                    } else {
+                                        "KiteList"
+                                    })
                                     .track_focus(&self.focus)
                                     .child(body),
                             ),
                     ),
             )
-            .child(self.render_footer(cx))
+            .when(self.settings.show_shortcuts && !preferences_open, |d| {
+                d.child(self.render_footer(cx))
+            })
             .children(self.render_overlay(window, cx))
             .children(self.render_toast(window))
     }
@@ -1324,6 +1396,7 @@ impl Kite {
     ) -> Option<AnyElement> {
         match &self.overlay {
             Overlay::None => None,
+            Overlay::Accounts(_) => Some(crate::sidebar::account_menu(self, window, cx)),
             Overlay::Help => Some(self.render_help(cx)),
             Overlay::Palette(_) => Some(palette::render(self, window, cx)),
             Overlay::Snooze(_) => Some(snooze::render(self, window, cx)),

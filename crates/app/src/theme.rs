@@ -2,7 +2,9 @@
 use gpui_kit::component::{ActiveTheme as _, Theme as UiTheme, ThemeMode};
 use gpui_kit::{App, Hsla, Rgba, WindowAppearance, px};
 
+#[derive(Clone, Copy, PartialEq)]
 pub struct Theme {
+    pub scale: f32,
     pub bg: Rgba,
     pub bg2: Rgba,
     pub bg3: Rgba,
@@ -19,6 +21,7 @@ pub struct Theme {
 }
 
 pub const CARBON: Theme = Theme {
+    scale: 1.,
     bg: rgb_const(0x0e0f13),
     bg2: rgb_const(0x15161c),
     bg3: rgb_const(0x1d1f27),
@@ -35,6 +38,7 @@ pub const CARBON: Theme = Theme {
 };
 
 pub const PAPER: Theme = Theme {
+    scale: 1.,
     bg: rgb_const(0xfbfbfc),
     bg2: rgb_const(0xf3f3f6),
     bg3: rgb_const(0xe9e9ee),
@@ -77,8 +81,8 @@ const fn rgb_const(hex: u32) -> Rgba {
 /// Which theme `settings.theme` asks for. `system` follows the window appearance.
 pub fn wants_dark(setting: &str, appearance: WindowAppearance) -> bool {
     match setting {
-        "dark" => true,
-        "light" => false,
+        "dark" | "midnight" => true,
+        "light" | "linen" => false,
         _ => matches!(
             appearance,
             WindowAppearance::Dark | WindowAppearance::VibrantDark
@@ -91,7 +95,7 @@ pub fn pick(dark: bool) -> &'static Theme {
 }
 
 /// Keeps gpui-component's own theme (inputs, kbd pills, scrollbars) in step with ours.
-pub fn install(t: &Theme, cx: &mut App) {
+pub fn install(t: &Theme, font: &str, cx: &mut App) {
     UiTheme::change(
         if t.dark {
             ThemeMode::Dark
@@ -113,16 +117,182 @@ pub fn install(t: &Theme, cx: &mut App) {
         ui.colors.selection = Theme::alpha(t.accent, 0.25);
         ui.radius = px(10.);
         ui.radius_lg = px(12.);
-        ui.font_family = FONT.into();
+        ui.font_family = font.to_string().into();
+        ui.font_size = t.px(14.);
+        ui.colors.ring = t.accent.into();
         ui.mono_font_family = "Cascadia Code".into();
     });
     let _ = cx.theme();
 }
 
 impl Theme {
+    pub fn px(&self, base: f32) -> gpui_kit::Pixels {
+        px(base * self.scale)
+    }
     pub fn alpha(c: Rgba, a: f32) -> Hsla {
         let mut h: Hsla = c.into();
         h.a = a;
         h
     }
+}
+
+/// The palette is owned by the view so imported themes need no leaked allocations.
+pub fn preset(name: &str) -> Theme {
+    match name {
+        "midnight" => Theme {
+            bg: rgb_const(0x101820),
+            bg2: rgb_const(0x16212b),
+            bg3: rgb_const(0x20303e),
+            sel: rgb_const(0x223c4d),
+            accent: rgb_const(0x77c5dc),
+            accent2: rgb_const(0x9acbb8),
+            ..CARBON
+        },
+        "linen" => Theme {
+            bg: rgb_const(0xfaf8f4),
+            bg2: rgb_const(0xf0ede6),
+            bg3: rgb_const(0xe7e2d8),
+            sel: rgb_const(0xe5eade),
+            fg: rgb_const(0x292d27),
+            fg2: rgb_const(0x666b60),
+            accent: rgb_const(0x667957),
+            accent2: rgb_const(0x9a795a),
+            ..PAPER
+        },
+        "light" => PAPER,
+        _ => CARBON,
+    }
+}
+
+pub fn color(value: &str) -> anyhow::Result<Rgba> {
+    let hex = value
+        .strip_prefix('#')
+        .ok_or_else(|| anyhow::anyhow!("Use a hex colour such as #8B7CFF."))?;
+    anyhow::ensure!(
+        hex.len() == 6 && hex.bytes().all(|c| c.is_ascii_hexdigit()),
+        "Use a six-digit hex colour such as #8B7CFF."
+    );
+    Ok(rgb_const(u32::from_str_radix(hex, 16)?))
+}
+
+pub fn contrast(a: Rgba, b: Rgba) -> f32 {
+    let luminance = |c: Rgba| {
+        let linear = |v: f32| {
+            if v <= 0.04045 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(c.r) + 0.7152 * linear(c.g) + 0.0722 * linear(c.b)
+    };
+    let (a, b) = (luminance(a), luminance(b));
+    (a.max(b) + 0.05) / (a.min(b) + 0.05)
+}
+
+pub fn custom(definition: &kite_core::model::CustomTheme) -> anyhow::Result<Theme> {
+    anyhow::ensure!(
+        !definition.name.trim().is_empty() && definition.name.chars().count() <= 40,
+        "Theme name must contain 1–40 characters."
+    );
+    anyhow::ensure!(
+        matches!(definition.base.as_str(), "dark" | "light"),
+        "Theme base must be dark or light."
+    );
+    anyhow::ensure!(
+        !definition.colors.is_empty(),
+        "The theme needs at least one colour."
+    );
+    let mut theme = preset(&definition.base);
+    for (name, value) in &definition.colors {
+        let target = match name.as_str() {
+            "bg" => &mut theme.bg,
+            "bg2" => &mut theme.bg2,
+            "bg3" => &mut theme.bg3,
+            "fg" => &mut theme.fg,
+            "fg2" => &mut theme.fg2,
+            "fg3" => &mut theme.fg3,
+            "sel" => &mut theme.sel,
+            "accent" => &mut theme.accent,
+            "accent2" => &mut theme.accent2,
+            "line" => &mut theme.line,
+            _ => anyhow::bail!("Unknown theme colour: {name}"),
+        };
+        *target = color(value)?;
+    }
+    anyhow::ensure!(
+        contrast(theme.fg, theme.bg) >= 4.5
+            && contrast(theme.fg, theme.bg2) >= 4.5
+            && contrast(theme.fg, theme.sel) >= 4.5
+            && contrast(theme.fg2, theme.bg) >= 4.5
+            && contrast(theme.fg2, theme.bg2) >= 4.5,
+        "Theme text needs at least 4.5:1 contrast with its background, sidebar and selection."
+    );
+    Ok(theme)
+}
+
+pub fn resolve(
+    settings: &kite_core::model::Settings,
+    appearance: WindowAppearance,
+) -> anyhow::Result<Theme> {
+    let mut theme = if settings.theme == "custom" {
+        custom(
+            settings
+                .custom_theme
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Import a theme first."))?,
+        )?
+    } else if settings.theme == "system" {
+        *pick(wants_dark("system", appearance))
+    } else {
+        anyhow::ensure!(
+            matches!(
+                settings.theme.as_str(),
+                "dark" | "light" | "midnight" | "linen"
+            ),
+            "Unknown theme."
+        );
+        preset(&settings.theme)
+    };
+    anyhow::ensure!(
+        (12..=18).contains(&settings.font_size),
+        "Font size must be between 12 and 18 px."
+    );
+    anyhow::ensure!(
+        settings.font_family.len() <= 80
+            && settings
+                .font_family
+                .chars()
+                .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.')),
+        "Use an installed font family name."
+    );
+    theme.scale = settings.font_size as f32 / 14.;
+    if let Some(value) = &settings.font_color {
+        let fg = color(value)?;
+        anyhow::ensure!(
+            contrast(fg, theme.bg) >= 4.5
+                && contrast(fg, theme.bg2) >= 4.5
+                && contrast(fg, theme.sel) >= 4.5,
+            "Text colour needs at least 4.5:1 contrast with the background and sidebar."
+        );
+        theme.fg = fg;
+    }
+    Ok(theme)
+}
+
+pub fn font(settings: &kite_core::model::Settings) -> &str {
+    if settings.font_family.is_empty() {
+        FONT
+    } else {
+        &settings.font_family
+    }
+}
+
+pub fn hex(color: Rgba) -> String {
+    format!(
+        "#{:02x}{:02x}{:02x}",
+        (color.r * 255.).round() as u8,
+        (color.g * 255.).round() as u8,
+        (color.b * 255.).round() as u8
+    )
 }

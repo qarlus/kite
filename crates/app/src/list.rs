@@ -32,7 +32,7 @@ pub fn when(ms: Ms, now: DateTime<Local>) -> String {
 impl Kite {
     pub fn render_list(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         if self.rows.is_empty() {
-            return self.render_empty();
+            return self.render_empty(cx);
         }
         let scroll = self.list_scroll.clone();
         let list = uniform_list(
@@ -80,7 +80,7 @@ impl Kite {
             .into_any_element()
     }
 
-    fn render_empty(&self) -> AnyElement {
+    fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let (title, note) = if self.view.query.is_some() {
             ("No results", "Try another name, subject, or search term.")
@@ -104,6 +104,8 @@ impl Kite {
                 ),
                 Mailbox::Drafts => ("No drafts", "Your unfinished messages will appear here."),
                 Mailbox::Sent => ("No sent mail", "Messages you send will appear here."),
+                Mailbox::Spam => ("No spam", "A little less noise. Nothing to review here."),
+                Mailbox::Trash => ("Trash is empty", "Deleted conversations will appear here."),
                 _ => ("No conversations", "There's no mail in this view."),
             }
         };
@@ -117,25 +119,53 @@ impl Kite {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(linear_gradient(
-                135.,
-                linear_color_stop(Theme::alpha(t.accent, 0.12), 0.),
-                linear_color_stop(Theme::alpha(t.accent2, 0.12), 1.),
-            ))
+            .bg(t.bg)
             .child(
                 div()
-                    .text_size(px(28.))
+                    .size(px(48.))
+                    .rounded_full()
+                    .bg(t.bg2)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mb_2()
+                    .child(
+                        Icon::new(
+                            crate::sidebar::MAILBOXES
+                                .iter()
+                                .find(|(mailbox, _, _)| *mailbox == self.view.mailbox)
+                                .map(|(_, _, icon)| *icon)
+                                .unwrap_or(IconName::Inbox),
+                        )
+                        .with_size(px(22.))
+                        .text_color(t.fg3),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(t.px(24.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(div().text_size(px(14.)).text_color(t.fg2).child(note))
+            .child(div().text_size(t.px(14.)).text_color(t.fg2).child(note))
             .when(self.accounts.is_empty(), |d| {
                 d.child(
                     div()
                         .mt_4()
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.fg2)
-                        .child("Account connection is not available in this build."),
+                        .id("empty-add-account")
+                        .test_support()
+                        .aria_label("Add an account")
+                        .px_3()
+                        .py_2()
+                        .rounded(px(6.))
+                        .bg(t.bg2)
+                        .cursor_pointer()
+                        .child("Add an account")
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.show_preferences(1, window, cx)),
+                        ),
                 )
             })
             .into_any_element()
@@ -157,12 +187,12 @@ impl Kite {
                         .justify_between()
                         .gap_4()
                         .h(px(24.))
-                        .child(div().text_size(px(13.)).child(c.title))
-                        .child(keys_pills(t, c.keys[0]))
+                        .child(div().text_size(t.px(13.)).child(c.title))
+                        .child(keys_pills(&t, c.keys[0]))
                 }))
         };
         overlay(
-            t,
+            &t,
             px(0.),
             true,
             div()
@@ -180,7 +210,7 @@ impl Kite {
                 .gap_4()
                 .child(
                     div()
-                        .text_size(px(15.))
+                        .text_size(t.px(15.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("Keyboard shortcuts"),
                 )
@@ -227,7 +257,7 @@ fn row_element(
         .items_center()
         .flex_shrink_0()
         .w_full()
-        .h(px(ROW_H))
+        .h(px(ROW_H * t.scale))
         .rounded(px(6.))
         .px_3()
         .gap_3()
@@ -289,7 +319,7 @@ fn row_element(
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(13.))
+                        .text_size(t.px(13.))
                         .font_weight(if row.unread {
                             FontWeight(650.)
                         } else {
@@ -311,7 +341,7 @@ fn row_element(
                                         .unwrap_or_default(),
                                 )
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(t.px(11.))
                                 .text_color(t.fg2)
                                 .child(
                                     account
@@ -340,7 +370,7 @@ fn row_element(
                         } else {
                             FontWeight::NORMAL
                         })
-                        .text_size(px(13.))
+                        .text_size(t.px(13.))
                         .text_color(t.fg)
                         .child(row.subject.clone()),
                 )
@@ -349,7 +379,7 @@ fn row_element(
                         .flex_1()
                         .min_w_0()
                         .truncate()
-                        .text_size(px(13.))
+                        .text_size(t.px(13.))
                         .text_color(t.fg2)
                         .child(row.snippet.clone()),
                 ),
@@ -379,7 +409,7 @@ fn row_element(
                             .py_0p5()
                             .rounded(px(6.))
                             .bg(t.bg3)
-                            .text_size(px(12.))
+                            .text_size(t.px(12.))
                             .text_color(t.fg2)
                             .child(label.clone())
                     })),
@@ -395,7 +425,7 @@ fn row_element(
                 .flex_shrink_0()
                 .flex()
                 .justify_end()
-                .text_size(px(12.))
+                .text_size(t.px(12.))
                 .text_color(t.fg3)
                 .child(
                     div()
@@ -413,8 +443,8 @@ fn row_element(
                                 .flex()
                                 .items_center()
                                 .gap_1()
-                                .child(keys_pills(t, "e"))
-                                .child(keys_pills(t, "h")),
+                                .child(keys_pills(&t, "e"))
+                                .child(keys_pills(&t, "h")),
                         ),
                 ),
         )

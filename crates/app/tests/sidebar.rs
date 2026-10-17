@@ -15,6 +15,8 @@ fn account_scope_survives_splits_and_mailboxes_and_combines_again(cx: &mut TestA
             window.find(("row-account", 0usize)).label(),
             Some("karl@proton.me")
         );
+        window.click("account-switcher", cx);
+        window.render_frame(cx);
         window.click("account-2", cx);
     })
     .unwrap();
@@ -28,6 +30,8 @@ fn account_scope_survives_splits_and_mailboxes_and_combines_again(cx: &mut TestA
         assert_eq!(kite.row_count(), 0);
     });
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("account-switcher", cx);
         window.render_frame(cx);
         window.click("account-0", cx);
         window.render_frame(cx);
@@ -79,6 +83,8 @@ fn a_single_click_opens_with_full_headers_and_the_sidebar_remains(cx: &mut TestA
             window.find("attachment-501").label(),
             Some("Next chapter.pdf (34567 bytes)")
         );
+        window.click("account-switcher", cx);
+        window.render_frame(cx);
         window.click("account-2", cx);
         window.render_frame(cx);
         assert!(window.try_find("thread-subject").is_none());
@@ -146,6 +152,8 @@ fn identical_provider_folder_ids_in_two_accounts_do_not_mix_conversations(cx: &m
     let (window, kite) = mount(cx, fixture);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click("account-switcher", cx);
+        window.render_frame(cx);
         window.click("account-2", cx);
         window.render_frame(cx);
         window.click("folder-2-work", cx);
@@ -190,6 +198,8 @@ async fn creating_a_folder_in_the_chosen_account_then_moving_mail_into_it(cx: &m
     })
     .await;
     cx.update_window(window.into(), |_, window, cx| {
+        window.click("account-switcher", cx);
+        window.render_frame(cx);
         window.click("account-2", cx);
     })
     .unwrap();
@@ -267,6 +277,8 @@ fn standard_mailboxes_show_moved_mail_and_preserve_account_scope(cx: &mut TestAp
         assert_eq!(kite.row_ids(), vec![1])
     });
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("account-switcher", cx);
         window.render_frame(cx);
         window.click("account-2", cx);
         window.render_frame(cx);

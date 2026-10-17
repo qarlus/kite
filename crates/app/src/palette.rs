@@ -139,7 +139,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     })
                     .child(
                         div()
-                            .text_size(px(14.))
+                            .text_size(t.px(14.))
                             .when(selected, |d| d.text_color(t.fg))
                             .child(cmd.title),
                     )
@@ -155,13 +155,13 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 .bg(t.accent),
                         )
                     })
-                    .child(keys_pills(t, cmd.keys[0]))
+                    .child(keys_pills(&t, cmd.keys[0]))
                     .into_any_element(),
             )
         })
         .collect();
     overlay(
-        t,
+        &t,
         window.viewport_size().height * 0.18,
         false,
         div()
@@ -186,7 +186,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .h(px(48.))
                     .px_3()
                     .gap_3()
-                    .text_size(px(14.))
+                    .text_size(t.px(14.))
                     .text_color(if palette.query.is_empty() {
                         t.fg3
                     } else {
@@ -223,7 +223,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .flex()
                     .items_center()
                     .justify_between()
-                    .text_size(px(12.))
+                    .text_size(t.px(12.))
                     .text_color(t.fg2)
                     .child("↑ ↓ to navigate")
                     .child(
@@ -231,7 +231,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(keys_pills(t, "enter"))
+                            .child(keys_pills(&t, "enter"))
                             .child("Run command"),
                     ),
             ),

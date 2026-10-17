@@ -96,6 +96,8 @@ impl Kite {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.preferences = None;
+        self.sidebar_dirty = true;
         let mut view = self.view.clone();
         view.mailbox = Mailbox::Archive;
         view.split = None;
@@ -207,7 +209,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         Overlay::Move(dialog) => {
             panel = panel.aria_label("Move to folder").child(
                 div()
-                    .text_size(px(16.))
+                    .text_size(t.px(16.))
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Move to folder"),
             );
@@ -239,7 +241,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     div()
                         .flex()
                         .justify_between()
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.fg2)
                         .child(
                             div()
@@ -281,7 +283,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
             if dialog.mixed_accounts {
                 panel = panel.child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.fg2)
                         .child("Select mail from one account to choose its custom folders."),
                 );
@@ -292,8 +294,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .items_center()
                     .gap_2()
                     .text_color(t.fg2)
-                    .text_size(px(12.))
-                    .child(keys_pills(t, "enter"))
+                    .text_size(t.px(12.))
+                    .child(keys_pills(&t, "enter"))
                     .child("Move conversations"),
             );
         }
@@ -302,13 +304,13 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                 .aria_label("New folder")
                 .child(
                     div()
-                        .text_size(px(16.))
+                        .text_size(t.px(16.))
                         .font_weight(FontWeight::SEMIBOLD)
                         .child("New folder"),
                 )
                 .child(
                     div()
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.fg2)
                         .child("Create in · ↑↓ to change account"),
                 );
@@ -348,7 +350,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         .id("folder-error")
                         .test_support()
                         .aria_label(error.clone())
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.danger)
                         .child(error.clone()),
                 );
@@ -376,5 +378,5 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         }
         _ => return div().into_any_element(),
     }
-    overlay(t, window.viewport_size().height * 0.18, false, panel).into_any_element()
+    overlay(&t, window.viewport_size().height * 0.18, false, panel).into_any_element()
 }

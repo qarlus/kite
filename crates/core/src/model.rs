@@ -150,8 +150,22 @@ pub struct CalEvent {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct CustomTheme {
+    pub name: String,
+    pub base: String,
+    pub colors: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(default)]
 pub struct Settings {
     pub theme: String,
+    pub custom_theme: Option<CustomTheme>,
+    pub font_family: String,
+    pub font_size: u8,
+    pub font_color: Option<String>,
+    pub show_shortcuts: bool,
     pub undo_send_secs: u32,
     pub load_remote_images: bool,
     pub ai_enabled: bool,
@@ -163,6 +177,11 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: "system".into(),
+            custom_theme: None,
+            font_family: String::new(),
+            font_size: 14,
+            font_color: None,
+            show_shortcuts: true,
             undo_send_secs: 5,
             load_remote_images: false,
             ai_enabled: false,

@@ -24,11 +24,14 @@ cargo run -p kite --example preview -- --thread
 cargo run -p kite --example preview -- --palette
 cargo run -p kite --example preview -- --create-folder
 cargo run -p kite --example preview -- --move
+cargo run -p kite --example preview -- --settings
+cargo run -p kite --example preview -- --light --narrow --settings
+cargo run -p kite --example preview -- --switcher
 ```
 
 The preview uses two sample accounts, account-owned Work/Receipts folders and local conversations. Folder creation, moving and undo change only the in-memory integration-test fixture; it sends no email. `--empty` shows
 Inbox Zero. Sample messages and the preview are not included in the shipped app.
-The current UI-shell build still starts without a connected mail engine.
+The current UI-shell build still starts without a connected mail engine. Settings already saves appearance locally; provider sign-in reports the missing engine. See [custom themes](docs/THEMES.md) for the import format.
 
 ## Microsoft account setup (one-time, ~2 min)
 1. Go to https://entra.microsoft.com, then **App registrations → New registration**.

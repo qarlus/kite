@@ -18,16 +18,18 @@ pub struct HtmlKey {
     width: u32,
     scale: u32,
     dark: bool,
+    appearance: u64,
 }
 
 impl HtmlKey {
-    pub fn new(id: Id, width: f32, scale: f32, dark: bool) -> Self {
+    pub fn new(id: Id, width: f32, scale: f32, dark: bool, appearance: u64) -> Self {
         Self {
             id,
             // Quantised so a drag-resize does not miss the cache every frame.
             width: (width * 4.).round() as u32,
             scale: (scale * 20.).round() as u32,
             dark,
+            appearance,
         }
     }
 
@@ -137,7 +139,7 @@ impl Kite {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_size(px(12.))
+                                            .text_size(t.px(12.))
                                             .text_color(t.fg2)
                                             .cursor_pointer()
                                             .hover(|s| s.text_color(t.fg))
@@ -145,7 +147,7 @@ impl Kite {
                                                 this.run(crate::keys::cmd::BACK, window, cx)
                                             }))
                                             .child("Back to list")
-                                            .child(crate::list::keys_pills(t, "u")),
+                                            .child(crate::list::keys_pills(&t, "u")),
                                     )
                                     .child(
                                         div()
@@ -183,7 +185,7 @@ impl Kite {
                                     .id("thread-subject")
                                     .test_support()
                                     .aria_label(subject.clone())
-                                    .text_size(px(20.))
+                                    .text_size(t.px(20.))
                                     .font_weight(FontWeight(650.))
                                     .child(subject),
                             )
@@ -192,7 +194,7 @@ impl Kite {
                                     .id("thread-account")
                                     .test_support()
                                     .aria_label(account.clone())
-                                    .text_size(px(12.))
+                                    .text_size(t.px(12.))
                                     .text_color(t.fg2)
                                     .child(format!(
                                         "{count} {} · {account}",
@@ -240,14 +242,14 @@ impl Kite {
                 .flex()
                 .items_start()
                 .gap_2()
-                .text_size(px(12.))
+                .text_size(t.px(12.))
                 .text_color(t.fg2)
                 .child(div().w(px(36.)).flex_shrink_0().child(field))
                 .child(div().flex_1().min_w_0().child(value))
         };
         let mut details = div().flex_1().min_w_0().flex().flex_col().gap_1().child(
             div()
-                .text_size(px(14.))
+                .text_size(t.px(14.))
                 .font_weight(FontWeight(650.))
                 .child(if message.from.name.is_empty() {
                     message.from.email.clone()
@@ -275,11 +277,11 @@ impl Kite {
                 .child(
                     div()
                         .truncate()
-                        .text_size(px(12.))
+                        .text_size(t.px(12.))
                         .text_color(t.fg2)
                         .child(snippet(&message)),
                 )
-                .child(div().text_size(px(11.)).text_color(t.fg2).child(when));
+                .child(div().text_size(t.px(11.)).text_color(t.fg2).child(when));
         }
         let header = div()
             .flex()
@@ -295,7 +297,7 @@ impl Kite {
                     .flex_shrink_0()
                     .rounded_full()
                     .bg(t.bg3)
-                    .text_size(px(12.))
+                    .text_size(t.px(12.))
                     .text_color(t.fg2)
                     .child(initials(&message.from.name)),
             )
@@ -332,7 +334,7 @@ impl Kite {
                 .id(format!("text-{}", message.id))
                 .test_support()
                 .aria_label(message.text.clone())
-                .text_size(px(15.))
+                .text_size(t.px(15.))
                 .line_height(relative(1.7))
                 .child(message.text.clone())
                 .into_any_element(),
@@ -360,7 +362,7 @@ impl Kite {
                                 .py_2()
                                 .rounded(px(6.))
                                 .bg(t.bg3)
-                                .text_size(px(12.))
+                                .text_size(t.px(12.))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(t.sel))
                                 .child(
@@ -409,7 +411,7 @@ impl Kite {
     ) -> AnyElement {
         let t = self.theme;
         let width = (body_width * scale).round() / scale;
-        let key = HtmlKey::new(message.id, width, scale, self.dark);
+        let key = HtmlKey::new(message.id, width, scale, self.dark, self.appearance_version);
         self.request_html(source, key, cx);
         match self.html_cache.get(&key) {
             Some(rendered) => {
@@ -482,10 +484,11 @@ impl Kite {
         }
         let (width, scale) = key.at();
         let source = source.to_string();
-        let dark = key.dark;
+        let theme = self.theme;
+        let font = crate::theme::font(&self.settings).to_string();
         let task = cx
             .background_executor()
-            .spawn(async move { html::render(&source, width, scale, dark) });
+            .spawn(async move { html::render_styled(&source, width, scale, theme, &font) });
         cx.spawn(async move |this, cx| {
             let rendered = task.await;
             this.update(cx, |this, cx| {
@@ -503,7 +506,13 @@ impl Kite {
             let Some(source) = message.html.clone() else {
                 continue;
             };
-            let key = HtmlKey::new(message.id, self.html_width, self.html_scale, self.dark);
+            let key = HtmlKey::new(
+                message.id,
+                self.html_width,
+                self.html_scale,
+                self.dark,
+                self.appearance_version,
+            );
             self.request_html(&source, key, cx);
         }
     }

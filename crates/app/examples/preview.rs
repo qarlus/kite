@@ -7,6 +7,10 @@ use gpui_kit::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let settings = args.iter().any(|arg| arg == "--settings");
+    let accounts = args.iter().any(|arg| arg == "--accounts");
+    let switcher = args.iter().any(|arg| arg == "--switcher");
+    let spam = args.iter().any(|arg| arg == "--spam");
     let narrow = args.iter().any(|arg| arg == "--narrow");
     let light = args.iter().any(|arg| arg == "--light");
     let thread = args.iter().any(|arg| arg == "--thread");
@@ -45,6 +49,18 @@ fn main() {
                 |window, cx| {
                     cx.new(|cx| {
                         let mut view = kite::app::Kite::new(mail, window, cx);
+                        if settings {
+                            view.run(kite::keys::cmd::SETTINGS, window, cx);
+                        }
+                        if accounts {
+                            view.run(kite::keys::cmd::MANAGE_ACCOUNTS, window, cx);
+                        }
+                        if switcher {
+                            view.run(kite::keys::cmd::ACCOUNT_SWITCHER, window, cx);
+                        }
+                        if spam {
+                            view.run(kite::keys::cmd::GO + 7, window, cx);
+                        }
                         if thread {
                             view.run(kite::keys::cmd::OPEN, window, cx);
                         }

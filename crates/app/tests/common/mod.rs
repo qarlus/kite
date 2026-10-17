@@ -25,6 +25,8 @@ pub struct Fixture {
     pub folders: Mutex<Vec<Folder>>,
     pub locations: Mutex<Locations>,
     pub folder_error: Mutex<Option<String>>,
+    pub account_error: Mutex<Option<String>>,
+    pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
     pub accounts: Mutex<Vec<Account>>,
@@ -93,6 +95,8 @@ impl Fixture {
             folders: Mutex::new(Vec::new()),
             locations: Mutex::new(HashMap::new()),
             folder_error: Mutex::new(None),
+            account_error: Mutex::new(None),
+            settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
@@ -360,15 +364,52 @@ impl Mail for Fixture {
         Ok(self.accounts.lock().unwrap().clone())
     }
 
-    fn add_proton(&self, _: ProtonLogin) -> anyhow::Result<Account> {
-        anyhow::bail!("not supported")
+    fn add_proton(&self, login: ProtonLogin) -> anyhow::Result<Account> {
+        if let Some(error) = self.account_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        let mut accounts = self.accounts.lock().unwrap();
+        let account = Account {
+            id: accounts.iter().map(|a| a.id).max().unwrap_or(0) + 1,
+            provider: kite_core::model::Provider::Proton,
+            email: login.email,
+            name: "Karl".into(),
+        };
+        accounts.push(account.clone());
+        Ok(account)
     }
 
     fn add_microsoft(&self) -> anyhow::Result<Account> {
-        anyhow::bail!("not supported")
+        if let Some(error) = self.account_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        let mut accounts = self.accounts.lock().unwrap();
+        let account = Account {
+            id: accounts.iter().map(|a| a.id).max().unwrap_or(0) + 1,
+            provider: kite_core::model::Provider::Microsoft,
+            email: "new@outlook.com".into(),
+            name: "Karl".into(),
+        };
+        accounts.push(account.clone());
+        Ok(account)
     }
 
-    fn remove_account(&self, _: Id) -> anyhow::Result<()> {
+    fn remove_account(&self, id: Id) -> anyhow::Result<()> {
+        if let Some(error) = self.account_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        self.accounts
+            .lock()
+            .unwrap()
+            .retain(|account| account.id != id);
+        self.threads
+            .lock()
+            .unwrap()
+            .retain(|thread| thread.account_id != id);
+        self.folders
+            .lock()
+            .unwrap()
+            .retain(|folder| folder.account_id != id);
         Ok(())
     }
 
@@ -556,10 +597,17 @@ impl Mail for Fixture {
     }
 
     fn settings(&self) -> anyhow::Result<Settings> {
+        if let Some(path) = &*self.settings_path.lock().unwrap() {
+            return kite::preferences::read_settings(path);
+        }
         Ok(self.settings.lock().unwrap().clone())
     }
 
-    fn set_settings(&self, _: Settings) -> anyhow::Result<()> {
+    fn set_settings(&self, settings: Settings) -> anyhow::Result<()> {
+        if let Some(path) = &*self.settings_path.lock().unwrap() {
+            kite::preferences::write_settings(path, &settings)?;
+        }
+        *self.settings.lock().unwrap() = settings;
         Ok(())
     }
 

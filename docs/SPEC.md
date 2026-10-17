@@ -8,7 +8,7 @@ Kite is a keyboard-first email client modelled on Superhuman. Every action has a
 | **Proton Mail** | IMAP + SMTP via Proton Bridge (`127.0.0.1`, IMAP 1143 / SMTP 1025, STARTTLS, Bridge self-signed cert) | Bridge username + password, stored in the OS keychain |
 | **Microsoft 365 / Outlook** | Microsoft Graph v1.0 (`/me/mailFolders`, `/me/messages/delta`, `/me/sendMail`, `/me/calendarView`) | OAuth 2.0 Auth Code + PKCE, public client, loopback redirect `http://localhost:{port}`. Client ID from `KITE_MS_CLIENT_ID` env var or `config.json`. Refresh token kept in the OS keychain. Scopes: `offline_access Mail.ReadWrite Mail.Send Calendars.Read User.Read` |
 
-Multiple accounts are supported. The persistent left sidebar selects all inboxes together or a specific account. Account switching uses `Ctrl/Cmd+1..9`; `Ctrl/Cmd+0` returns to the combined inbox. Split tabs and standard mailbox navigation preserve the selected account.
+Multiple accounts are supported. The account switcher at the bottom of the persistent sidebar selects all inboxes together or a specific account, showing avatars and account identity. Account switching uses `Ctrl/Cmd+1..9`; `Ctrl/Cmd+0` returns to the combined inbox. Split tabs and standard mailbox navigation preserve the selected account.
 
 The sidebar includes Inbox, Drafts, Sent, Starred, Snoozed, Archive, Spam, Trash and All mail. Custom folders belong to an account; the combined sidebar identifies their owner. New folder opens an account chooser and name field (`Ctrl/Cmd+Shift+N`). Creation runs off the UI thread, reports errors, and adds the folder only after success. `L` moves selected conversations into Inbox, Archive, Trash or a custom folder from their account. Mixed-account selections expose only the shared standard destinations. Moving is undoable. Creating a folder does not move any mail automatically.
 
@@ -62,3 +62,13 @@ The sidebar includes Inbox, Drafts, Sent, Starred, Snoozed, Archive, Spam, Trash
 
 ## Non-goals (v1)
 Read receipts, tracking pixels, rich HTML compose, Gmail/IMAP providers other than Proton Bridge, mobile, plugins.
+
+## Settings and appearance
+
+`Ctrl/Cmd+,` opens Settings; `Ctrl/Cmd+Shift+,` opens Accounts directly. Escape or Back to mail returns to the previous mail view. `Ctrl/Cmd+Shift+A` opens the bottom account switcher; arrows/Enter select, Escape dismisses. Mail navigation shortcuts never consume text in editable fields.
+
+Appearance offers Carbon, Paper, Midnight, Linen and Match system. A native file picker imports a JSON palette, validates its tokens and readability, then saves its contents rather than a reference to the source file. [Theme format](THEMES.md). Typography supports any installed font family, a 12–18px base font size and an optional six-digit hex text colour. Explicitly styled HTML email keeps its authored styles; our native UI and default HTML styling follow the user's preference. Changes invalidate HTML caches, including renders still in flight.
+
+Accounts exposes Outlook sign-in and local Proton Bridge credentials, plus confirmed removal from Kite. All provider operations use Mail on a background executor and report failures. The placeholder production shell cannot authenticate providers yet; it reports that limitation instead of inventing an account. Appearance settings already persist locally in the shell's user configuration directory. The integrated engine will own settings through the same Mail interface.
+
+General saves the shortcut-footer preference and 0/5/10/20/30-second undo-send window. Sending remains engine-owned. New settings fields use serde defaults to preserve existing preferences.

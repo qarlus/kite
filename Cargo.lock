@@ -4210,6 +4210,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "kite-core",
+ "serde_json",
 ]
 
 [[package]]

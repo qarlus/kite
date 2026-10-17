@@ -26,6 +26,9 @@ pub mod cmd {
     /// Go-to mailboxes, then account switching at `ACCOUNT + n`.
     pub const GO: u8 = 20;
     pub const CREATE_FOLDER: u8 = 30;
+    pub const SETTINGS: u8 = 31;
+    pub const ACCOUNT_SWITCHER: u8 = 32;
+    pub const MANAGE_ACCOUNTS: u8 = 33;
     pub const ACCOUNT: u8 = 40;
 }
 
@@ -48,6 +51,19 @@ const fn c(title: &'static str, keys: &'static [&'static str], ctx: &'static str
 }
 
 pub static COMMANDS: &[Cmd] = &[
+    c(
+        "Manage accounts",
+        &["secondary-shift-,"],
+        "Kite",
+        cmd::MANAGE_ACCOUNTS,
+    ),
+    c("Settings", &["secondary-,"], "Kite", cmd::SETTINGS),
+    c(
+        "Switch account",
+        &["secondary-shift-a"],
+        "Kite",
+        cmd::ACCOUNT_SWITCHER,
+    ),
     c("Next thread", &["j"], "Kite", cmd::NEXT),
     c("Previous thread", &["k"], "Kite", cmd::PREV),
     c("Open thread", &["enter", "o"], "KiteList", cmd::OPEN),
@@ -120,7 +136,18 @@ pub fn bind(cx: &mut App) {
             bindings.push(KeyBinding::new(
                 key,
                 Act { cmd: command.id },
-                Some(command.ctx),
+                Some(
+                    if command.ctx == "Kite"
+                        && !matches!(
+                            command.id,
+                            cmd::BACK | cmd::SETTINGS | cmd::PALETTE | cmd::ACCOUNT_SWITCHER
+                        )
+                    {
+                        "Kite && !Input"
+                    } else {
+                        command.ctx
+                    },
+                ),
             ));
             // Reading actions must not match while the titlebar search input has focus.
             if matches!(
