@@ -507,6 +507,42 @@ async fn apply_moves_flags_and_sends_mime() {
     assert_eq!(STANDARD.decode(send.body_str()).unwrap(), mime);
 }
 
+// ------------------------------------------------------------------- folders
+
+#[tokio::test]
+async fn create_folder_posts_the_display_name_and_returns_the_id() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/mailFolders") => Reply::json(
+            201,
+            json!({ "id": "AAMkFOLDER", "displayName": "Receipts" }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    assert_eq!(g.create_folder("Receipts").await.unwrap(), "AAMkFOLDER");
+    let call = &fake.path("/me/mailFolders")[0];
+    assert_eq!(call.method, "POST");
+    assert_eq!(call.json(), json!({ "displayName": "Receipts" }));
+    assert_eq!(call.header("authorization"), Some("Bearer token"));
+}
+
+#[tokio::test]
+async fn a_rejected_folder_creation_is_an_error() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/mailFolders") => Reply::json(
+            400,
+            json!({ "error": { "code": "ErrorDuplicateDisplayName" } }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    assert!(g.create_folder("Receipts").await.is_err());
+}
+
 // ------------------------------------------------------------------- tokens
 
 #[tokio::test]

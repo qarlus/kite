@@ -644,6 +644,42 @@ impl Mail for Engine {
         Ok(())
     }
 
+    fn folders(&self) -> Result<Vec<Folder>> {
+        self.inner.read(Store::folders)
+    }
+
+    fn create_folder(&self, account: Id, name: &str) -> Result<Folder> {
+        let name = name.trim();
+        anyhow::ensure!(!name.is_empty(), "Enter a folder name.");
+        anyhow::ensure!(
+            !self
+                .inner
+                .read(Store::folders)?
+                .iter()
+                .any(|f| f.account_id == account && f.name.eq_ignore_ascii_case(name)),
+            "A folder with this name already exists in that account."
+        );
+        let account_row = self
+            .inner
+            .read(Store::accounts)?
+            .into_iter()
+            .find(|a| a.id == account)
+            .with_context(|| format!("no account {account}"))?;
+        let mut backend = backend_for(&self.inner, &account_row)?;
+        // Contact the provider first and only persist after it accepted the folder, so a failed
+        // create never leaves a phantom folder in the local catalog.
+        let id = run_async(async {
+            match &mut backend {
+                Backend::Imap(imap) => imap.create_folder(name).await,
+                Backend::Graph { client, .. } => client.create_folder(name).await,
+            }
+        })?;
+        persist_tokens(&self.inner, account, &mut backend)?;
+        let folder = self.inner.write(|s| s.add_folder(account, &id, name))?;
+        self.wake();
+        Ok(folder)
+    }
+
     fn threads(&self, view: &View, offset: u32, limit: u32) -> Result<Vec<ThreadSummary>> {
         self.inner.read(|s| s.threads(view, offset, limit))
     }

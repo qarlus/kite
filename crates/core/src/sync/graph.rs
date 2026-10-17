@@ -216,6 +216,21 @@ impl Graph {
             .collect())
     }
 
+    /// Creates a mail folder and returns the provider id it was given.
+    pub async fn create_folder(&mut self, name: &str) -> Result<String> {
+        let url = format!("{}/me/mailFolders", self.base_url);
+        let body = json!({ "displayName": name });
+        let res = self
+            .auth_send(|http, token| http.post(&url).bearer_auth(token).json(&body))
+            .await?;
+        let v = json_res(res, "create folder").await?;
+        v["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .context("Graph /me/mailFolders returned no id")
+    }
+
     async fn move_msg(&mut self, remote_id: &str, destination: &str) -> Result<Option<String>> {
         let url = format!("{}/me/messages/{remote_id}/move", self.base_url);
         let body = json!({ "destinationId": destination });

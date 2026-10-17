@@ -421,6 +421,24 @@ impl Imap {
         }
     }
 
+    /// Creates a user folder and subscribes to it, returning its mailbox name (its identity).
+    /// Bridge exposes user folders under `Folders/`, which is also how `sync` discovers them.
+    pub async fn create_folder(&mut self, name: &str) -> Result<String> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("folder name is empty");
+        }
+        let mailbox = format!("Folders/{name}");
+        let session = self.session().await?;
+        timed(session.create(mailbox.as_str()))
+            .await
+            .with_context(|| format!("create mailbox {mailbox}"))?;
+        timed(session.subscribe(mailbox.as_str()))
+            .await
+            .with_context(|| format!("subscribe mailbox {mailbox}"))?;
+        Ok(mailbox)
+    }
+
     async fn attachment_once(
         &mut self,
         remote_msg_id: &str,
