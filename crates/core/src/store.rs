@@ -783,6 +783,18 @@ impl Store {
             )
             .optional()?)
     }
+
+    /// The thread a message belongs to, used to arm a post-send "remind me if no reply".
+    pub fn message_thread(&self, message_id: Id) -> Result<Option<Id>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT thread_id FROM messages WHERE id=?1",
+                [message_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
 }
 
 // ---------------------------------------------------------- actions and undo

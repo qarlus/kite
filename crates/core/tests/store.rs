@@ -83,6 +83,7 @@ fn view(mb: Mailbox) -> View {
         mailbox: mb,
         split: None,
         query: None,
+        folder: None,
     }
 }
 
@@ -92,6 +93,7 @@ fn search(mb: Mailbox, q: &str) -> View {
         mailbox: mb,
         split: None,
         query: Some(q.into()),
+        folder: None,
     }
 }
 
