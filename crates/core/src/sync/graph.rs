@@ -297,20 +297,20 @@ impl Graph {
         &mut self,
         req: impl Fn(&reqwest::Client, &str) -> reqwest::RequestBuilder,
     ) -> Result<reqwest::Response> {
-        if auth::now_ms() >= self.tokens.expires_at() {
+        if auth::now_ms() >= self.tokens.expires_at {
             self.refresh().await?;
         }
-        let res = req(&self.http, self.tokens.access()).send().await?;
+        let res = req(&self.http, &self.tokens.access).send().await?;
         if res.status() != reqwest::StatusCode::UNAUTHORIZED {
             return Ok(res);
         }
         self.refresh().await?;
-        Ok(req(&self.http, self.tokens.access()).send().await?)
+        Ok(req(&self.http, &self.tokens.access).send().await?)
     }
 
     async fn refresh(&mut self) -> Result<()> {
         self.tokens =
-            auth::ms_refresh_at(&self.authority, &self.client_id, self.tokens.refresh()).await?;
+            auth::ms_refresh_at(&self.authority, &self.client_id, &self.tokens.refresh).await?;
         Ok(())
     }
 }
@@ -361,6 +361,7 @@ fn delta_for(
         starred: item["flag"]["flagStatus"].as_str() == Some("flagged"),
         important: match item["inferenceClassification"].as_str() {
             Some("focused") => Some(true),
+            Some("other") => Some(false),
             _ => None,
         },
         attachments: attachments.get(id).cloned().unwrap_or_default(),

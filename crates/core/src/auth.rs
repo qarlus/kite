@@ -38,31 +38,9 @@ pub fn secret_del(key: &str) -> Result<()> {
 /// Tokens for one account. Serialize them into the keychain; the engine persists refreshed ones.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Tokens {
-    access: String,
-    refresh: String,
-    expires_at: Ms,
-}
-
-impl Tokens {
-    pub fn new(access: impl Into<String>, refresh: impl Into<String>, expires_at: Ms) -> Self {
-        Self {
-            access: access.into(),
-            refresh: refresh.into(),
-            expires_at,
-        }
-    }
-
-    pub fn access(&self) -> &str {
-        &self.access
-    }
-
-    pub fn refresh(&self) -> &str {
-        &self.refresh
-    }
-
-    pub fn expires_at(&self) -> Ms {
-        self.expires_at
-    }
+    pub access: String,
+    pub refresh: String,
+    pub expires_at: Ms,
 }
 
 pub fn now_ms() -> Ms {
@@ -233,7 +211,11 @@ async fn read_tokens(res: reqwest::Response, prior_refresh: Option<&str>) -> Res
         .ok_or_else(|| anyhow!("token response had no refresh token"))?;
     // Expire a minute early so a request never races the server clock.
     let expires_at = now_ms() + body.expires_in.unwrap_or(3600) * 1000 - 60_000;
-    Ok(Tokens::new(body.access_token, refresh, expires_at))
+    Ok(Tokens {
+        access: body.access_token,
+        refresh,
+        expires_at,
+    })
 }
 
 fn random_token(bytes: usize) -> Result<String> {
@@ -255,9 +237,9 @@ fn http() -> reqwest::Client {
 
 #[cfg(target_os = "windows")]
 fn open_browser(url: &str) {
-    // cmd.exe treats `&` inside the URL as a command separator unless it is caret-escaped.
-    let _ = Command::new("cmd")
-        .args(["/C", "start", "", &url.replace('&', "^&")])
+    // Not `cmd /C start`: cmd treats the `&`s in the query string as command separators.
+    let _ = Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
         .spawn();
 }
 

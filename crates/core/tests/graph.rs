@@ -204,7 +204,11 @@ fn graph(fake: &Fake) -> Graph {
         &fake.base,
         &fake.base,
         "client-1",
-        Tokens::new("token", "refresh", auth::now_ms() + 3_600_000),
+        Tokens {
+            access: "token".into(),
+            refresh: "refresh".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+        },
     )
 }
 
@@ -361,7 +365,11 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
     assert_eq!(m2.date, 1_714_642_200_000);
     assert!(m2.unread);
     assert_eq!(m2.text, "See you at 12");
-    assert_eq!(m2.important, None);
+    assert_eq!(
+        m2.important,
+        Some(false),
+        "Outlook \"Other\" is an explicit not-important signal"
+    );
     assert!(m2.attachments.is_empty());
 
     // The delta query asks for HTML bodies, paging, and every field we map.
@@ -399,7 +407,7 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
     let m1 = upsert(&second, "m1");
     assert!(m1.unread);
     assert!(!m1.starred);
-    assert_eq!(m1.important, None);
+    assert_eq!(m1.important, Some(false));
     assert_eq!(fake.path("/delta1").len(), 1);
     assert_eq!(fake.path("/me/mailFolders/inbox/messages/delta").len(), 1);
     assert!(cursor2.contains("/delta2"));
@@ -516,7 +524,11 @@ async fn an_expired_token_refreshes_before_use() {
     })
     .await;
 
-    let stale = Tokens::new("stale", "r1", auth::now_ms() - 1_000);
+    let stale = Tokens {
+        access: "stale".into(),
+        refresh: "r1".into(),
+        expires_at: auth::now_ms() - 1_000,
+    };
     let mut g = Graph::new(&fake.base, &fake.base, "client-1", stale);
     assert_eq!(g.me().await.unwrap().0, "ada@example.com");
 
@@ -549,14 +561,18 @@ async fn a_401_refreshes_once_and_retries() {
         &fake.base,
         &fake.base,
         "client-1",
-        Tokens::new("old", "r1", auth::now_ms() + 3_600_000),
+        Tokens {
+            access: "old".into(),
+            refresh: "r1".into(),
+            expires_at: auth::now_ms() + 3_600_000,
+        },
     );
     assert_eq!(
         g.me().await.unwrap(),
         ("ada@example.com".to_string(), "Ada".to_string())
     );
-    assert_eq!(g.tokens().access(), "new");
-    assert_eq!(g.tokens().refresh(), "r2");
+    assert_eq!(g.tokens().access, "new");
+    assert_eq!(g.tokens().refresh, "r2");
 
     let token = &fake.path("/oauth2/v2.0/token")[0];
     let form = token.form();
@@ -623,8 +639,8 @@ async fn login_sends_the_matching_s256_verifier() {
     let (challenge, status, result) = login(&fake, |_| {}).await;
     assert_eq!(status, 200);
     let tokens = result.unwrap();
-    assert_eq!(tokens.access(), "at");
-    assert_eq!(tokens.refresh(), "rt");
+    assert_eq!(tokens.access, "at");
+    assert_eq!(tokens.refresh, "rt");
 
     let token = &fake.path("/oauth2/v2.0/token")[0];
     let form = token.form();
