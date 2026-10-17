@@ -24,11 +24,13 @@ anyrender_vello_cpu = "0.18"
 image = { version = "0.25", default-features = false }
 # kite-core network stack. TLS is always the OS stack (native-tls), never rustls.
 tokio = { version = "1", default-features = false }
-reqwest = { version = "0.13", default-features = false, features = ["form", "json", "native-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["form", "json", "native-tls", "stream"] }
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 mail-parser = { version = "0.11", default-features = false }
+mail-builder = { version = "1", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
