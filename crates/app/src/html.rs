@@ -8,11 +8,21 @@ use blitz_traits::shell::{ColorScheme, Viewport};
 use gpui_kit::RenderImage;
 use std::sync::Arc;
 
+/// A link's hit box in logical pixels, resolved once at render time so the
+/// document itself never has to cross a thread boundary.
+struct Link {
+    href: String,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 pub struct Rendered {
     pub image: Arc<RenderImage>,
     /// Content height in logical pixels.
     pub height: f32,
-    doc: HtmlDocument,
+    links: Vec<Link>,
 }
 
 /// Lays out and rasterises `html` at `width` logical px. `scale` is the window's DPI scale.
@@ -48,6 +58,22 @@ pub fn render(html: &str, width: f32, scale: f32, dark: bool) -> Rendered {
         .height
         .ceil()
         .max(1.0);
+    let links = doc
+        .tree()
+        .iter()
+        .filter_map(|(_, node)| {
+            let href = node.attr(local_name!("href"))?.to_string();
+            let at = node.absolute_position(0., 0.);
+            let size = node.final_layout().size;
+            Some(Link {
+                href,
+                x: at.x,
+                y: at.y,
+                w: size.width,
+                h: size.height,
+            })
+        })
+        .collect();
     let ph = (height * scale).ceil() as u32;
     let mut buf = Vec::new();
     VelloCpuImageRenderer::new(pw, ph).render_to_vec(
@@ -62,20 +88,16 @@ pub fn render(html: &str, width: f32, scale: f32, dark: bool) -> Rendered {
     Rendered {
         image: Arc::new(RenderImage::new([image::Frame::new(image)])),
         height,
-        doc,
+        links,
     }
 }
 
 impl Rendered {
     /// The `href` of the link under logical point (x, y), if any.
     pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
-        let mut id = Some(self.doc.hit(x, y)?.node_id);
-        while let Some(n) = id.and_then(|i| self.doc.get_node(i)) {
-            if let Some(href) = n.attr(local_name!("href")) {
-                return Some(href.to_string());
-            }
-            id = n.parent;
-        }
-        None
+        self.links
+            .iter()
+            .find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h)
+            .map(|l| l.href.clone())
     }
 }

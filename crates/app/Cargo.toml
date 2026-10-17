@@ -19,6 +19,8 @@ blitz-traits.workspace = true
 anyrender.workspace = true
 anyrender_vello_cpu.workspace = true
 image.workspace = true
+async-channel = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 gpui-kit = { workspace = true, features = ["test-support"] }

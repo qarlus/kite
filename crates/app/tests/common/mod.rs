@@ -1,0 +1,407 @@
+//! Test fixture: an in-memory `Mail` that serves synthetic threads, applies actions
+//! to its own data and records every call the UI makes.
+#![allow(dead_code)]
+use gpui_kit::{
+    App, AppContext, Bounds, Entity, Point, Render, Size, TestAppContext, Window, WindowBounds,
+    WindowHandle, WindowOptions, base::Root, px,
+};
+use kite_core::api::Mail;
+use kite_core::model::{
+    Account, Action, Addr, CalEvent, ChatMsg, Draft, Event, Id, Mailbox, Message, Ms, ProtonLogin,
+    Settings, Split, ThreadSummary, View,
+};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
+
+pub const SPLITS: [Id; 2] = [1, 2];
+/// The HTML body served for even-numbered threads.
+pub const HTML: &str = "<p>Hello there.</p><p>Second paragraph with enough text to lay out.</p>";
+
+pub struct Fixture {
+    threads: Mutex<Vec<ThreadSummary>>,
+    messages: Mutex<HashMap<Id, Vec<Message>>>,
+    /// Every `act` call, in order.
+    pub actions: Mutex<Vec<(Vec<Id>, Action)>>,
+    pub undos: Mutex<Vec<i64>>,
+    /// Every `threads` query, in order.
+    pub queries: Mutex<Vec<(View, u32)>>,
+    pub opened: Mutex<Vec<Id>>,
+    snapshots: Mutex<HashMap<i64, Vec<ThreadSummary>>>,
+    senders: Mutex<Vec<async_channel::Sender<Event>>>,
+    next_token: AtomicI64,
+}
+
+impl Fixture {
+    pub fn new(count: usize) -> Arc<Self> {
+        let now = chrono::Local::now().timestamp_millis();
+        let mut threads = Vec::new();
+        let mut messages = HashMap::new();
+        for i in 0..count {
+            let id = i as Id + 1;
+            threads.push(ThreadSummary {
+                id,
+                account_id: 1,
+                subject: format!("Thread {id}"),
+                snippet: format!("Snippet {id}"),
+                participants: format!("Sender {id}"),
+                date: now - (id * 3_600_000),
+                unread: i % 2 == 0,
+                starred: false,
+                important: true,
+                attachments: false,
+                labels: Vec::new(),
+                count: 2,
+                snoozed_until: None,
+            });
+            let html = (i % 2 == 1).then(|| {
+                "<p>Hello there.</p><p>Second paragraph with enough text to lay out.</p>"
+                    .to_string()
+            });
+            messages.insert(
+                id,
+                vec![
+                    message(
+                        id * 10 + 1,
+                        id,
+                        "Older note",
+                        "Earlier plain text",
+                        None,
+                        now,
+                    ),
+                    message(
+                        id * 10 + 2,
+                        id,
+                        &format!("Subject {id}"),
+                        &format!("Plain body for thread {id}"),
+                        html,
+                        now,
+                    ),
+                ],
+            );
+        }
+        Arc::new(Self {
+            threads: Mutex::new(threads),
+            messages: Mutex::new(messages),
+            actions: Mutex::new(Vec::new()),
+            undos: Mutex::new(Vec::new()),
+            queries: Mutex::new(Vec::new()),
+            opened: Mutex::new(Vec::new()),
+            snapshots: Mutex::new(HashMap::new()),
+            senders: Mutex::new(Vec::new()),
+            next_token: AtomicI64::new(1),
+        })
+    }
+
+    pub fn thread_count(&self) -> usize {
+        self.threads.lock().unwrap().len()
+    }
+
+    pub fn actions(&self) -> Vec<(Vec<Id>, Action)> {
+        self.actions.lock().unwrap().clone()
+    }
+
+    pub fn last_action(&self) -> Option<(Vec<Id>, Action)> {
+        self.actions.lock().unwrap().last().cloned()
+    }
+
+    pub fn next_id(&self) -> Id {
+        self.threads
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|t| t.id)
+            .max()
+            .unwrap_or(0)
+            + 1
+    }
+
+    /// Adds a thread and tells the UI the store changed.
+    pub fn push_thread(&self) -> Id {
+        let id = self.next_id();
+        let now = chrono::Local::now().timestamp_millis();
+        self.threads.lock().unwrap().insert(
+            0,
+            ThreadSummary {
+                id,
+                account_id: 1,
+                subject: format!("Thread {id}"),
+                snippet: "New".into(),
+                participants: "New Sender".into(),
+                date: now,
+                unread: true,
+                starred: false,
+                important: true,
+                attachments: false,
+                labels: Vec::new(),
+                count: 1,
+                snoozed_until: None,
+            },
+        );
+        self.messages.lock().unwrap().insert(
+            id,
+            vec![message(
+                id * 10 + 2,
+                id,
+                "New",
+                "Brand new message",
+                None,
+                now,
+            )],
+        );
+        id
+    }
+
+    pub fn emit(&self, event: Event) {
+        for sender in self.senders.lock().unwrap().iter() {
+            let _ = sender.try_send(event.clone());
+        }
+    }
+}
+
+fn message(
+    id: Id,
+    thread_id: Id,
+    subject: &str,
+    text: &str,
+    html: Option<String>,
+    date: Ms,
+) -> Message {
+    Message {
+        id,
+        thread_id,
+        from: Addr {
+            name: format!("Sender {thread_id}"),
+            email: format!("sender{thread_id}@example.com"),
+        },
+        to: vec![Addr {
+            name: "Me".into(),
+            email: "me@example.com".into(),
+        }],
+        cc: Vec::new(),
+        date,
+        subject: subject.into(),
+        html,
+        text: text.into(),
+        attachments: Vec::new(),
+        unread: false,
+    }
+}
+
+impl Mail for Fixture {
+    fn accounts(&self) -> anyhow::Result<Vec<Account>> {
+        Ok(vec![Account {
+            id: 1,
+            provider: kite_core::model::Provider::Proton,
+            email: "me@example.com".into(),
+            name: "Me".into(),
+        }])
+    }
+
+    fn add_proton(&self, _: ProtonLogin) -> anyhow::Result<Account> {
+        anyhow::bail!("not supported")
+    }
+
+    fn add_microsoft(&self) -> anyhow::Result<Account> {
+        anyhow::bail!("not supported")
+    }
+
+    fn remove_account(&self, _: Id) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn threads(&self, view: &View, offset: u32, limit: u32) -> anyhow::Result<Vec<ThreadSummary>> {
+        self.queries.lock().unwrap().push((view.clone(), offset));
+        let all = self.threads.lock().unwrap();
+        let important = view.split == Some(SPLITS[0]) || view.split.is_none();
+        let query = view.query.as_deref().map(str::to_lowercase);
+        let rows: Vec<ThreadSummary> = all
+            .iter()
+            .filter(|t| match view.mailbox {
+                Mailbox::Starred => t.starred,
+                Mailbox::Snoozed => t.snoozed_until.is_some(),
+                Mailbox::Trash => false,
+                _ => true,
+            })
+            .filter(|t| important || !t.important)
+            .filter(|t| {
+                query.as_ref().is_none_or(|q| {
+                    t.subject.to_lowercase().contains(q)
+                        || t.participants.to_lowercase().contains(q)
+                })
+            })
+            .cloned()
+            .collect();
+        Ok(rows
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
+    fn thread(&self, id: Id) -> anyhow::Result<Vec<Message>> {
+        self.opened.lock().unwrap().push(id);
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn act(&self, ids: &[Id], action: &Action) -> anyhow::Result<i64> {
+        self.actions
+            .lock()
+            .unwrap()
+            .push((ids.to_vec(), action.clone()));
+        let token = self.next_token.fetch_add(1, Ordering::SeqCst);
+        let mut all = self.threads.lock().unwrap();
+        self.snapshots.lock().unwrap().insert(token, all.clone());
+        match action {
+            Action::Star => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| t.starred = true),
+            Action::Unstar => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| t.starred = false),
+            Action::Read => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| t.unread = false),
+            Action::Unread => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| t.unread = true),
+            _ => all.retain(|t| !ids.contains(&t.id)),
+        }
+        Ok(token)
+    }
+
+    fn undo(&self, token: i64) -> anyhow::Result<()> {
+        self.undos.lock().unwrap().push(token);
+        if let Some(snapshot) = self.snapshots.lock().unwrap().get(&token).cloned() {
+            *self.threads.lock().unwrap() = snapshot;
+        }
+        Ok(())
+    }
+
+    fn send(&self, _: Draft) -> anyhow::Result<Id> {
+        Ok(0)
+    }
+
+    fn cancel_send(&self, _: Id) -> anyhow::Result<Option<Draft>> {
+        Ok(None)
+    }
+
+    fn contacts(&self, _: &str) -> anyhow::Result<Vec<Addr>> {
+        Ok(Vec::new())
+    }
+
+    fn open_attachment(&self, _: Id) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn splits(&self) -> anyhow::Result<Vec<Split>> {
+        Ok(vec![
+            Split {
+                id: SPLITS[0],
+                name: "Important".into(),
+                query: String::new(),
+            },
+            Split {
+                id: SPLITS[1],
+                name: "Other".into(),
+                query: "important:false".into(),
+            },
+        ])
+    }
+
+    fn set_splits(&self, _: Vec<Split>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn settings(&self) -> anyhow::Result<Settings> {
+        Ok(Settings {
+            theme: "dark".into(),
+            ..Settings::default()
+        })
+    }
+
+    fn set_settings(&self, _: Settings) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn set_ai_key(&self, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn calendar_today(&self, _: Id) -> anyhow::Result<Vec<CalEvent>> {
+        Ok(Vec::new())
+    }
+
+    fn ai(&self, _: u32, _: Vec<ChatMsg>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn sync_now(&self) {}
+
+    fn events(&self) -> async_channel::Receiver<Event> {
+        let (tx, rx) = async_channel::unbounded();
+        self.senders.lock().unwrap().push(tx);
+        rx
+    }
+}
+
+/// The production window entry point with deterministic test bounds.
+pub fn open_window<V: Render>(
+    cx: &mut TestAppContext,
+    size: Option<Size<gpui_kit::Pixels>>,
+    build: impl FnOnce(&mut Window, &mut App) -> Entity<V>,
+) -> (WindowHandle<Root>, Entity<V>) {
+    cx.update(|cx| {
+        let bounds = size
+            .map(|size| Bounds {
+                origin: Point::default(),
+                size,
+            })
+            .unwrap_or_else(|| Bounds::maximized(None, cx));
+        let (window, content) = gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                ..Default::default()
+            },
+            cx,
+            build,
+        )
+        .expect("open test window");
+        (window.downcast::<Root>().expect("Base Root"), content)
+    })
+}
+
+/// Opens Kite on the given fixture.
+pub fn mount(
+    cx: &mut TestAppContext,
+    mail: Arc<dyn Mail>,
+) -> (WindowHandle<Root>, Entity<kite::app::Kite>) {
+    cx.update(gpui_kit::init);
+    open_window(
+        cx,
+        Some(gpui_kit::size(px(1200.), px(800.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(mail, window, cx)),
+    )
+}
+
+pub fn update_content<V: Render, R>(
+    window: WindowHandle<Root>,
+    content: &Entity<V>,
+    cx: &mut TestAppContext,
+    update: impl FnOnce(&mut V, &mut Window, &mut gpui_kit::Context<V>) -> R,
+) -> R {
+    cx.update_window(window.into(), |_, window, cx| {
+        content.update(cx, |view, cx| update(view, window, cx))
+    })
+    .unwrap()
+}
