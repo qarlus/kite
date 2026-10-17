@@ -13,6 +13,7 @@ use crate::model::{Addr, Mailbox, Ms};
 use serde::{Deserialize, Serialize};
 
 pub mod graph;
+pub mod imap;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteAttachment {
