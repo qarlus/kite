@@ -9,3 +9,13 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 async-channel = "2"
+base64.workspace = true
+getrandom.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+# The fake Graph server and `#[tokio::test]` need a runtime and async TCP/IO.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
