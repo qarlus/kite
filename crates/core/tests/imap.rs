@@ -91,7 +91,10 @@ struct World {
 
 impl World {
     fn folder(&mut self, name: &str) -> &mut Folder {
-        self.folders.iter_mut().find(|f| f.name == name).expect("folder")
+        self.folders
+            .iter_mut()
+            .find(|f| f.name == name)
+            .expect("folder")
     }
 }
 
@@ -117,8 +120,12 @@ fn world() -> World {
 // ---- fake server ----
 
 async fn serve(world: Arc<Mutex<World>>) -> (u16, u16) {
-    let imap = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind imap");
-    let smtp = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind smtp");
+    let imap = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind imap");
+    let smtp = TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind smtp");
     let (imap_port, smtp_port) = (
         imap.local_addr().expect("addr").port(),
         smtp.local_addr().expect("addr").port(),
@@ -139,7 +146,12 @@ async fn serve(world: Arc<Mutex<World>>) -> (u16, u16) {
 
 async fn imap_conn(stream: TcpStream, world: Arc<Mutex<World>>) {
     let mut io = BufReader::new(stream);
-    if io.get_mut().write_all(b"* OK fake imap ready\r\n").await.is_err() {
+    if io
+        .get_mut()
+        .write_all(b"* OK fake imap ready\r\n")
+        .await
+        .is_err()
+    {
         return;
     }
     let mut selected = String::new();
@@ -150,7 +162,9 @@ async fn imap_conn(stream: TcpStream, world: Arc<Mutex<World>>) {
             Ok(_) => {}
         }
         let line = line.trim_end_matches(['\r', '\n']);
-        let Some((tag, rest)) = line.split_once(' ') else { return };
+        let Some((tag, rest)) = line.split_once(' ') else {
+            return;
+        };
         let reply = handle(&mut world.lock().expect("world"), tag, rest, &mut selected);
         if io.get_mut().write_all(&reply).await.is_err() {
             return;
@@ -181,8 +195,11 @@ fn handle(world: &mut World, tag: &str, rest: &str, selected: &mut String) -> Ve
         "LIST" => {
             let mut out = Vec::new();
             for folder in &world.folders {
-                let attrs =
-                    if folder.attrs.is_empty() { String::new() } else { folder.attrs.join(" ") };
+                let attrs = if folder.attrs.is_empty() {
+                    String::new()
+                } else {
+                    folder.attrs.join(" ")
+                };
                 let line = format!("* LIST ({attrs}) \"/\" \"{}\"\r\n", folder.name);
                 out.extend(line.into_bytes());
             }
@@ -273,7 +290,11 @@ fn uid_fetch(world: &mut World, tag: &str, args: &str, selected: &str) -> Vec<u8
             "* {} FETCH ({}{}",
             index + 1,
             parts.join(" "),
-            if want_body { format!(" BODY[] {{{}}}\r\n", msg.raw.len()) } else { String::new() }
+            if want_body {
+                format!(" BODY[] {{{}}}\r\n", msg.raw.len())
+            } else {
+                String::new()
+            }
         )
         .into_bytes();
         if want_body {
@@ -317,8 +338,11 @@ fn uid_move(world: &mut World, tag: &str, args: &str, selected: &str) -> Vec<u8>
     let validity = world.folders[target].uidvalidity;
     let mut moved = Vec::new();
     for uid in uids {
-        let index =
-            world.folders[source].msgs.iter().position(|m| m.uid == uid).expect("msg");
+        let index = world.folders[source]
+            .msgs
+            .iter()
+            .position(|m| m.uid == uid)
+            .expect("msg");
         let msg = world.folders[source].msgs.remove(index);
         let flags: Vec<&str> = msg.flags.iter().map(String::as_str).collect();
         let new_uid = world.folders[target].push(&msg.raw, &flags);
@@ -329,8 +353,12 @@ fn uid_move(world: &mut World, tag: &str, args: &str, selected: &str) -> Vec<u8>
     }
     let from: Vec<String> = moved.iter().map(|(uid, _)| uid.to_string()).collect();
     let to: Vec<String> = moved.iter().map(|(_, uid)| uid.to_string()).collect();
-    let mut out = format!("* OK [COPYUID {validity} {} {}] moved\r\n", from.join(","), to.join(","))
-        .into_bytes();
+    let mut out = format!(
+        "* OK [COPYUID {validity} {} {}] moved\r\n",
+        from.join(","),
+        to.join(",")
+    )
+    .into_bytes();
     out.extend(reply(tag, "MOVE completed"));
     out
 }
@@ -357,7 +385,9 @@ async fn smtp_conn(stream: TcpStream, world: Arc<Mutex<World>>) {
                     return;
                 }
             } else {
-                data.as_mut().expect("data").extend_from_slice(line.as_bytes());
+                data.as_mut()
+                    .expect("data")
+                    .extend_from_slice(line.as_bytes());
             }
             continue;
         }
@@ -368,7 +398,12 @@ async fn smtp_conn(stream: TcpStream, world: Arc<Mutex<World>>) {
             "AUTH" => "235 authenticated\r\n".to_string(),
             "MAIL" => "250 sender ok\r\n".to_string(),
             "RCPT" => {
-                rcpts.push(rest.trim().trim_start_matches("TO:").trim_matches(['<', '>']).to_string());
+                rcpts.push(
+                    rest.trim()
+                        .trim_start_matches("TO:")
+                        .trim_matches(['<', '>'])
+                        .to_string(),
+                );
                 "250 recipient ok\r\n".to_string()
             }
             "DATA" => {
@@ -425,7 +460,11 @@ fn parse_set(set: &str, all: &[u32]) -> Vec<u32> {
         match part.split_once(':') {
             Some((start, end)) => {
                 let start: u32 = start.parse().unwrap_or(0);
-                let end = if end.trim() == "*" { max } else { end.parse().unwrap_or(0) };
+                let end = if end.trim() == "*" {
+                    max
+                } else {
+                    end.parse().unwrap_or(0)
+                };
                 for uid in all {
                     if *uid >= start && *uid <= end {
                         out.push(*uid);
@@ -505,8 +544,16 @@ fn upserts(deltas: &[Delta]) -> Vec<&kite_core::sync::RemoteMsg> {
 #[tokio::test]
 async fn first_sync_parses_messages() {
     let world = Arc::new(Mutex::new(world()));
-    world.lock().expect("world").folder("INBOX").push(FIRST, &["\\Flagged"]);
-    world.lock().expect("world").folder("INBOX").push(SECOND, &["\\Seen"]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Flagged"]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(SECOND, &["\\Seen"]);
     let (imap_port, smtp_port) = serve(world.clone()).await;
 
     let mut imap = Imap::new(config(imap_port, smtp_port));
@@ -514,7 +561,10 @@ async fn first_sync_parses_messages() {
 
     let messages = upserts(&deltas);
     assert_eq!(messages.len(), 2, "two inbox messages");
-    let first = messages.iter().find(|m| m.subject == "Quarterly numbers").expect("first");
+    let first = messages
+        .iter()
+        .find(|m| m.subject == "Quarterly numbers")
+        .expect("first");
     assert_eq!(first.remote_id, "INBOX/1/1");
     assert_eq!(first.folder, "INBOX");
     assert_eq!(first.mailbox, Mailbox::Inbox);
@@ -526,9 +576,18 @@ async fn first_sync_parses_messages() {
     assert_eq!(first.date, 1_746_525_600_000);
     assert_eq!(first.message_id.as_deref(), Some("abc@example.org"));
     assert_eq!(first.in_reply_to.as_deref(), Some("parent@example.org"));
-    assert_eq!(first.references, vec!["root@example.org", "parent@example.org"]);
+    assert_eq!(
+        first.references,
+        vec!["root@example.org", "parent@example.org"]
+    );
     assert!(first.text.contains("plain body"));
-    assert!(first.html.as_deref().expect("html").contains("<p>html body</p>"));
+    assert!(
+        first
+            .html
+            .as_deref()
+            .expect("html")
+            .contains("<p>html body</p>")
+    );
     assert!(first.unread);
     assert!(first.starred);
     assert_eq!(first.attachments.len(), 1);
@@ -536,7 +595,10 @@ async fn first_sync_parses_messages() {
     assert_eq!(first.attachments[0].mime, "application/pdf");
     assert_eq!(first.attachments[0].size, 8);
 
-    let second = messages.iter().find(|m| m.subject == "Lunch?").expect("second");
+    let second = messages
+        .iter()
+        .find(|m| m.subject == "Lunch?")
+        .expect("second");
     assert!(!second.unread);
     assert!(!second.starred);
     assert!(second.html.is_none());
@@ -546,9 +608,21 @@ async fn first_sync_parses_messages() {
 #[tokio::test]
 async fn incremental_sync_reports_new_flags_and_deletes() {
     let world = Arc::new(Mutex::new(world()));
-    world.lock().expect("world").folder("INBOX").push(FIRST, &[]);
-    world.lock().expect("world").folder("INBOX").push(SECOND, &[]);
-    world.lock().expect("world").folder("INBOX").push(FIRST, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(SECOND, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &[]);
     let (imap_port, smtp_port) = serve(world.clone()).await;
 
     let mut imap = Imap::new(config(imap_port, smtp_port));
@@ -576,8 +650,16 @@ async fn incremental_sync_reports_new_flags_and_deletes() {
 #[tokio::test]
 async fn move_returns_the_new_remote_id() {
     let world = Arc::new(Mutex::new(world()));
-    world.lock().expect("world").folder("INBOX").push(FIRST, &[]);
-    world.lock().expect("world").folder("INBOX").push(SECOND, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(SECOND, &[]);
     let (imap_port, smtp_port) = serve(world.clone()).await;
 
     let mut imap = Imap::new(config(imap_port, smtp_port));
@@ -590,18 +672,68 @@ async fn move_returns_the_new_remote_id() {
         .clone();
 
     let new_id = imap
-        .apply(&Op::Move { remote_id: message.clone(), to: Mailbox::Archive })
+        .apply(&Op::Move {
+            remote_id: message.clone(),
+            to: Mailbox::Archive,
+        })
         .await
         .expect("move")
         .expect("copyuid");
     assert_eq!(new_id, "Archive/4/1");
 
     let world = world.lock().expect("world");
-    let archive = world.folders.iter().find(|f| f.name == "Archive").expect("archive");
+    let archive = world
+        .folders
+        .iter()
+        .find(|f| f.name == "Archive")
+        .expect("archive");
     assert_eq!(archive.uids(), vec![1]);
     assert_eq!(archive.msgs[0].raw, SECOND);
-    let inbox = world.folders.iter().find(|f| f.name == "INBOX").expect("inbox");
+    let inbox = world
+        .folders
+        .iter()
+        .find(|f| f.name == "INBOX")
+        .expect("inbox");
     assert_eq!(inbox.uids(), vec![1]);
+}
+
+#[tokio::test]
+async fn flag_ops_set_seen_and_flagged_on_the_server() {
+    let world = Arc::new(Mutex::new(world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Seen"]);
+    let (imap_port, smtp_port) = serve(world.clone()).await;
+    let mut imap = Imap::new(config(imap_port, smtp_port));
+    let (deltas, _) = imap.sync(None).await.expect("sync");
+    let id = upserts(&deltas)[0].remote_id.clone();
+    let flags = || {
+        world.lock().expect("world").folder("INBOX").msgs[0]
+            .flags
+            .clone()
+    };
+
+    let op = Op::Flags {
+        remote_id: id.clone(),
+        unread: Some(true),
+        starred: Some(true),
+    };
+    imap.apply(&op).await.expect("mark unread + star");
+    assert_eq!(
+        flags(),
+        vec!["\\Flagged"],
+        "unread clears \\Seen, star sets \\Flagged"
+    );
+
+    let op = Op::Flags {
+        remote_id: id,
+        unread: Some(false),
+        starred: Some(false),
+    };
+    imap.apply(&op).await.expect("mark read + unstar");
+    assert_eq!(flags(), vec!["\\Seen"]);
 }
 
 #[tokio::test]
@@ -622,19 +754,39 @@ first line\r\n\
 last line\r\n";
 
     let mut imap = Imap::new(config(imap_port, smtp_port));
-    imap.apply(&Op::Send { mime: mime.to_vec() }).await.expect("send");
+    imap.apply(&Op::Send {
+        mime: mime.to_vec(),
+    })
+    .await
+    .expect("send");
 
     let world = world.lock().expect("world");
     assert_eq!(world.sent.len(), 1);
     let sent = &world.sent[0];
     let mut rcpts = sent.rcpts.clone();
     rcpts.sort();
-    assert_eq!(rcpts, vec!["alice@example.org", "carol@example.org", "hidden@example.org"]);
+    assert_eq!(
+        rcpts,
+        vec![
+            "alice@example.org",
+            "carol@example.org",
+            "hidden@example.org"
+        ]
+    );
 
     let raw = String::from_utf8_lossy(&sent.raw).to_string();
-    assert!(!raw.to_ascii_lowercase().contains("bcc:"), "bcc stripped: {raw}");
-    assert!(raw.contains("\r\n..hidden line\r\n"), "dot stuffed: {raw:?}");
-    assert!(raw.replace("\r\n..", "\r\n.").contains("\r\n.hidden line\r\n"));
+    assert!(
+        !raw.to_ascii_lowercase().contains("bcc:"),
+        "bcc stripped: {raw}"
+    );
+    assert!(
+        raw.contains("\r\n..hidden line\r\n"),
+        "dot stuffed: {raw:?}"
+    );
+    assert!(
+        raw.replace("\r\n..", "\r\n.")
+            .contains("\r\n.hidden line\r\n")
+    );
 }
 
 #[tokio::test]
@@ -651,7 +803,11 @@ async fn wrong_password_fails_verify() {
 #[tokio::test]
 async fn attachment_downloads_the_mime_part() {
     let world = Arc::new(Mutex::new(world()));
-    world.lock().expect("world").folder("INBOX").push(FIRST, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &[]);
     let (imap_port, smtp_port) = serve(world.clone()).await;
 
     let mut imap = Imap::new(config(imap_port, smtp_port));

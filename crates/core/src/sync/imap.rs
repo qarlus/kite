@@ -18,6 +18,7 @@ use async_imap::Session;
 use async_imap::imap_proto::rfc4315::UidSetMember;
 use async_imap::imap_proto::{Response, ResponseCode, Status};
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, Uid};
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::TryStreamExt;
 use mail_parser::{Address, HeaderValue, Message, MessageParser, MimeHeaders};
 use serde::{Deserialize, Serialize};
@@ -68,7 +69,11 @@ struct Caps {
 
 impl Imap {
     pub fn new(cfg: ImapConfig) -> Self {
-        Self { cfg, session: None, caps: Caps::default() }
+        Self {
+            cfg,
+            session: None,
+            caps: Caps::default(),
+        }
     }
 
     /// Login check for account setup.
@@ -100,12 +105,18 @@ impl Imap {
         }
     }
 
-    pub async fn attachment(&mut self, remote_msg_id: &str, remote_att_id: &str) -> Result<Vec<u8>> {
+    pub async fn attachment(
+        &mut self,
+        remote_msg_id: &str,
+        remote_att_id: &str,
+    ) -> Result<Vec<u8>> {
         match self.attachment_once(remote_msg_id, remote_att_id).await {
             Ok(bytes) => Ok(bytes),
             Err(first) => {
                 self.session = None;
-                self.attachment_once(remote_msg_id, remote_att_id).await.map_err(|_| first)
+                self.attachment_once(remote_msg_id, remote_att_id)
+                    .await
+                    .map_err(|_| first)
             }
         }
     }
@@ -118,28 +129,45 @@ impl Imap {
             self.session = Some(session);
             self.caps = caps;
         }
-        self.session.as_mut().ok_or_else(|| anyhow!("no imap session"))
+        self.session
+            .as_mut()
+            .ok_or_else(|| anyhow!("no imap session"))
     }
 
     async fn open(&self) -> Result<(Session<Conn>, Caps)> {
         if !self.cfg.tls && !is_loopback(&self.cfg.host) {
             bail!("plaintext IMAP is only allowed for loopback hosts");
         }
-        let tcp = timed(TcpStream::connect((self.cfg.host.as_str(), self.cfg.imap_port))).await
-            .with_context(|| format!("connect to {}:{}", self.cfg.host, self.cfg.imap_port))?;
+        let tcp = timed(TcpStream::connect((
+            self.cfg.host.as_str(),
+            self.cfg.imap_port,
+        )))
+        .await
+        .with_context(|| format!("connect to {}:{}", self.cfg.host, self.cfg.imap_port))?;
         let _ = tcp.set_nodelay(true);
         let mut client = async_imap::Client::new(Conn::Plain(tcp));
-        timed(client.read_response()).await.context("imap greeting")?;
+        timed(client.read_response())
+            .await
+            .context("imap greeting")?;
         if self.cfg.tls {
-            timed(client.run_command_and_check_ok("STARTTLS", None)).await.context("imap starttls")?;
+            timed(client.run_command_and_check_ok("STARTTLS", None))
+                .await
+                .context("imap starttls")?;
             let conn = start_tls(&self.cfg.host, client.into_inner()).await?;
             client = async_imap::Client::new(conn);
         }
         let login = client.login(self.cfg.user.as_str(), self.cfg.password.as_str());
-        let login = tokio::time::timeout(TIMEOUT, login).await.map_err(|_| anyhow!("imap login timed out"))?;
+        let login = tokio::time::timeout(TIMEOUT, login)
+            .await
+            .map_err(|_| anyhow!("imap login timed out"))?;
         let mut session = login.map_err(|(error, _)| error).context("imap login")?;
-        let caps = timed(session.capabilities()).await.context("imap capability")?;
-        let caps = Caps { mv: caps.has_str("MOVE"), condstore: caps.has_str("CONDSTORE") };
+        let caps = timed(session.capabilities())
+            .await
+            .context("imap capability")?;
+        let caps = Caps {
+            mv: caps.has_str("MOVE"),
+            condstore: caps.has_str("CONDSTORE"),
+        };
         Ok((session, caps))
     }
 
@@ -159,11 +187,20 @@ impl Imap {
         }
         // A folder that vanished (or is now skipped) drops every message we held for it.
         let live: BTreeSet<&str> = folders.iter().map(|(name, _)| name.as_str()).collect();
-        let gone: Vec<String> = cursor.folders.keys().filter(|n| !live.contains(n.as_str())).cloned().collect();
+        let gone: Vec<String> = cursor
+            .folders
+            .keys()
+            .filter(|n| !live.contains(n.as_str()))
+            .cloned()
+            .collect();
         for name in gone {
-            let Some(state) = cursor.folders.remove(&name) else { continue };
+            let Some(state) = cursor.folders.remove(&name) else {
+                continue;
+            };
             for uid in decode_uids(&state.uids) {
-                deltas.push(Delta::Delete { remote_id: remote_id(&name, state.uidvalidity, uid) });
+                deltas.push(Delta::Delete {
+                    remote_id: remote_id(&name, state.uidvalidity, uid),
+                });
             }
         }
         Ok((deltas, serde_json::to_string(&cursor)?))
@@ -180,9 +217,15 @@ impl Imap {
         let condstore = self.caps.condstore;
         let session = self.session().await?;
         let select = async {
-            if condstore { session.select_condstore(folder).await } else { session.select(folder).await }
+            if condstore {
+                session.select_condstore(folder).await
+            } else {
+                session.select(folder).await
+            }
         };
-        let selected = timed(select).await.with_context(|| format!("select {folder}"))?;
+        let selected = timed(select)
+            .await
+            .with_context(|| format!("select {folder}"))?;
         let validity = selected.uid_validity.unwrap_or(0);
         let next = selected.uid_next.unwrap_or(0);
         let modseq = selected.highest_modseq;
@@ -191,7 +234,9 @@ impl Imap {
             Some(p) if p.uidvalidity == validity => decode_uids(&p.uids),
             Some(p) => {
                 for uid in decode_uids(&p.uids) {
-                    out.push(Delta::Delete { remote_id: remote_id(folder, p.uidvalidity, uid) });
+                    out.push(Delta::Delete {
+                        remote_id: remote_id(folder, p.uidvalidity, uid),
+                    });
                 }
                 BTreeSet::new()
             }
@@ -207,12 +252,18 @@ impl Imap {
             let all = search(session, "ALL").await?;
             let page: BTreeSet<Uid> = all.iter().rev().take(PAGE).copied().collect();
             known = fetch_msgs(session, &page, folder, role, validity, out).await?;
-            low = if known.len() < PAGE { 0 } else { known.first().copied().unwrap_or(0) };
+            low = if known.len() < PAGE {
+                0
+            } else {
+                known.first().copied().unwrap_or(0)
+            };
         } else {
             // Expunges: anything we hold that the server no longer lists.
             let all = search(session, "ALL").await?;
             for uid in known.difference(&all) {
-                out.push(Delta::Delete { remote_id: remote_id(folder, validity, *uid) });
+                out.push(Delta::Delete {
+                    remote_id: remote_id(folder, validity, *uid),
+                });
             }
             known.retain(|uid| all.contains(uid));
             let held = known.clone();
@@ -232,13 +283,20 @@ impl Imap {
                 }
                 _ => (encode_uids(&known), "(FLAGS)".to_string()),
             };
-            let stream = timed(session.uid_fetch(set.as_str(), items.as_str())).await
+            let stream = timed(session.uid_fetch(set.as_str(), items.as_str()))
+                .await
                 .context("uid fetch flags")?;
-            let changed: Vec<Fetch> = timed(stream.try_collect()).await.context("uid fetch flags")?;
+            let changed: Vec<Fetch> = timed(stream.try_collect())
+                .await
+                .context("uid fetch flags")?;
             for f in &changed {
                 if let Some(uid) = f.uid.filter(|u| held.contains(u)) {
                     let (unread, starred) = flags(f);
-                    out.push(Delta::Flags { remote_id: remote_id(folder, validity, uid), unread, starred });
+                    out.push(Delta::Flags {
+                        remote_id: remote_id(folder, validity, uid),
+                        unread,
+                        starred,
+                    });
                 }
             }
 
@@ -255,7 +313,13 @@ impl Imap {
             }
         }
 
-        Ok(FolderSync { uidvalidity: validity, uidnext: next, modseq, low, uids: encode_uids(&known) })
+        Ok(FolderSync {
+            uidvalidity: validity,
+            uidnext: next,
+            modseq,
+            low,
+            uids: encode_uids(&known),
+        })
     }
 
     // ---- mutations ----
@@ -267,11 +331,16 @@ impl Imap {
                 self.move_to(remote_id, &folder).await
             }
             Op::MoveToFolder { remote_id, folder } => self.move_to(remote_id, folder).await,
-            Op::Flags { remote_id, unread, starred } => {
+            Op::Flags {
+                remote_id,
+                unread,
+                starred,
+            } => {
                 let (folder, _, uid) = split_remote_id(remote_id)?;
                 let mut add = Vec::new();
                 let mut remove = Vec::new();
-                for (want, flag) in [(unread, "\\Seen"), (starred, "\\Flagged")] {
+                // `\Seen` is the inverse of unread.
+                for (want, flag) in [(unread.map(|u| !u), "\\Seen"), (*starred, "\\Flagged")] {
                     match want {
                         Some(true) => add.push(flag),
                         Some(false) => remove.push(flag),
@@ -282,11 +351,14 @@ impl Imap {
                     return Ok(None);
                 }
                 let session = self.session().await?;
-                timed(session.select(folder)).await.with_context(|| format!("select {folder}"))?;
+                timed(session.select(folder))
+                    .await
+                    .with_context(|| format!("select {folder}"))?;
                 for (verb, flags) in [("+FLAGS.SILENT", add), ("-FLAGS.SILENT", remove)] {
                     if !flags.is_empty() {
                         let cmd = format!("UID STORE {uid} {verb} ({})", flags.join(" "));
-                        timed(session.run_command_and_check_ok(cmd.as_str())).await
+                        timed(session.run_command_and_check_ok(cmd.as_str()))
+                            .await
                             .context("uid store")?;
                     }
                 }
@@ -304,21 +376,30 @@ impl Imap {
         self.session().await?;
         let mv = self.caps.mv;
         let session = self.session().await?;
-        timed(session.select(source)).await.with_context(|| format!("select {source}"))?;
+        timed(session.select(source))
+            .await
+            .with_context(|| format!("select {source}"))?;
         let copy = if mv {
             uid_move(session, uid, folder).await?
         } else {
             let set = uid.to_string();
-            timed(session.uid_copy(set.as_str(), folder)).await.context("uid copy")?;
-            timed(session.run_command_and_check_ok(format!(
-                "UID STORE {uid} +FLAGS.SILENT (\\Deleted)"
-            ))).await
+            timed(session.uid_copy(set.as_str(), folder))
+                .await
+                .context("uid copy")?;
+            timed(
+                session
+                    .run_command_and_check_ok(format!("UID STORE {uid} +FLAGS.SILENT (\\Deleted)")),
+            )
+            .await
             .context("uid store")?;
-            timed(session.run_command_and_check_ok(format!("UID EXPUNGE {uid}"))).await
+            timed(session.run_command_and_check_ok(format!("UID EXPUNGE {uid}")))
+                .await
                 .context("uid expunge")?;
             None
         };
-        let Some((validity, new_uid)) = copy else { return Ok(None) };
+        let Some((validity, new_uid)) = copy else {
+            return Ok(None);
+        };
         Ok(Some(remote_id(folder, validity, new_uid)))
     }
 
@@ -340,15 +421,25 @@ impl Imap {
         }
     }
 
-    async fn attachment_once(&mut self, remote_msg_id: &str, remote_att_id: &str) -> Result<Vec<u8>> {
+    async fn attachment_once(
+        &mut self,
+        remote_msg_id: &str,
+        remote_att_id: &str,
+    ) -> Result<Vec<u8>> {
         let (folder, _, uid) = split_remote_id(remote_msg_id)?;
         let index: usize = remote_att_id.parse().context("attachment id")?;
         let session = self.session().await?;
-        timed(session.select(folder)).await.with_context(|| format!("select {folder}"))?;
-        let stream = timed(session.uid_fetch(uid.to_string(), "(BODY.PEEK[])")).await
+        timed(session.select(folder))
+            .await
+            .with_context(|| format!("select {folder}"))?;
+        let stream = timed(session.uid_fetch(uid.to_string(), "(BODY.PEEK[])"))
+            .await
             .context("uid fetch")?;
         let fetched: Vec<Fetch> = timed(stream.try_collect()).await.context("uid fetch")?;
-        let raw = fetched.first().and_then(|f| f.body()).context("message not found")?;
+        let raw = fetched
+            .first()
+            .and_then(|f| f.body())
+            .context("message not found")?;
         let msg = parser().parse(raw).context("unparseable message")?;
         let part = msg
             .parts
@@ -363,7 +454,9 @@ impl Imap {
         if !self.cfg.tls && !is_loopback(&self.cfg.host) {
             bail!("plaintext SMTP is only allowed for loopback hosts");
         }
-        let msg = parser().parse(mime).context("unparseable outbound message")?;
+        let msg = parser()
+            .parse(mime)
+            .context("unparseable outbound message")?;
         let mut rcpts = Vec::new();
         for list in [msg.to(), msg.cc(), msg.bcc()].into_iter().flatten() {
             for addr in list.iter() {
@@ -377,8 +470,12 @@ impl Imap {
         }
         let body = strip_bcc(mime);
 
-        let tcp = timed(TcpStream::connect((self.cfg.host.as_str(), self.cfg.smtp_port))).await
-            .with_context(|| format!("connect to {}:{}", self.cfg.host, self.cfg.smtp_port))?;
+        let tcp = timed(TcpStream::connect((
+            self.cfg.host.as_str(),
+            self.cfg.smtp_port,
+        )))
+        .await
+        .with_context(|| format!("connect to {}:{}", self.cfg.host, self.cfg.smtp_port))?;
         let _ = tcp.set_nodelay(true);
         let mut conn = Conn::Plain(tcp);
         expect(&mut conn, 220, "greeting").await?;
@@ -395,7 +492,11 @@ impl Imap {
         credentials.extend_from_slice(self.cfg.user.as_bytes());
         credentials.push(0);
         credentials.extend_from_slice(self.cfg.password.as_bytes());
-        say(&mut conn, &format!("AUTH PLAIN {}", base64(&credentials))).await?;
+        say(
+            &mut conn,
+            &format!("AUTH PLAIN {}", STANDARD.encode(&credentials)),
+        )
+        .await?;
         expect(&mut conn, 235, "auth").await?;
         say(&mut conn, &format!("MAIL FROM:<{}>", self.cfg.user)).await?;
         expect(&mut conn, 250, "mail from").await?;
@@ -412,14 +513,21 @@ impl Imap {
     }
 
     fn ehlo_name(&self) -> String {
-        self.cfg.user.split('@').nth(1).unwrap_or("localhost").to_string()
+        self.cfg
+            .user
+            .split('@')
+            .nth(1)
+            .unwrap_or("localhost")
+            .to_string()
     }
 
     // ---- folder discovery ----
 
     async fn folders(&mut self) -> Result<Vec<(String, Mailbox)>> {
         let session = self.session().await?;
-        let stream = timed(session.list(Some(""), Some("*"))).await.context("list")?;
+        let stream = timed(session.list(Some(""), Some("*")))
+            .await
+            .context("list")?;
         let names: Vec<Name> = timed(stream.try_collect()).await.context("list")?;
         let mut out = Vec::new();
         for name in &names {
@@ -444,14 +552,21 @@ async fn uid_move(session: &mut Session<Conn>, uid: Uid, dest: &str) -> Result<O
     let mut mapping = None;
     loop {
         let response = timed(session.read_response()).await.context("uid move")?;
-        let Some(response) = response else { bail!("imap connection closed during move") };
+        let Some(response) = response else {
+            bail!("imap connection closed during move")
+        };
         match response.parsed() {
-            Response::Data { status: Status::Ok, outcome } => {
+            Response::Data {
+                status: Status::Ok,
+                outcome,
+            } => {
                 if let Some(ResponseCode::CopyUid(validity, _, dest)) = &outcome.code {
                     mapping = Some((*validity, first_uid(dest)));
                 }
             }
-            Response::Done { tag: done, status, .. } if done == &tag => {
+            Response::Done {
+                tag: done, status, ..
+            } if done == &tag => {
                 if *status != Status::Ok {
                     bail!("imap move failed: {status:?}");
                 }
@@ -471,7 +586,9 @@ fn first_uid(set: &[UidSetMember]) -> Uid {
 }
 
 async fn search(session: &mut Session<Conn>, query: &str) -> Result<BTreeSet<Uid>> {
-    let found = timed(session.uid_search(query)).await.with_context(|| format!("uid search {query}"))?;
+    let found = timed(session.uid_search(query))
+        .await
+        .with_context(|| format!("uid search {query}"))?;
     Ok(found.into_iter().collect())
 }
 
@@ -487,9 +604,12 @@ async fn fetch_msgs(
         return Ok(BTreeSet::new());
     }
     let set = encode_uids(uids);
-    let stream = timed(session.uid_fetch(set.as_str(), "(FLAGS RFC822.SIZE BODY.PEEK[])")).await
+    let stream = timed(session.uid_fetch(set.as_str(), "(FLAGS RFC822.SIZE BODY.PEEK[])"))
+        .await
         .with_context(|| format!("fetch {folder}"))?;
-    let fetched: Vec<Fetch> = timed(stream.try_collect()).await.with_context(|| format!("fetch {folder}"))?;
+    let fetched: Vec<Fetch> = timed(stream.try_collect())
+        .await
+        .with_context(|| format!("fetch {folder}"))?;
     let mut got = BTreeSet::new();
     for f in &fetched {
         let Some(uid) = f.uid else { continue };
@@ -520,7 +640,12 @@ fn to_msg(f: &Fetch, uid: Uid, folder: &str, role: Mailbox, validity: u32) -> Op
             HeaderValue::Text(text) => text.split_whitespace().map(trim_id).collect(),
             _ => Vec::new(),
         },
-        from: from.and_then(|a| addrs(a).into_iter().next()).unwrap_or(Addr { name: String::new(), email: String::new() }),
+        from: from
+            .and_then(|a| addrs(a).into_iter().next())
+            .unwrap_or(Addr {
+                name: String::new(),
+                email: String::new(),
+            }),
         to: to.map(addrs).unwrap_or_default(),
         cc: cc.map(addrs).unwrap_or_default(),
         date: msg.date().map(|d| d.to_timestamp() * 1000).unwrap_or(0),
@@ -557,7 +682,10 @@ fn to_msg(f: &Fetch, uid: Uid, folder: &str, role: Mailbox, validity: u32) -> Op
 
 /// mail-parser lists every body candidate in both lists, so the part itself decides.
 fn body(msg: &Message<'_>, html: bool) -> Option<String> {
-    let part = msg.parts.iter().find(|p| p.is_text() && p.is_text_html() == html)?;
+    let part = msg
+        .parts
+        .iter()
+        .find(|p| p.is_text() && p.is_text_html() == html)?;
     part.text_contents().map(str::to_string)
 }
 
@@ -578,14 +706,21 @@ fn addrs(address: &Address<'_>) -> Vec<Addr> {
     address
         .iter()
         .filter_map(|a| {
-            Some(Addr { name: a.name().unwrap_or_default().to_string(), email: a.address()?.to_string() })
+            Some(Addr {
+                name: a.name().unwrap_or_default().to_string(),
+                email: a.address()?.to_string(),
+            })
         })
         .collect()
 }
 
 /// Headers carry `<id>`; the store threads on the bare id.
 fn trim_id(raw: &str) -> String {
-    raw.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string()
+    raw.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string()
 }
 
 fn parser() -> &'static MessageParser {
@@ -653,7 +788,11 @@ fn encode_uids(uids: &BTreeSet<Uid>) -> String {
             end = *next;
             iter.next();
         }
-        out.push(if start == end { start.to_string() } else { format!("{start}:{end}") });
+        out.push(if start == end {
+            start.to_string()
+        } else {
+            format!("{start}:{end}")
+        });
     }
     out.join(",")
 }
@@ -681,24 +820,6 @@ fn quote(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// AUTH PLAIN payload encoding (RFC 4616).
-fn base64(data: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
-        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
-        for i in 0..4 {
-            if i <= chunk.len() {
-                out.push(ALPHABET[(n >> (18 - 6 * i)) as usize & 63] as char);
-            } else {
-                out.push('=');
-            }
-        }
-    }
-    out
-}
-
 fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "[::1]" | "localhost")
 }
@@ -713,7 +834,11 @@ enum Conn {
 }
 
 impl AsyncRead for Conn {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Conn::Plain(tcp) => Pin::new(tcp).poll_read(cx, buf),
             Conn::Tls(tls) => Pin::new(tls.as_mut()).poll_read(cx, buf),
@@ -722,7 +847,11 @@ impl AsyncRead for Conn {
 }
 
 impl AsyncWrite for Conn {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Conn::Plain(tcp) => Pin::new(tcp).poll_write(cx, buf),
             Conn::Tls(tls) => Pin::new(tls.as_mut()).poll_write(cx, buf),
@@ -748,7 +877,9 @@ async fn start_tls(host: &str, conn: Conn) -> Result<Conn> {
     let mut builder = native_tls::TlsConnector::builder();
     if is_loopback(host) {
         // Bridge serves its own self-signed certificate on loopback only.
-        builder.danger_accept_invalid_certs(true).danger_accept_invalid_hostnames(true);
+        builder
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true);
     }
     let connector = builder.build().context("tls connector")?;
     let connector = tokio_native_tls::TlsConnector::from(connector);
@@ -764,7 +895,9 @@ async fn start_tls(host: &str, conn: Conn) -> Result<Conn> {
 }
 
 async fn say(conn: &mut Conn, line: &str) -> Result<()> {
-    timed(async { conn.write_all(format!("{line}\r\n").as_bytes()).await }).await.context("smtp")?;
+    timed(async { conn.write_all(format!("{line}\r\n").as_bytes()).await })
+        .await
+        .context("smtp")?;
     timed(conn.flush()).await.context("smtp")
 }
 
@@ -793,7 +926,10 @@ async fn read_line(conn: &mut Conn) -> Result<String> {
 /// Reads one (possibly multi-line) reply and returns its status code.
 async fn read_reply(conn: &mut Conn) -> Result<u16> {
     let first = read_line(conn).await?;
-    let code: u16 = first.get(..3).and_then(|c| c.parse().ok()).context("smtp reply code")?;
+    let code: u16 = first
+        .get(..3)
+        .and_then(|c| c.parse().ok())
+        .context("smtp reply code")?;
     if first.as_bytes().get(3) == Some(&b'-') {
         loop {
             let line = read_line(conn).await?;
@@ -840,7 +976,9 @@ fn strip_bcc(mime: &[u8]) -> Vec<u8> {
         .position(|w| w == b"\r\n\r\n")
         .map(|i| (i, 4))
         .or_else(|| mime.windows(2).position(|w| w == b"\n\n").map(|i| (i, 2)));
-    let Some((head_end, sep)) = split else { return mime.to_vec() };
+    let Some((head_end, sep)) = split else {
+        return mime.to_vec();
+    };
     let mut out = Vec::with_capacity(mime.len());
     let mut dropping = false;
     for line in mime[..head_end].split(|b| *b == b'\n') {

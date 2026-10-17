@@ -4321,6 +4321,7 @@ dependencies = [
  "anyhow",
  "async-channel 2.5.0",
  "async-imap",
+ "base64 0.22.1",
  "futures-util",
  "mail-parser",
  "native-tls",
