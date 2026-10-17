@@ -109,7 +109,7 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
         );
     })
     .unwrap();
-    let saved = kite::preferences::read_settings(&file.0).unwrap();
+    let saved = common::read_settings(&file.0).unwrap();
     assert_eq!(saved.theme, "linen");
     assert_eq!(saved.font_size, 15);
     let (reopened, _) = mount(cx, fixture);

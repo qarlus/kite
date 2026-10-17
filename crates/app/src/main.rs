@@ -1,97 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-//! Wave 2 replaces `Empty` with the real engine. Until then the app runs on no data.
+//! Opens the local engine and runs the Kite window.
 use gpui_kit::component::TitleBar;
 use gpui_kit::*;
-use kite_core::api::Mail;
-use kite_core::model::{
-    Account, Action as MailAction, Addr, CalEvent, ChatMsg, Draft, Event, Id, Message, ProtonLogin,
-    Settings, Split, ThreadSummary, View,
-};
-use std::sync::Arc;
-
-struct Empty {
-    settings_path: std::path::PathBuf,
-}
-
-impl Mail for Empty {
-    fn accounts(&self) -> anyhow::Result<Vec<Account>> {
-        Ok(Vec::new())
-    }
-    fn add_proton(&self, _: ProtonLogin) -> anyhow::Result<Account> {
-        anyhow::bail!(
-            "Account connection requires the mail engine, which is not connected in this build."
-        )
-    }
-    fn add_microsoft(&self) -> anyhow::Result<Account> {
-        anyhow::bail!(
-            "Account connection requires the mail engine, which is not connected in this build."
-        )
-    }
-    fn remove_account(&self, _: Id) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn threads(&self, _: &View, _: u32, _: u32) -> anyhow::Result<Vec<ThreadSummary>> {
-        Ok(Vec::new())
-    }
-    fn thread(&self, _: Id) -> anyhow::Result<Vec<Message>> {
-        Ok(Vec::new())
-    }
-    fn act(&self, _: &[Id], _: &MailAction) -> anyhow::Result<i64> {
-        Ok(0)
-    }
-    fn undo(&self, _: i64) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn send(&self, _: Draft) -> anyhow::Result<Id> {
-        anyhow::bail!("no engine yet")
-    }
-    fn cancel_send(&self, _: Id) -> anyhow::Result<Option<Draft>> {
-        Ok(None)
-    }
-    fn contacts(&self, _: &str) -> anyhow::Result<Vec<Addr>> {
-        Ok(Vec::new())
-    }
-    fn open_attachment(&self, _: Id) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn splits(&self) -> anyhow::Result<Vec<Split>> {
-        Ok(Vec::new())
-    }
-    fn set_splits(&self, _: Vec<Split>) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn settings(&self) -> anyhow::Result<Settings> {
-        kite::preferences::read_settings(&self.settings_path)
-    }
-    fn set_settings(&self, settings: Settings) -> anyhow::Result<()> {
-        kite::preferences::write_settings(&self.settings_path, &settings)
-    }
-    fn set_ai_key(&self, _: &str) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn calendar_today(&self, _: Id) -> anyhow::Result<Vec<CalEvent>> {
-        Ok(Vec::new())
-    }
-    fn ai(&self, _: u32, _: Vec<ChatMsg>) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn sync_now(&self) {}
-    fn events(&self) -> async_channel::Receiver<Event> {
-        let (tx, rx) = async_channel::unbounded();
-        std::mem::forget(tx);
-        rx
-    }
-}
 
 fn main() {
-    let directory = std::env::var_os("APPDATA")
-        .or_else(|| std::env::var_os("XDG_CONFIG_HOME"))
-        .map(std::path::PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
-        })
-        .unwrap_or_else(std::env::temp_dir)
-        .join("Kite");
+    let directory = kite_core::engine::data_dir();
+    let engine = match kite_core::engine::Engine::open(&directory) {
+        Ok(engine) => engine,
+        Err(error) => {
+            eprintln!(
+                "Kite could not open its local mail database in {}: {error:#}",
+                directory.display()
+            );
+            std::process::exit(1);
+        }
+    };
     gpui_kit::application()
         .with_assets(kite::Assets)
         .run(move |cx| {
@@ -104,17 +27,7 @@ fn main() {
                     ..TitleBar::window_options()
                 },
                 cx,
-                |window, cx| {
-                    cx.new(|cx| {
-                        kite::app::Kite::new(
-                            Arc::new(Empty {
-                                settings_path: directory.join("settings.json"),
-                            }),
-                            window,
-                            cx,
-                        )
-                    })
-                },
+                |window, cx| cx.new(|cx| kite::app::Kite::new(engine, window, cx)),
             )
             .expect("failed to open window");
         });

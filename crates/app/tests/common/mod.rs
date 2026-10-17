@@ -598,14 +598,14 @@ impl Mail for Fixture {
 
     fn settings(&self) -> anyhow::Result<Settings> {
         if let Some(path) = &*self.settings_path.lock().unwrap() {
-            return kite::preferences::read_settings(path);
+            return read_settings(path);
         }
         Ok(self.settings.lock().unwrap().clone())
     }
 
     fn set_settings(&self, settings: Settings) -> anyhow::Result<()> {
         if let Some(path) = &*self.settings_path.lock().unwrap() {
-            kite::preferences::write_settings(path, &settings)?;
+            write_settings(path, &settings)?;
         }
         *self.settings.lock().unwrap() = settings;
         Ok(())
@@ -630,6 +630,26 @@ impl Mail for Fixture {
         self.senders.lock().unwrap().push(tx);
         rx
     }
+}
+
+/// Settings-file helpers for the fixture only; production persists settings in the engine.
+pub fn read_settings(path: &std::path::Path) -> anyhow::Result<Settings> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn write_settings(path: &std::path::Path, settings: &Settings) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let temp = path.with_extension("json.tmp");
+    let bytes = serde_json::to_vec_pretty(settings)?;
+    std::fs::write(&temp, bytes)?;
+    std::fs::rename(temp, path)?;
+    Ok(())
 }
 
 /// The production window entry point with deterministic test bounds.

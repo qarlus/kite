@@ -1039,23 +1039,3 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
     }
     root.into_any_element()
 }
-
-/// Local shell storage until the engine owns preferences. Credentials are never included.
-pub fn read_settings(path: &std::path::Path) -> anyhow::Result<Settings> {
-    match std::fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(error) => Err(error.into()),
-    }
-}
-
-pub fn write_settings(path: &std::path::Path, settings: &Settings) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let temp = path.with_extension("json.tmp");
-    let bytes = serde_json::to_vec_pretty(settings)?;
-    std::fs::write(&temp, bytes)?;
-    std::fs::rename(temp, path)?;
-    Ok(())
-}
