@@ -361,6 +361,47 @@ fn a_wrong_bridge_password_leaves_no_account() {
 }
 
 #[test]
+fn creating_a_folder_persists_it_and_a_provider_error_persists_nothing() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = engine.add_proton(login(server.ports())).expect("add");
+
+    assert!(
+        engine.folders().expect("folders").is_empty(),
+        "discovery is out of scope, so nothing is cached yet"
+    );
+
+    let folder = engine.create_folder(account.id, "Receipts").expect("create");
+    assert_eq!(folder.account_id, account.id);
+    assert_eq!(folder.name, "Receipts");
+    assert!(folder.id.ends_with("Receipts"), "{}", folder.id);
+
+    // The provider really accepted it, including the subscribe.
+    {
+        let world = world.lock().expect("world");
+        assert!(world.folders.iter().any(|f| f.name == folder.id));
+        assert!(world.subscribed.contains(&folder.id));
+    }
+
+    // `Mail::folders` reads the local catalog, so the folder is visible without a round trip.
+    let folders = engine.folders().expect("folders");
+    assert_eq!(folders.len(), 1);
+    assert_eq!(folders[0].id, folder.id);
+    assert_eq!(folders[0].name, "Receipts");
+
+    // A provider failure must not leave a phantom folder behind.
+    server.stop();
+    assert!(engine.create_folder(account.id, "Loud").is_err());
+    let folders = engine.folders().expect("folders");
+    assert_eq!(folders.len(), 1, "only the first folder exists");
+    assert!(folders.iter().all(|f| f.name == "Receipts"));
+}
+
+#[test]
 fn ai_streams_sse_chunks_in_order() {
     let address = sse_server(&[
         r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,

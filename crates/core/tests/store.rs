@@ -62,6 +62,22 @@ fn unread(mut m: RemoteMsg) -> RemoteMsg {
     m
 }
 
+fn in_folder(mut m: RemoteMsg, folder: &str) -> RemoteMsg {
+    m.folder = folder.into();
+    m.mailbox = Mailbox::All;
+    m
+}
+
+fn folder_view(account: Option<Id>, folder: &str) -> View {
+    View {
+        account_id: account,
+        mailbox: Mailbox::All,
+        split: None,
+        query: None,
+        folder: Some(folder.into()),
+    }
+}
+
 fn flagged(mut m: RemoteMsg, important: bool) -> RemoteMsg {
     m.important = Some(important);
     m
@@ -818,6 +834,184 @@ fn accounts_cascade_on_removal() {
     s.remove_account(a.id).unwrap();
     assert!(s.accounts().unwrap().is_empty());
     assert!(s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().is_empty());
+}
+
+#[test]
+fn folders_round_trip_and_threads_honour_the_folder_view() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "a@x.com", "A").unwrap();
+    let b = s.add_account(Provider::Microsoft, "b@x.com", "B").unwrap();
+
+    let travel = s.create_folder(a.id, "Travel").unwrap();
+    let receipts = s.create_folder(a.id, "Receipts").unwrap();
+    let archive = s.create_folder(b.id, "Archive 2019").unwrap();
+    assert_eq!(travel.account_id, a.id);
+    assert_eq!(travel.name, "Travel");
+    assert_eq!(travel.id, "Travel", "an IMAP folder is identified by its name");
+
+    let ordered: Vec<(Id, String)> = s
+        .folders()
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.account_id, f.name))
+        .collect();
+    assert_eq!(
+        ordered,
+        vec![
+            (a.id, "Receipts".into()),
+            (a.id, "Travel".into()),
+            (b.id, "Archive 2019".into()),
+        ]
+    );
+    assert_eq!(s.folder_owner(&travel.id).unwrap(), Some(a.id));
+    assert_eq!(s.folder_owner("missing").unwrap(), None);
+
+    // Empty and duplicate names never reach the catalog.
+    assert!(s.create_folder(a.id, "   ").is_err());
+    assert!(s.create_folder(a.id, "travel").is_err());
+    assert_eq!(s.folders().unwrap().len(), 3);
+
+    s.apply_deltas(
+        a.id,
+        &[
+            up(in_folder(msg("t1", "ada@x.com", "Trip", D0), &travel.id)),
+            up(in_folder(
+                msg("r1", "ada@x.com", "Invoice", D0 + 1),
+                &receipts.id,
+            )),
+            up(msg("i1", "ada@x.com", "Hello", D0 + 2)),
+        ],
+    )
+    .unwrap();
+    s.apply_deltas(
+        b.id,
+        &[up(in_folder(
+            msg("b1", "bob@x.com", "Old", D0),
+            &archive.id,
+        ))],
+    )
+    .unwrap();
+
+    // A folder view returns only that folder's mail; it supersedes the mailbox filter.
+    let travel_rows = s
+        .threads(&folder_view(Some(a.id), &travel.id), 0, 50)
+        .unwrap();
+    assert_eq!(travel_rows.len(), 1);
+    assert_eq!(travel_rows[0].subject, "Trip");
+    assert_eq!(travel_rows[0].account_id, a.id);
+    let receipts_rows = s
+        .threads(&folder_view(Some(a.id), &receipts.id), 0, 50)
+        .unwrap();
+    assert_eq!(receipts_rows.len(), 1);
+    assert_eq!(receipts_rows[0].subject, "Invoice");
+
+    // Combined scope still resolves the folder to its owner.
+    let combined = s.threads(&folder_view(None, &travel.id), 0, 50).unwrap();
+    assert_eq!(combined.len(), 1);
+    assert_eq!(combined[0].account_id, a.id);
+
+    // A folder asked for under the wrong account yields nothing: it has one owner.
+    assert!(
+        s.threads(&folder_view(Some(b.id), &travel.id), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        s.threads(&folder_view(None, "missing"), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_move_into_another_accounts_folder_is_rejected() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "a@x.com", "A").unwrap();
+    let b = s.add_account(Provider::Proton, "b@x.com", "B").unwrap();
+    let folder = s.create_folder(a.id, "Travel").unwrap();
+
+    s.apply_deltas(b.id, &[up(msg("b1", "bob@x.com", "B mail", D0))])
+        .unwrap();
+    let tid = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap()[0].id;
+
+    let error = s
+        .act(&[tid], &Action::Move {
+            folder: folder.id.clone(),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("does not belong"), "{error}");
+
+    // No local mutation: still in the inbox, nothing queued, nothing armed for undo.
+    let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
+    assert_eq!(inbox.len(), 1, "the message did not move");
+    assert_eq!(inbox[0].account_id, b.id);
+    assert!(s.pending_ops(b.id, DUE, 10).unwrap().is_empty());
+    assert!(
+        s.threads(&folder_view(Some(a.id), &folder.id), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+
+    // The owning account can move into it, and undo restores the message.
+    s.apply_deltas(a.id, &[up(msg("a1", "ada@x.com", "A mail", D0 + 1))])
+        .unwrap();
+    let own = s
+        .threads(&view(Mailbox::Inbox), 0, 50)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.account_id == a.id)
+        .unwrap()
+        .id;
+    let token = s.act(&[own], &Action::Move {
+        folder: folder.id.clone(),
+    })
+    .unwrap();
+    assert_eq!(
+        s.threads(&folder_view(Some(a.id), &folder.id), 0, 50)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(s.pending_ops(a.id, DUE, 10).unwrap().iter().any(
+        |(_, op)| matches!(op, Op::MoveToFolder { folder: f, .. } if f == &folder.id)
+    ));
+    s.undo(token).unwrap();
+    assert!(
+        s.threads(&folder_view(Some(a.id), &folder.id), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn a_database_from_before_the_folder_catalog_still_opens() {
+    let path = temp_db("migrate");
+    let result = (|| {
+        let s = Store::open(&path)?;
+        let a = s.add_account(Provider::Proton, "me@x.com", "Me")?;
+        s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])?;
+        assert!(s.folders()?.is_empty());
+        drop(s);
+        // Roll the database back to the schema that shipped before this change.
+        {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.execute_batch(
+                "DROP TABLE folders; DROP INDEX IF EXISTS messages_folder; PRAGMA user_version=1;",
+            )?;
+        }
+        let s = Store::open(&path)?;
+        assert_eq!(
+            s.threads(&view(Mailbox::Inbox), 0, 50)?.len(),
+            1,
+            "existing mail survives the migration"
+        );
+        let folder = s.create_folder(a.id, "Travel")?;
+        assert_eq!(folder.name, "Travel");
+        assert_eq!(s.folders()?.len(), 1, "the catalog migrated in");
+        Ok::<(), anyhow::Error>(())
+    })();
+    cleanup(&path);
+    result.unwrap();
 }
 
 #[test]

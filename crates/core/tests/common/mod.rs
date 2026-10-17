@@ -88,6 +88,7 @@ pub struct World {
     pub user: String,
     pub password: String,
     pub folders: Vec<Folder>,
+    pub subscribed: Vec<String>,
     pub sent: Vec<Sent>,
 }
 
@@ -115,6 +116,7 @@ pub fn world() -> World {
             Folder::new("Starred", &["\\Flagged"], 8),
             Folder::new("Folders/Travel", &[], 9),
         ],
+        subscribed: Vec::new(),
         sent: Vec::new(),
     }
 }
@@ -277,6 +279,23 @@ fn handle(world: &mut World, tag: &str, rest: &str, selected: &mut String) -> Ve
             out.extend(reply(tag, "LOGOUT completed"));
             out
         }
+        "CREATE" => {
+            let name = unquote(args).0;
+            if world.folders.iter().any(|f| f.name == name) {
+                return format!("{tag} NO [ALREADYEXISTS] mailbox exists\r\n").into_bytes();
+            }
+            let uidvalidity = 100 + world.folders.len() as u32;
+            world.folders.push(Folder::new(&name, &[], uidvalidity));
+            reply(tag, "CREATE completed")
+        }
+        "SUBSCRIBE" => {
+            let name = unquote(args).0;
+            if !world.subscribed.contains(&name) {
+                world.subscribed.push(name);
+            }
+            reply(tag, "SUBSCRIBE completed")
+        }
+        "UNSUBSCRIBE" => reply(tag, "UNSUBSCRIBE completed"),
         _ => reply(tag, "ok"),
     }
 }

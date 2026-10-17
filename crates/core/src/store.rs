@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
@@ -119,6 +119,17 @@ INSERT INTO splits(id, name, query, position) VALUES (1, 'Important', 'is:import
 INSERT INTO splits(id, name, query, position) VALUES (2, 'Other', '-is:important', 1);
 "#;
 
+/// Schema v2 adds the custom folder catalog and the index that makes a `View::folder` lookup one
+/// indexed query. `IF NOT EXISTS` keeps this safe for databases created before the catalog existed.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS folders (
+  id TEXT PRIMARY KEY, account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  name TEXT NOT NULL, created INTEGER NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS folders_account_name ON folders(account_id, name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder);
+"#;
+
 /// Fields the engine needs to build reply MIME. `references` already ends with `message_id_header`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyCtx {
@@ -147,10 +158,17 @@ impl Store {
     fn init(conn: Connection) -> Result<Store> {
         conn.busy_timeout(Duration::from_millis(5000))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA temp_store=memory; PRAGMA mmap_size=268435456;")?;
-        if conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? < 1 {
+        let version = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))?;
+        if version < 1 {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(SCHEMA_V1)?;
             tx.execute_batch("PRAGMA user_version=1")?;
+            tx.commit()?;
+        }
+        if version < 2 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch("PRAGMA user_version=2")?;
             tx.commit()?;
         }
         Ok(Store { conn })
@@ -228,6 +246,81 @@ impl Store {
             params![cursor, id],
         )?;
         Ok(())
+    }
+}
+
+// ----------------------------------------------------------------- folders
+
+impl Store {
+    /// Locally known custom folders, ordered by account then name.
+    pub fn folders(&self) -> Result<Vec<Folder>> {
+        let mut s = self.conn.prepare(
+            "SELECT id, account_id, name FROM folders ORDER BY account_id, name COLLATE NOCASE",
+        )?;
+        let it = s.query_map([], |r| {
+            Ok(Folder {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                name: r.get(2)?,
+            })
+        })?;
+        Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// A folder whose provider identity is its display name (an IMAP mailbox).
+    pub fn create_folder(&self, account: Id, name: &str) -> Result<Folder> {
+        self.add_folder(account, name, name)
+    }
+
+    /// Persists a folder under its provider identity. The engine calls this only after the provider
+    /// accepted the folder, so a successful return means the local catalog holds it.
+    pub(crate) fn add_folder(&self, account: Id, id: &str, name: &str) -> Result<Folder> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("folder name is empty");
+        }
+        if id.is_empty() {
+            bail!("folder id is empty");
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        let taken: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=?1 AND name=?2 COLLATE NOCASE)",
+            params![account, name],
+            |r| r.get(0),
+        )?;
+        if taken {
+            bail!("folder {name:?} already exists in account {account}");
+        }
+        // A provider identity is unique in the catalog; a different account owning it must fail
+        // loudly rather than silently reassigning the folder.
+        if let Some(owner) = tx
+            .query_row("SELECT account_id FROM folders WHERE id=?1", [id], |r| {
+                r.get::<_, Id>(0)
+            })
+            .optional()?
+            && owner != account
+        {
+            bail!("folder id {id:?} already belongs to account {owner}");
+        }
+        tx.execute(
+            "INSERT INTO folders(id, account_id, name, created) VALUES (?1,?2,?3,?4)",
+            params![id, account, name, now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(Folder {
+            id: id.to_string(),
+            account_id: account,
+            name: name.to_string(),
+        })
+    }
+
+    pub fn folder_owner(&self, folder: &str) -> Result<Option<Id>> {
+        Ok(self
+            .conn
+            .query_row("SELECT account_id FROM folders WHERE id=?1", [folder], |r| {
+                r.get(0)
+            })
+            .optional()?)
     }
 }
 
@@ -669,11 +762,35 @@ impl Store {
             view.query.clone().unwrap_or_default()
         ));
 
-        let mut conds: Vec<String> = vec![mailbox_cond(view.mailbox).to_string()];
+        let mut conds: Vec<String> = Vec::new();
         let mut ps: Vec<Value> = Vec::new();
-        if let Some(a) = view.account_id {
-            conds.push("t.account_id=?".into());
-            ps.push(Value::Integer(a));
+        match &view.folder {
+            // A folder belongs to exactly one account and supersedes the standard mailbox filter.
+            Some(folder) => {
+                conds.push(FOLDER_IN.into());
+                ps.push(Value::Text(folder.clone()));
+                match view.account_id {
+                    Some(a) => {
+                        conds.push("t.account_id=?".into());
+                        ps.push(Value::Integer(a));
+                    }
+                    // No explicit account: the folder's owner decides. An unknown folder matches
+                    // nothing, because `account_id = NULL` is never true.
+                    None => {
+                        conds.push(
+                            "t.account_id=(SELECT account_id FROM folders WHERE id=?)".into(),
+                        );
+                        ps.push(Value::Text(folder.clone()));
+                    }
+                }
+            }
+            None => {
+                conds.push(mailbox_cond(view.mailbox).to_string());
+                if let Some(a) = view.account_id {
+                    conds.push("t.account_id=?".into());
+                    ps.push(Value::Integer(a));
+                }
+            }
         }
         if !p.match_terms.is_empty() {
             conds.push(FTS_IN.into());
@@ -841,6 +958,18 @@ impl Store {
             let Some(account_id) = account_id else {
                 continue;
             };
+            // Moving into a folder that belongs to another account is a caller bug: reject it
+            // before anything local changes. Dropping `tx` rolls back the whole action.
+            if let Action::Move { folder } = action {
+                let owner: Option<Id> = tx
+                    .query_row("SELECT account_id FROM folders WHERE id=?1", [folder], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                if owner != Some(account_id) {
+                    bail!("folder {folder:?} does not belong to account {account_id}");
+                }
+            }
             let states = message_states(&tx, thread_id)?;
             if states.is_empty() {
                 continue;
@@ -1354,6 +1483,7 @@ impl Store {
 // ----------------------------------------------------------------- searching
 
 const FTS_IN: &str = "t.id IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
+const FOLDER_IN: &str = "t.id IN (SELECT m.thread_id FROM messages m WHERE m.folder=?)";
 const FTS_NOT_IN: &str = "t.id NOT IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
 
 #[derive(Default)]

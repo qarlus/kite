@@ -270,6 +270,25 @@ async fn wrong_password_fails_verify() {
 }
 
 #[tokio::test]
+async fn create_folder_creates_and_subscribes_the_mailbox() {
+    let world = Arc::new(Mutex::new(world()));
+    let (imap_port, smtp_port) = serve(world.clone()).await.ports();
+
+    let mut imap = Imap::new(config(imap_port, smtp_port));
+    let id = imap.create_folder("Receipts").await.expect("create");
+    assert_eq!(id, "Folders/Receipts");
+
+    {
+        let world = world.lock().expect("world");
+        assert!(world.folders.iter().any(|f| f.name == id));
+        assert!(world.subscribed.contains(&id));
+    }
+
+    // A folder that already exists is an error, never a silent success.
+    assert!(imap.create_folder("Receipts").await.is_err());
+}
+
+#[tokio::test]
 async fn attachment_downloads_the_mime_part() {
     let world = Arc::new(Mutex::new(world()));
     world
