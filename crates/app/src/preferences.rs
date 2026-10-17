@@ -1,6 +1,6 @@
 //! Preferences stay behind the Mail boundary; provider work never runs on the UI thread.
 use crate::app::{Kite, Overlay};
-use crate::theme::{self, Theme};
+use crate::theme::{self, RADIUS, RADIUS_SM, Theme};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{Icon, Sizable};
@@ -357,8 +357,8 @@ fn heading(t: Theme, title: &str, description: &str) -> impl IntoElement {
         .gap_2()
         .child(
             div()
-                .text_size(t.px(19.))
-                .font_weight(FontWeight::SEMIBOLD)
+                .text_size(t.px(20.))
+                .font_weight(FontWeight(650.))
                 .child(title.to_string()),
         )
         .child(
@@ -380,7 +380,7 @@ fn button(
         .aria_label(label.to_string())
         .px_3()
         .py_2()
-        .rounded(px(7.))
+        .rounded(px(RADIUS_SM))
         .border_1()
         .border_color(t.line)
         .bg(t.bg2)
@@ -388,6 +388,76 @@ fn button(
         .cursor_pointer()
         .hover(|s| s.bg(t.bg3))
         .child(label.to_string())
+}
+
+/// DESIGN › Settings: theme tiles show a miniature native inbox, not a generic swatch.
+fn inbox_preview(palette: Theme) -> Div {
+    let faint = |a: f32| Theme::alpha(palette.fg3, a);
+    div()
+        .h(px(90.))
+        .rounded(px(RADIUS_SM))
+        .overflow_hidden()
+        .flex()
+        .bg(palette.bg)
+        .child(
+            div()
+                .w(px(34.))
+                .h_full()
+                .flex_shrink_0()
+                .bg(palette.bg2)
+                .px_1()
+                .pt(px(12.))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().h(px(7.)).w_full().rounded(px(2.)).bg(palette.sel))
+                .children(
+                    (0..3).map(move |_| div().h(px(5.)).w_full().rounded(px(2.)).bg(faint(0.3))),
+                ),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .px_2()
+                .py_2()
+                .gap_1()
+                .child(
+                    div()
+                        .h(px(7.))
+                        .w(px(38.))
+                        .rounded(px(2.))
+                        .bg(Theme::alpha(palette.fg, 0.7)),
+                )
+                .children((0..3).map(move |ix| {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .h(px(16.))
+                        .rounded(px(3.))
+                        .when(ix == 0, |d| d.bg(palette.sel))
+                        .child(div().size(px(4.)).rounded_full().bg(palette.accent))
+                        .child(
+                            div()
+                                .h(px(5.))
+                                .w(px(26.))
+                                .rounded(px(2.))
+                                .bg(Theme::alpha(palette.fg2, 0.85)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h(px(5.))
+                                .rounded(px(2.))
+                                .bg(Theme::alpha(palette.fg2, 0.35)),
+                        )
+                        .child(div().h(px(5.)).w(px(12.)).rounded(px(2.)).bg(faint(0.5)))
+                })),
+        )
 }
 
 pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
@@ -415,13 +485,13 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         .child(
                             div()
                                 .text_size(t.px(10.))
-                                .font_weight(FontWeight::SEMIBOLD)
+                                .font_weight(FontWeight(650.))
                                 .text_color(t.accent)
                                 .child("YOUR WORKSPACE"),
                         )
                         .child(
                             div()
-                                .text_size(t.px(30.))
+                                .text_size(t.px(28.))
                                 .font_weight(FontWeight(650.))
                                 .child("Settings"),
                         ),
@@ -459,7 +529,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 .when(page.tab == index, |d| {
                                     d.border_b_2()
                                         .border_color(t.accent)
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_weight(FontWeight(650.))
                                 })
                                 .cursor_pointer()
                                 .child(label)
@@ -507,7 +577,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             .flex_1()
                             .min_w_0()
                             .p_1()
-                            .rounded(px(10.))
+                            .rounded(px(RADIUS))
                             .border_2()
                             .border_color(if kite.settings.theme == id {
                                 t.accent
@@ -516,51 +586,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             })
                             .cursor_pointer()
                             .hover(|s| s.border_color(t.fg3))
-                            .child(
-                                div()
-                                    .h(px(90.))
-                                    .rounded(px(6.))
-                                    .overflow_hidden()
-                                    .flex()
-                                    .bg(palette.bg)
-                                    .child(
-                                        div()
-                                            .w(px(30.))
-                                            .h_full()
-                                            .bg(palette.bg2)
-                                            .p_1()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_2()
-                                            .child(div().h(px(5.)).bg(palette.sel).rounded(px(2.)))
-                                            .child(
-                                                div()
-                                                    .h(px(3.))
-                                                    .bg(Theme::alpha(palette.fg2, 0.25))
-                                                    .rounded(px(2.)),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .p_3()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_2()
-                                            .child(
-                                                div()
-                                                    .h(px(5.))
-                                                    .w(px(42.))
-                                                    .rounded(px(2.))
-                                                    .bg(palette.fg2),
-                                            )
-                                            .children((0..3).map(|i| {
-                                                div().h(px(9.)).w_full().rounded(px(2.)).bg(
-                                                    if i == 0 { palette.sel } else { palette.bg2 },
-                                                )
-                                            })),
-                                    ),
-                            )
+                            .child(inbox_preview(palette))
                             .child(
                                 div()
                                     .flex()
@@ -708,7 +734,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         kite.settings.font_size
                     ))
                     .bg(t.bg2)
-                    .rounded(px(10.))
+                    .rounded(px(RADIUS))
                     .p_5()
                     .flex()
                     .flex_col()
@@ -716,7 +742,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .child(
                         div()
                             .text_size(t.px(18.))
-                            .font_weight(FontWeight::SEMIBOLD)
+                            .font_weight(FontWeight(650.))
                             .child("Less noise. More room to think."),
                     )
                     .child(
@@ -812,7 +838,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                     div()
                                         .truncate()
                                         .text_size(t.px(14.))
-                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .font_weight(FontWeight(650.))
                                         .child(account.email.clone()),
                                 )
                                 .child(
@@ -839,7 +865,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     content.child(
                         div()
                             .p_4()
-                            .rounded(px(8.))
+                            .rounded(px(RADIUS_SM))
                             .bg(t.bg2)
                             .flex()
                             .flex_col()
@@ -907,7 +933,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         )),
                 );
                 if page.proton {
-                    content = content.child(div().p_5().bg(t.bg2).rounded(px(10.)).flex().flex_col().gap_3().child(div().text_size(t.px(12.)).text_color(t.fg2).child("Use credentials from Proton Mail Bridge, not your Proton password. Bridge must be running on this computer."))
+                    content = content.child(div().p_5().bg(t.bg2).rounded(px(RADIUS)).flex().flex_col().gap_3().child(div().text_size(t.px(12.)).text_color(t.fg2).child("Use credentials from Proton Mail Bridge, not your Proton password. Bridge must be running on this computer."))
                         .child(Input::new(&page.email).id("proton-username").aria_label("Bridge username"))
                         .child(Input::new(&page.password).id("proton-password").aria_label("Bridge password"))
                         .child(button("connect-proton", "Connect Bridge", t).on_click(cx.listener(|this, _, window, cx| this.connect_account(true, window, cx)))));
@@ -978,7 +1004,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     }))
                 }),
             ));
-            content = content.child(div().p_5().rounded(px(10.)).bg(t.bg2).flex().flex_col().gap_2().child(div().text_size(t.px(13.)).font_weight(FontWeight::SEMIBOLD).child("Private by default")).child(div().text_size(t.px(12.)).text_color(t.fg2).child("Email scripts and remote images stay blocked. No tracking pixels or read receipts. Account secrets belong in the OS keychain, never in a theme or settings file.")));
+            content = content.child(div().p_5().rounded(px(RADIUS)).bg(t.bg2).flex().flex_col().gap_2().child(div().text_size(t.px(13.)).font_weight(FontWeight(650.)).child("Private by default")).child(div().text_size(t.px(12.)).text_color(t.fg2).child("Email scripts and remote images stay blocked. No tracking pixels or read receipts. Account secrets belong in the OS keychain, never in a theme or settings file.")));
         }
     }
     let mut root = div()

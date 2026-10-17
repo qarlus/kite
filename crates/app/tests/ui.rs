@@ -43,6 +43,22 @@ fn an_unconnected_app_does_not_claim_the_inbox_is_cleared(cx: &mut TestAppContex
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("inbox-zero").label(), Some("Welcome to Kite"));
+        assert_eq!(
+            window.find("empty-note").label(),
+            Some("Sign-in isn't available in this build yet, so nothing has synced.")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_empty_archive_names_the_archive_rather_than_the_inbox(cx: &mut TestAppContext) {
+    let (window, _) = mount(cx, Fixture::new(3));
+    cx.simulate_keystrokes(window.into(), "g e");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("inbox-header").label(), Some("Archive"));
+        assert_eq!(window.find("inbox-zero").label(), Some("Nothing archived"));
     })
     .unwrap();
 }

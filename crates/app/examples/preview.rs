@@ -18,6 +18,9 @@ fn main() {
     let create = args.iter().any(|arg| arg == "--create-folder");
     let move_mail = args.iter().any(|arg| arg == "--move");
     let empty = args.iter().any(|arg| arg == "--empty");
+    let no_accounts = args.iter().any(|arg| arg == "--no-accounts");
+    let focus_search = args.iter().any(|arg| arg == "--focus-search");
+    let done = args.iter().any(|arg| arg == "--done");
     gpui_kit::application()
         .with_assets(kite::Assets)
         .run(move |cx| {
@@ -27,6 +30,9 @@ fn main() {
             } else {
                 common::Fixture::showcase()
             };
+            if no_accounts {
+                mail.accounts.lock().unwrap().clear();
+            }
             if light {
                 mail.settings.lock().unwrap().theme = "light".into();
             }
@@ -72,6 +78,12 @@ fn main() {
                         }
                         if palette {
                             view.run(kite::keys::cmd::PALETTE, window, cx);
+                        }
+                        if focus_search {
+                            view.run(kite::keys::cmd::SEARCH, window, cx);
+                        }
+                        if done {
+                            view.run(kite::keys::cmd::DONE, window, cx);
                         }
                         view
                     })

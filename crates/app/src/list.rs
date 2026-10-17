@@ -1,7 +1,7 @@
 //! The virtualised thread list, the empty states and the shortcut cheat sheet.
 use crate::app::Kite;
 use crate::keys::{self, Cmd};
-use crate::theme::{ROW_H, Theme};
+use crate::theme::{RADIUS, RADIUS_SM, ROW_H, Theme};
 use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::kbd::Kbd;
@@ -82,37 +82,69 @@ impl Kite {
 
     fn render_empty(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
+        let folder = self.folders.iter().find(|folder| {
+            Some(folder.account_id) == self.view.account_id
+                && Some(&folder.id) == self.view.folder.as_ref()
+        });
         let (title, note) = if self.view.query.is_some() {
-            ("No results", "Try another name, subject, or search term.")
-        } else if self.view.folder.is_some() {
             (
-                "No conversations",
+                "No results".to_string(),
+                "Try another name, subject, or search term.",
+            )
+        } else if let Some(folder) = folder {
+            (
+                format!("{} is empty", folder.name),
                 "Move mail here with the folder menu or press L.",
             )
         } else if self.accounts.is_empty() {
             (
-                "Welcome to Kite",
-                "Your email deserves a little breathing room.",
+                "Welcome to Kite".to_string(),
+                "Sign-in isn't available in this build yet, so nothing has synced.",
             )
         } else {
             match self.view.mailbox {
-                Mailbox::Inbox => ("Inbox Zero", "You're all caught up. Enjoy the quiet."),
-                Mailbox::Starred => ("No starred mail", "Star a conversation to find it here."),
+                Mailbox::Inbox => (
+                    "Inbox Zero".to_string(),
+                    "You're all caught up. Enjoy the quiet.",
+                ),
+                Mailbox::Starred => (
+                    "No starred mail".to_string(),
+                    "Star a conversation to find it here.",
+                ),
                 Mailbox::Snoozed => (
-                    "Nothing snoozed",
+                    "Nothing snoozed".to_string(),
                     "Conversations you snooze will wait here.",
                 ),
-                Mailbox::Drafts => ("No drafts", "Your unfinished messages will appear here."),
-                Mailbox::Sent => ("No sent mail", "Messages you send will appear here."),
-                Mailbox::Spam => ("No spam", "A little less noise. Nothing to review here."),
-                Mailbox::Trash => ("Trash is empty", "Deleted conversations will appear here."),
-                _ => ("No conversations", "There's no mail in this view."),
+                Mailbox::Drafts => (
+                    "No drafts".to_string(),
+                    "Your unfinished messages will appear here.",
+                ),
+                Mailbox::Sent => (
+                    "No sent mail".to_string(),
+                    "Messages you send will appear here.",
+                ),
+                Mailbox::Archive => (
+                    "Nothing archived".to_string(),
+                    "Conversations you mark done are filed here.",
+                ),
+                Mailbox::Spam => (
+                    "No spam".to_string(),
+                    "A little less noise. Nothing to review here.",
+                ),
+                Mailbox::Trash => (
+                    "Trash is empty".to_string(),
+                    "Deleted conversations will appear here.",
+                ),
+                Mailbox::All => (
+                    "No mail".to_string(),
+                    "Nothing has arrived in this account yet.",
+                ),
             }
         };
         div()
             .id("inbox-zero")
             .test_support()
-            .aria_label(title)
+            .aria_label(title.clone())
             .flex_1()
             .flex()
             .flex_col()
@@ -144,10 +176,18 @@ impl Kite {
             .child(
                 div()
                     .text_size(t.px(24.))
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight(650.))
                     .child(title),
             )
-            .child(div().text_size(t.px(14.)).text_color(t.fg2).child(note))
+            .child(
+                div()
+                    .id("empty-note")
+                    .test_support()
+                    .aria_label(note)
+                    .text_size(t.px(14.))
+                    .text_color(t.fg2)
+                    .child(note),
+            )
             .when(self.accounts.is_empty(), |d| {
                 d.child(
                     div()
@@ -200,7 +240,7 @@ impl Kite {
                 .test_support()
                 .aria_label("Keyboard shortcuts")
                 .w(px(620.))
-                .rounded(px(12.))
+                .rounded(px(RADIUS))
                 .bg(t.bg2)
                 .border_1()
                 .border_color(t.line)
@@ -211,7 +251,7 @@ impl Kite {
                 .child(
                     div()
                         .text_size(t.px(15.))
-                        .font_weight(FontWeight::SEMIBOLD)
+                        .font_weight(FontWeight(650.))
                         .child("Keyboard shortcuts"),
                 )
                 .child(
@@ -258,23 +298,13 @@ fn row_element(
         .flex_shrink_0()
         .w_full()
         .h(px(ROW_H * t.scale))
-        .rounded(px(6.))
+        .rounded(px(RADIUS_SM))
         .px_3()
         .gap_3()
         .cursor_pointer()
         .when(selected, |d| d.bg(t.sel))
         .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
-        .when(selected, |d| {
-            d.child(
-                div()
-                    .absolute()
-                    .left_0()
-                    .top_0()
-                    .w(px(2.))
-                    .h_full()
-                    .bg(t.accent),
-            )
-        })
+        .when(selected, |d| d.child(selection_edge(&t)))
         .child(
             div()
                 .id(("select-row", ix))
@@ -407,7 +437,7 @@ fn row_element(
                             .truncate()
                             .px_2()
                             .py_0p5()
-                            .rounded(px(6.))
+                            .rounded(px(RADIUS_SM))
                             .bg(t.bg3)
                             .text_size(t.px(12.))
                             .text_color(t.fg2)
@@ -464,12 +494,12 @@ pub fn overlay(
     centered: bool,
     panel: impl IntoElement,
 ) -> impl IntoElement {
-    // DESIGN › Motion: overlays fade in over 100 ms (skipped under reduced motion).
+    // DESIGN › Motion: overlays fade in and rise 4px over 100 ms (skipped under reduced motion).
     let panel = div()
         .with_animation(
             ("overlay-panel", 0usize),
             Animation::new(Duration::from_millis(100)).with_easing(ease_out_quint()),
-            |panel, delta| panel.opacity(delta),
+            |panel, delta| panel.relative().top(px(4. * (1. - delta))).opacity(delta),
         )
         .child(panel);
     div()
@@ -485,6 +515,21 @@ pub fn overlay(
         .when(!centered, |d| d.pt(offset))
         .bg(Theme::alpha(t.bg, 0.72))
         .child(panel)
+}
+
+/// The accent edge that marks the selected row, wherever rows are selected.
+pub fn selection_edge(t: &Theme) -> Div {
+    div()
+        .absolute()
+        .left_0()
+        .top_0()
+        .w(px(2.))
+        .h_full()
+        .rounded_full()
+        .bg(crate::theme::accent_glow(t))
+        .shadow(vec![
+            BoxShadow::new(px(0.), px(0.), Theme::alpha(t.accent, 0.45)).blur_radius(px(8.)),
+        ])
 }
 
 /// One `<kbd>` pill per keystroke in a (possibly multi-stroke) binding.

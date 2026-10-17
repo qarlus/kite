@@ -96,7 +96,14 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
         );
         window.click("theme-linen", cx);
         window.render_frame(cx);
-        assert_eq!(window.find("theme-linen").selected(), Some(true));
+        assert_eq!(
+            window.find("theme-linen").selected(),
+            Some(true),
+            "the palette did not apply: {:?}",
+            window
+                .try_find("settings-error")
+                .and_then(|e| e.label().map(str::to_owned))
+        );
         window.click("font-larger", cx);
         window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
@@ -361,6 +368,43 @@ async fn failed_account_connection_is_not_reported_as_success(cx: &mut TestAppCo
             Some("Sign-in cancelled")
         );
         assert!(window.try_find("settings-account-3").is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn theme_tiles_preview_the_native_inbox_four_across_or_two_across(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, _) = open_window(
+        cx,
+        Some(gpui_kit::size(px(1200.), px(800.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(Fixture::showcase(), window, cx)),
+    );
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let carbon = window.find("theme-dark").bounds();
+        let paper = window.find("theme-light").bounds();
+        let midnight = window.find("theme-midnight").bounds();
+        assert_eq!(paper.origin.y, carbon.origin.y);
+        assert_eq!(midnight.origin.y, carbon.origin.y);
+        assert!(midnight.origin.x > paper.origin.x);
+    })
+    .unwrap();
+    let (window, _) = open_window(
+        cx,
+        Some(gpui_kit::size(px(720.), px(480.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(Fixture::showcase(), window, cx)),
+    );
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let carbon = window.find("theme-dark").bounds();
+        let paper = window.find("theme-light").bounds();
+        let midnight = window.find("theme-midnight").bounds();
+        assert_eq!(paper.origin.y, carbon.origin.y);
+        assert!(midnight.origin.y > carbon.origin.y);
+        assert_eq!(midnight.origin.x, carbon.origin.x);
     })
     .unwrap();
 }
