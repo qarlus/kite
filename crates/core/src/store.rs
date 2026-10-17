@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::types::Value;
-use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Transaction};
+use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
 use crate::model::*;
 use crate::sync::{Delta, Op, RemoteMsg};
@@ -75,6 +75,7 @@ CREATE TABLE pending_ops (
   attempts INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX pending_due ON pending_ops(account_id, at, id);
+CREATE INDEX pending_msg ON pending_ops(message_id);
 
 CREATE TABLE undo_seq (token INTEGER PRIMARY KEY AUTOINCREMENT);
 CREATE TABLE undo_log (
@@ -166,12 +167,23 @@ impl Store {
              ON CONFLICT(email) DO UPDATE SET provider=excluded.provider, name=excluded.name",
             params![provider_str(provider), email, name],
         )?;
-        let id = self.conn.query_row("SELECT id FROM accounts WHERE email=?1", [&email], |r| r.get(0))?;
-        Ok(Account { id, provider, email, name: name.to_string() })
+        let id = self
+            .conn
+            .query_row("SELECT id FROM accounts WHERE email=?1", [&email], |r| {
+                r.get(0)
+            })?;
+        Ok(Account {
+            id,
+            provider,
+            email,
+            name: name.to_string(),
+        })
     }
 
     pub fn accounts(&self) -> Result<Vec<Account>> {
-        let mut s = self.conn.prepare("SELECT id, provider, email, name FROM accounts ORDER BY id")?;
+        let mut s = self
+            .conn
+            .prepare("SELECT id, provider, email, name FROM accounts ORDER BY id")?;
         let it = s.query_map([], |r| {
             Ok(Account {
                 id: r.get(0)?,
@@ -185,25 +197,36 @@ impl Store {
 
     /// Cascades to threads, messages, pending ops and outbox rows.
     pub fn remove_account(&self, id: Id) -> Result<()> {
-        self.conn.execute("DELETE FROM accounts WHERE id=?1", [id])?;
+        self.conn
+            .execute("DELETE FROM accounts WHERE id=?1", [id])?;
         Ok(())
     }
 
     pub fn account_provider(&self, id: Id) -> Result<Option<Provider>> {
         let p = self
             .conn
-            .query_row("SELECT provider FROM accounts WHERE id=?1", [id], |r| r.get::<_, String>(0))
+            .query_row("SELECT provider FROM accounts WHERE id=?1", [id], |r| {
+                r.get::<_, String>(0)
+            })
             .optional()?;
         Ok(p.map(|p| provider_parse(&p)))
     }
 
     pub fn cursor(&self, id: Id) -> Result<Option<String>> {
-        let c = self.conn.query_row("SELECT cursor FROM accounts WHERE id=?1", [id], |r| r.get(0)).optional()?;
+        let c = self
+            .conn
+            .query_row("SELECT cursor FROM accounts WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .optional()?;
         Ok(c.flatten())
     }
 
     pub fn set_cursor(&self, id: Id, cursor: &str) -> Result<()> {
-        self.conn.execute("UPDATE accounts SET cursor=?1 WHERE id=?2", params![cursor, id])?;
+        self.conn.execute(
+            "UPDATE accounts SET cursor=?1 WHERE id=?2",
+            params![cursor, id],
+        )?;
         Ok(())
     }
 }
@@ -215,7 +238,11 @@ impl Store {
     pub fn apply_deltas(&self, account_id: Id, deltas: &[Delta]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let account_email: String = tx
-            .query_row("SELECT email FROM accounts WHERE id=?1", [account_id], |r| r.get(0))
+            .query_row(
+                "SELECT email FROM accounts WHERE id=?1",
+                [account_id],
+                |r| r.get(0),
+            )
             .optional()?
             .unwrap_or_default();
         let mut touched: HashSet<Id> = HashSet::new();
@@ -230,14 +257,23 @@ impl Store {
                 }
             };
             let Some((mid, tid)) = hit else { continue };
-            match d {
-                Delta::Flags { unread, starred, .. } => {
-                    tx.execute("UPDATE messages SET unread=?1, starred=?2 WHERE id=?3", params![unread, starred, mid])?
-                }
+            let changed = match d {
+                // Unchanged flags are a no-op (IMAP without CONDSTORE re-reports every flag on every
+                // sync), and a local change wins until its pending op has reached the server.
+                Delta::Flags {
+                    unread, starred, ..
+                } => tx.execute(
+                    "UPDATE messages SET unread=?1, starred=?2 WHERE id=?3
+                       AND (unread IS NOT ?1 OR starred IS NOT ?2)
+                       AND NOT EXISTS (SELECT 1 FROM pending_ops WHERE message_id=?3)",
+                    params![unread, starred, mid],
+                )?,
                 Delta::Delete { .. } => tx.execute("DELETE FROM messages WHERE id=?1", [mid])?,
                 Delta::Upsert(_) => unreachable!(),
             };
-            touched.insert(tid);
+            if changed > 0 {
+                touched.insert(tid);
+            }
         }
         for tid in &touched {
             refresh_thread(&tx, *tid)?;
@@ -257,7 +293,12 @@ fn find_message(tx: &Transaction, account_id: Id, remote_id: &str) -> Result<Opt
         .optional()?)
 }
 
-fn upsert_message(tx: &Transaction, account_id: Id, account_email: &str, m: &RemoteMsg) -> Result<Id> {
+fn upsert_message(
+    tx: &Transaction,
+    account_id: Id,
+    account_email: &str,
+    m: &RemoteMsg,
+) -> Result<Id> {
     let from_email = m.from.email.trim().to_ascii_lowercase();
     let from_name = display_name(&m.from.name, &from_email);
     let from_self = !account_email.is_empty() && from_email == account_email;
@@ -272,7 +313,11 @@ fn upsert_message(tx: &Transaction, account_id: Id, account_email: &str, m: &Rem
     };
     // `important` is written here as a first guess; `refresh_thread` recomputes the auto ones.
     let sent_to: i64 = tx
-        .query_row("SELECT COALESCE(sent_to, 0) FROM contacts WHERE email=?1", [&from_email], |r| r.get(0))
+        .query_row(
+            "SELECT COALESCE(sent_to, 0) FROM contacts WHERE email=?1",
+            [&from_email],
+            |r| r.get(0),
+        )
         .optional()?
         .unwrap_or(0);
     let important = m.important.unwrap_or(from_self || sent_to > 0);
@@ -285,14 +330,19 @@ fn upsert_message(tx: &Transaction, account_id: Id, account_email: &str, m: &Rem
         .optional()?;
     let mid = match existing {
         Some(id) => {
+            // While a local change is queued, keep the local placement and flags (?22 = pending).
             tx.execute(
-                "UPDATE messages SET folder=?1, mailbox=?2, thread_hint=?3, message_id=?4, in_reply_to=?5,
+                "UPDATE messages SET
+                   folder=CASE WHEN ?22 THEN folder ELSE ?1 END, mailbox=CASE WHEN ?22 THEN mailbox ELSE ?2 END,
+                   thread_hint=?3, message_id=?4, in_reply_to=?5,
                    refs=?6, from_name=?7, from_email=?8, to_json=?9, cc_json=?10, date=?11, subject=?12,
-                   norm_subject=?13, text=?14, html=?15, unread=?16, starred=?17, important=?18,
-                   important_src=?19, from_self=?20 WHERE id=?21",
+                   norm_subject=?13, text=?14, html=?15,
+                   unread=CASE WHEN ?22 THEN unread ELSE ?16 END, starred=CASE WHEN ?22 THEN starred ELSE ?17 END,
+                   important=?18, important_src=?19, from_self=?20 WHERE id=?21",
                 params![m.folder, mailbox, m.thread_hint, m.message_id, m.in_reply_to, refs_json, from_name,
                         from_email, to_json, cc_json, m.date, m.subject, ns, m.text, m.html, m.unread,
-                        m.starred, important, src, from_self, id],
+                        m.starred, important, src, from_self, id,
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?],
             )?;
             return thread_id_of(tx, id);
         }
@@ -321,7 +371,11 @@ fn upsert_message(tx: &Transaction, account_id: Id, account_email: &str, m: &Rem
 
     // Contacts and people rows are only touched for genuinely new messages, so the counters stay
     // "how many distinct messages" rather than "how many sync passes".
-    let people = m.to.iter().map(|a| ("to", a)).chain(m.cc.iter().map(|a| ("cc", a))).chain([("from", &m.from)]);
+    let people =
+        m.to.iter()
+            .map(|a| ("to", a))
+            .chain(m.cc.iter().map(|a| ("cc", a)))
+            .chain([("from", &m.from)]);
     tx.execute("DELETE FROM message_people WHERE message_id=?1", [mid])?;
     let is_sent = mailbox == "sent";
     for (kind, a) in people {
@@ -346,7 +400,11 @@ fn upsert_message(tx: &Transaction, account_id: Id, account_email: &str, m: &Rem
 }
 
 fn thread_id_of(tx: &Transaction, message_id: Id) -> Result<Id> {
-    Ok(tx.query_row("SELECT thread_id FROM messages WHERE id=?1", [message_id], |r| r.get(0))?)
+    Ok(tx.query_row(
+        "SELECT thread_id FROM messages WHERE id=?1",
+        [message_id],
+        |r| r.get(0),
+    )?)
 }
 
 /// Graph's `conversationId` wins; otherwise the Message-ID/In-Reply-To/References union; otherwise
@@ -403,7 +461,10 @@ fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
 
 fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Option<Id>> {
     let mut emails: Vec<String> = Vec::new();
-    for a in std::iter::once(&m.from).chain(m.to.iter()).chain(m.cc.iter()) {
+    for a in std::iter::once(&m.from)
+        .chain(m.to.iter())
+        .chain(m.cc.iter())
+    {
         let e = a.email.trim().to_ascii_lowercase();
         if !e.is_empty() && !emails.contains(&e) {
             emails.push(e);
@@ -426,13 +487,21 @@ fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
         Value::Integer(m.date + 30 * 86_400_000),
     ];
     ps.extend(emails.into_iter().map(Value::Text));
-    Ok(tx.query_row(&sql, params_from_iter(ps), |r| r.get(0)).optional()?)
+    Ok(tx
+        .query_row(&sql, params_from_iter(ps), |r| r.get(0))
+        .optional()?)
 }
 
 fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
     if canon != other {
-        tx.execute("UPDATE OR REPLACE thread_keys SET thread_id=?1 WHERE thread_id=?2", params![canon, other])?;
-        tx.execute("UPDATE messages SET thread_id=?1 WHERE thread_id=?2", params![canon, other])?;
+        tx.execute(
+            "UPDATE OR REPLACE thread_keys SET thread_id=?1 WHERE thread_id=?2",
+            params![canon, other],
+        )?;
+        tx.execute(
+            "UPDATE messages SET thread_id=?1 WHERE thread_id=?2",
+            params![canon, other],
+        )?;
         tx.execute("DELETE FROM threads WHERE id=?1", [other])?;
     }
     Ok(())
@@ -456,7 +525,12 @@ fn msg_keys(m: &RemoteMsg) -> Vec<String> {
     let mut out: Vec<String> = raw
         .into_iter()
         .filter_map(|x| {
-            let n = x.trim().trim_start_matches('<').trim_end_matches('>').trim().to_ascii_lowercase();
+            let n = x
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .trim()
+                .to_ascii_lowercase();
             (!n.is_empty()).then(|| format!("i:{n}"))
         })
         .collect();
@@ -494,9 +568,19 @@ fn refresh_thread(tx: &Transaction, thread_id: Id) -> Result<()> {
         )?;
         let it = s.query_map([thread_id], |r| {
             Ok(Meta {
-                id: r.get(0)?, date: r.get(1)?, subject: r.get(2)?, text: r.get(3)?, from_name: r.get(4)?,
-                mailbox: r.get(5)?, unread: r.get(6)?, starred: r.get(7)?, important: r.get(8)?,
-                src: r.get(9)?, from_self: r.get(10)?, n_att: r.get(11)?, sent_to: r.get(12)?,
+                id: r.get(0)?,
+                date: r.get(1)?,
+                subject: r.get(2)?,
+                text: r.get(3)?,
+                from_name: r.get(4)?,
+                mailbox: r.get(5)?,
+                unread: r.get(6)?,
+                starred: r.get(7)?,
+                important: r.get(8)?,
+                src: r.get(9)?,
+                from_self: r.get(10)?,
+                n_att: r.get(11)?,
+                sent_to: r.get(12)?,
             })
         })?;
         it.collect::<rusqlite::Result<Vec<_>>>()?
@@ -515,22 +599,42 @@ fn refresh_thread(tx: &Transaction, thread_id: Id) -> Result<()> {
             _ => has_self || r.sent_to > 0,
         };
         if v != r.important {
-            tx.execute("UPDATE messages SET important=?1 WHERE id=?2", params![v, r.id])?;
+            tx.execute(
+                "UPDATE messages SET important=?1 WHERE id=?2",
+                params![v, r.id],
+            )?;
         }
         eff.push(v);
     }
-    let subject = rows.iter().map(|r| r.subject.trim()).find(|s| !s.is_empty()).unwrap_or("");
+    let subject = rows
+        .iter()
+        .map(|r| r.subject.trim())
+        .find(|s| !s.is_empty())
+        .unwrap_or("");
     let mut names: Vec<&str> = Vec::new();
     for r in &rows {
         if !r.from_name.is_empty() && !names.contains(&r.from_name.as_str()) {
             names.push(&r.from_name);
         }
     }
-    let participants =
-        if names.len() > 4 { format!("{}, {}, {}, {}…", names[0], names[1], names[2], names[3]) } else { names.join(", ") };
-    let text = rows.iter().rev().map(|r| r.text.as_str()).find(|t| !t.trim().is_empty()).unwrap_or("");
+    let participants = if names.len() > 4 {
+        format!("{}, {}, {}, {}…", names[0], names[1], names[2], names[3])
+    } else {
+        names.join(", ")
+    };
+    let text = rows
+        .iter()
+        .rev()
+        .map(|r| r.text.as_str())
+        .find(|t| !t.trim().is_empty())
+        .unwrap_or("");
     // The thread lives where its latest non-sent message lives, so our own replies do not move it.
-    let mailbox = rows.iter().rev().find(|r| r.mailbox != "sent").or_else(|| rows.last()).map(|r| r.mailbox.clone());
+    let mailbox = rows
+        .iter()
+        .rev()
+        .find(|r| r.mailbox != "sent")
+        .or_else(|| rows.last())
+        .map(|r| r.mailbox.clone());
     tx.execute(
         "UPDATE threads SET subject=?1, norm_subject=?2, snippet=?3, participants=?4, date=?5,
            unread=?6, starred=?7, important=?8, attachments=?9, count=?10, mailbox=?11 WHERE id=?12",
@@ -552,12 +656,18 @@ impl Store {
         let split_q = match view.split {
             Some(id) => self
                 .conn
-                .query_row("SELECT query FROM splits WHERE id=?1", [id], |r| r.get::<_, String>(0))
+                .query_row("SELECT query FROM splits WHERE id=?1", [id], |r| {
+                    r.get::<_, String>(0)
+                })
                 .optional()?
                 .unwrap_or_default(),
             None => String::new(),
         };
-        let p = parse_query(&format!("{} {}", split_q, view.query.clone().unwrap_or_default()));
+        let p = parse_query(&format!(
+            "{} {}",
+            split_q,
+            view.query.clone().unwrap_or_default()
+        ));
 
         let mut conds: Vec<String> = vec![mailbox_cond(view.mailbox).to_string()];
         let mut ps: Vec<Value> = Vec::new();
@@ -587,11 +697,19 @@ impl Store {
         let mut s = self.conn.prepare(&sql)?;
         let it = s.query_map(params_from_iter(ps), |r| {
             Ok(ThreadSummary {
-                id: r.get(0)?, account_id: r.get(1)?, subject: r.get(2)?, snippet: r.get(3)?,
-                participants: r.get(4)?, date: r.get(5)?, unread: r.get(6)?, starred: r.get(7)?,
-                important: r.get(8)?, attachments: r.get(9)?,
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                subject: r.get(2)?,
+                snippet: r.get(3)?,
+                participants: r.get(4)?,
+                date: r.get(5)?,
+                unread: r.get(6)?,
+                starred: r.get(7)?,
+                important: r.get(8)?,
+                attachments: r.get(9)?,
                 labels: serde_json::from_str(&r.get::<_, String>(10)?).unwrap_or_default(),
-                count: r.get::<_, i64>(11)? as u32, snoozed_until: r.get(12)?,
+                count: r.get::<_, i64>(11)? as u32,
+                snoozed_until: r.get(12)?,
             })
         })?;
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -605,28 +723,51 @@ impl Store {
             )?;
             let it = s.query_map([id], |r| {
                 Ok((
-                    r.get::<_, Id>(0)?, r.get::<_, Id>(1)?,
-                    Addr { name: r.get(2)?, email: r.get(3)? },
-                    addrs_from_json(&r.get::<_, String>(4)?), addrs_from_json(&r.get::<_, String>(5)?),
-                    r.get::<_, Ms>(6)?, r.get::<_, String>(7)?, r.get::<_, Option<String>>(8)?,
-                    r.get::<_, String>(9)?, r.get::<_, bool>(10)?,
+                    r.get::<_, Id>(0)?,
+                    r.get::<_, Id>(1)?,
+                    Addr {
+                        name: r.get(2)?,
+                        email: r.get(3)?,
+                    },
+                    addrs_from_json(&r.get::<_, String>(4)?),
+                    addrs_from_json(&r.get::<_, String>(5)?),
+                    r.get::<_, Ms>(6)?,
+                    r.get::<_, String>(7)?,
+                    r.get::<_, Option<String>>(8)?,
+                    r.get::<_, String>(9)?,
+                    r.get::<_, bool>(10)?,
                 ))
             })?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let mut s = self
-            .conn
-            .prepare("SELECT id, name, mime, size FROM attachments WHERE message_id=?1 ORDER BY id")?;
+        let mut s = self.conn.prepare(
+            "SELECT id, name, mime, size FROM attachments WHERE message_id=?1 ORDER BY id",
+        )?;
         let mut out = Vec::with_capacity(heads.len());
         for (id, thread_id, from, to, cc, date, subject, html, text, unread) in heads {
             let files = s
                 .query_map([id], |r| {
                     Ok(Attachment {
-                        id: r.get(0)?, name: r.get(1)?, mime: r.get(2)?, size: r.get::<_, i64>(3)? as u64,
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        mime: r.get(2)?,
+                        size: r.get::<_, i64>(3)? as u64,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
-            out.push(Message { id, thread_id, from, to, cc, date, subject, html, text, attachments: files, unread });
+            out.push(Message {
+                id,
+                thread_id,
+                from,
+                to,
+                cc,
+                date,
+                subject,
+                html,
+                text,
+                attachments: files,
+                unread,
+            });
         }
         Ok(out)
     }
@@ -679,9 +820,15 @@ impl Store {
         let now = now_ms();
         for &thread_id in ids {
             let account_id: Option<Id> = tx
-                .query_row("SELECT account_id FROM threads WHERE id=?1", [thread_id], |r| r.get(0))
+                .query_row(
+                    "SELECT account_id FROM threads WHERE id=?1",
+                    [thread_id],
+                    |r| r.get(0),
+                )
                 .optional()?;
-            let Some(account_id) = account_id else { continue };
+            let Some(account_id) = account_id else {
+                continue;
+            };
             let states = message_states(&tx, thread_id)?;
             if states.is_empty() {
                 continue;
@@ -692,7 +839,10 @@ impl Store {
                     [thread_id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
-                tx.execute("UPDATE threads SET snoozed_until=?1, remind_after=NULL WHERE id=?2", params![until, thread_id])?;
+                tx.execute(
+                    "UPDATE threads SET snoozed_until=?1, remind_after=NULL WHERE id=?2",
+                    params![until, thread_id],
+                )?;
                 tx.execute(
                     "INSERT INTO undo_log(token, account_id, thread_id, message_id, snoozed_until, remind_after)
                      VALUES (?1,?2,?3,NULL,?4,?5)",
@@ -728,7 +878,10 @@ impl Store {
                 )?;
             }
             if matches!(action, Action::Inbox) {
-                tx.execute("UPDATE threads SET snoozed_until=NULL, remind_after=NULL WHERE id=?1", [thread_id])?;
+                tx.execute(
+                    "UPDATE threads SET snoozed_until=NULL, remind_after=NULL WHERE id=?1",
+                    [thread_id],
+                )?;
             }
             refresh_thread(&tx, thread_id)?;
         }
@@ -747,9 +900,17 @@ impl Store {
             )?;
             let it = s.query_map([token], |r| {
                 Ok(UndoRow {
-                    account_id: r.get(0)?, thread_id: r.get(1)?, message_id: r.get(2)?, mailbox: r.get(3)?,
-                    unread: r.get(4)?, starred: r.get(5)?, folder: r.get(6)?, snoozed_until: r.get(7)?,
-                    remind_after: r.get(8)?, op_id: r.get(9)?, inverse: r.get(10)?,
+                    account_id: r.get(0)?,
+                    thread_id: r.get(1)?,
+                    message_id: r.get(2)?,
+                    mailbox: r.get(3)?,
+                    unread: r.get(4)?,
+                    starred: r.get(5)?,
+                    folder: r.get(6)?,
+                    snoozed_until: r.get(7)?,
+                    remind_after: r.get(8)?,
+                    op_id: r.get(9)?,
+                    inverse: r.get(10)?,
                 })
             })?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
@@ -772,8 +933,9 @@ impl Store {
                 }
             }
             if let Some(op_id) = r.op_id {
-                let queued: Option<()> =
-                    tx.query_row("SELECT 1 FROM pending_ops WHERE id=?1", [op_id], |_| Ok(())).optional()?;
+                let queued: Option<()> = tx
+                    .query_row("SELECT 1 FROM pending_ops WHERE id=?1", [op_id], |_| Ok(()))
+                    .optional()?;
                 if queued.is_some() {
                     tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
                 } else if let Some(inv) = r.inverse {
@@ -797,14 +959,28 @@ impl Store {
 
 /// What a local action does to one message: new column values, the remote op it queues, and that
 /// op's inverse. `None` means "leave it alone".
-type Plan = (Option<String>, Option<bool>, Option<bool>, Option<String>, Option<Op>, Option<Op>);
+type Plan = (
+    Option<String>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+    Option<Op>,
+    Option<Op>,
+);
 
 fn move_op(remote_id: &str, to: Mailbox) -> Op {
-    Op::Move { remote_id: remote_id.into(), to }
+    Op::Move {
+        remote_id: remote_id.into(),
+        to,
+    }
 }
 
 fn flag_op(remote_id: &str, unread: Option<bool>, starred: Option<bool>) -> Op {
-    Op::Flags { remote_id: remote_id.into(), unread, starred }
+    Op::Flags {
+        remote_id: remote_id.into(),
+        unread,
+        starred,
+    }
 }
 
 fn plan(action: &Action, m: &MsgState) -> Plan {
@@ -812,38 +988,75 @@ fn plan(action: &Action, m: &MsgState) -> Plan {
     let nothing = (None, None, None, None, None, None);
     match action {
         Action::Archive if m.mailbox == "inbox" => (
-            Some("archive".into()), Some(false), None, None,
-            Some(move_op(rid, Mailbox::Archive)), Some(move_op(rid, Mailbox::Inbox)),
+            Some("archive".into()),
+            Some(false),
+            None,
+            None,
+            Some(move_op(rid, Mailbox::Archive)),
+            Some(move_op(rid, Mailbox::Inbox)),
         ),
         Action::Inbox if m.mailbox == "archive" => (
-            Some("inbox".into()), None, None, None,
-            Some(move_op(rid, Mailbox::Inbox)), Some(move_op(rid, Mailbox::Archive)),
+            Some("inbox".into()),
+            None,
+            None,
+            None,
+            Some(move_op(rid, Mailbox::Inbox)),
+            Some(move_op(rid, Mailbox::Archive)),
         ),
         // The whole conversation goes to the bin, except drafts, which are not conversations.
         Action::Trash if m.mailbox != "trash" && m.mailbox != "drafts" => (
-            Some("trash".into()), Some(false), None, None,
-            Some(move_op(rid, Mailbox::Trash)), Some(move_op(rid, mb_parse(&m.mailbox))),
+            Some("trash".into()),
+            Some(false),
+            None,
+            None,
+            Some(move_op(rid, Mailbox::Trash)),
+            Some(move_op(rid, mb_parse(&m.mailbox))),
         ),
         Action::Star if !m.starred => (
-            None, None, Some(true), None,
-            Some(flag_op(rid, None, Some(true))), Some(flag_op(rid, None, Some(false))),
+            None,
+            None,
+            Some(true),
+            None,
+            Some(flag_op(rid, None, Some(true))),
+            Some(flag_op(rid, None, Some(false))),
         ),
         Action::Unstar if m.starred => (
-            None, None, Some(false), None,
-            Some(flag_op(rid, None, Some(false))), Some(flag_op(rid, None, Some(true))),
+            None,
+            None,
+            Some(false),
+            None,
+            Some(flag_op(rid, None, Some(false))),
+            Some(flag_op(rid, None, Some(true))),
         ),
         Action::Read if m.unread => (
-            None, Some(false), None, None,
-            Some(flag_op(rid, Some(false), None)), Some(flag_op(rid, Some(true), None)),
+            None,
+            Some(false),
+            None,
+            None,
+            Some(flag_op(rid, Some(false), None)),
+            Some(flag_op(rid, Some(true), None)),
         ),
         Action::Unread if !m.unread => (
-            None, Some(true), None, None,
-            Some(flag_op(rid, Some(true), None)), Some(flag_op(rid, Some(false), None)),
+            None,
+            Some(true),
+            None,
+            None,
+            Some(flag_op(rid, Some(true), None)),
+            Some(flag_op(rid, Some(false), None)),
         ),
         Action::Move { folder } if m.folder != *folder => (
-            Some("archive".into()), None, None, Some(folder.clone()),
-            Some(Op::MoveToFolder { remote_id: rid.into(), folder: folder.clone() }),
-            Some(Op::MoveToFolder { remote_id: rid.into(), folder: m.folder.clone() }),
+            Some("archive".into()),
+            None,
+            None,
+            Some(folder.clone()),
+            Some(Op::MoveToFolder {
+                remote_id: rid.into(),
+                folder: folder.clone(),
+            }),
+            Some(Op::MoveToFolder {
+                remote_id: rid.into(),
+                folder: m.folder.clone(),
+            }),
         ),
         _ => nothing,
     }
@@ -855,8 +1068,12 @@ fn message_states(tx: &Transaction, thread_id: Id) -> Result<Vec<MsgState>> {
     )?;
     let it = s.query_map([thread_id], |r| {
         Ok(MsgState {
-            id: r.get(0)?, remote_id: r.get(1)?, mailbox: r.get(2)?, folder: r.get(3)?,
-            unread: r.get(4)?, starred: r.get(5)?,
+            id: r.get(0)?,
+            remote_id: r.get(1)?,
+            mailbox: r.get(2)?,
+            folder: r.get(3)?,
+            unread: r.get(4)?,
+            starred: r.get(5)?,
         })
     })?;
     Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -866,8 +1083,12 @@ fn message_states(tx: &Transaction, thread_id: Id) -> Result<Vec<MsgState>> {
 
 impl Store {
     pub fn pending_ops(&self, account_id: Id, now: Ms, limit: u32) -> Result<Vec<(i64, Op)>> {
-        let mut s = self.conn.prepare("SELECT id, op FROM pending_ops WHERE account_id=?1 AND at<=?2 ORDER BY id LIMIT ?3")?;
-        let it = s.query_map(params![account_id, now, limit], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
+        let mut s = self.conn.prepare(
+            "SELECT id, op FROM pending_ops WHERE account_id=?1 AND at<=?2 ORDER BY id LIMIT ?3",
+        )?;
+        let it = s.query_map(params![account_id, now, limit], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+        })?;
         let mut out = Vec::new();
         for row in it {
             let (id, json) = row?;
@@ -884,7 +1105,8 @@ impl Store {
                 params![rid, op_id],
             )?;
         }
-        self.conn.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+        self.conn
+            .execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
         Ok(())
     }
 
@@ -892,7 +1114,11 @@ impl Store {
     pub fn op_failed(&self, op_id: i64, now: Ms) -> Result<()> {
         let attempts: i64 = self
             .conn
-            .query_row("SELECT attempts FROM pending_ops WHERE id=?1", [op_id], |r| r.get(0))
+            .query_row(
+                "SELECT attempts FROM pending_ops WHERE id=?1",
+                [op_id],
+                |r| r.get(0),
+            )
             .optional()?
             .unwrap_or(0);
         let backoff = (1_000i64 << attempts.min(12)).min(3_600_000);
@@ -926,7 +1152,9 @@ impl Store {
     }
 
     pub fn outbox_due(&self, now: Ms) -> Result<Vec<(Id, Draft)>> {
-        let mut s = self.conn.prepare("SELECT id, draft FROM outbox WHERE at<=?1 ORDER BY at, id")?;
+        let mut s = self
+            .conn
+            .prepare("SELECT id, draft FROM outbox WHERE at<=?1 ORDER BY at, id")?;
         let it = s.query_map([now], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in it {
@@ -959,7 +1187,9 @@ impl Store {
                 },
             )
             .optional()?;
-        let Some((account_id, header, refs, subject, name, email, to, cc)) = row else { return Ok(None) };
+        let Some((account_id, header, refs, subject, name, email, to, cc)) = row else {
+            return Ok(None);
+        };
         let mut references: Vec<String> = serde_json::from_str(&refs).unwrap_or_default();
         if let Some(h) = header.as_ref() {
             let dup = references.iter().any(|x| x == h);
@@ -967,7 +1197,11 @@ impl Store {
                 references.push(h.clone());
             }
         }
-        let subject = if subject.to_ascii_lowercase().starts_with("re:") { subject } else { format!("Re: {subject}") };
+        let subject = if subject.to_ascii_lowercase().starts_with("re:") {
+            subject
+        } else {
+            format!("Re: {subject}")
+        };
         Ok(Some(ReplyCtx {
             account_id,
             message_id_header: header.unwrap_or_default(),
@@ -1006,7 +1240,10 @@ impl Store {
                 None => false,
             };
             if replied {
-                tx.execute("UPDATE threads SET snoozed_until=NULL, remind_after=NULL WHERE id=?1", [tid])?;
+                tx.execute(
+                    "UPDATE threads SET snoozed_until=NULL, remind_after=NULL WHERE id=?1",
+                    [tid],
+                )?;
             } else {
                 tx.execute(
                     "UPDATE messages SET mailbox='inbox', unread=1 WHERE thread_id=?1 AND mailbox IN ('inbox','archive')",
@@ -1036,8 +1273,16 @@ impl Store {
 
 impl Store {
     pub fn splits(&self) -> Result<Vec<Split>> {
-        let mut s = self.conn.prepare("SELECT id, name, query FROM splits ORDER BY position, id")?;
-        let it = s.query_map([], |r| Ok(Split { id: r.get(0)?, name: r.get(1)?, query: r.get(2)? }))?;
+        let mut s = self
+            .conn
+            .prepare("SELECT id, name, query FROM splits ORDER BY position, id")?;
+        let it = s.query_map([], |r| {
+            Ok(Split {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                query: r.get(2)?,
+            })
+        })?;
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
@@ -1065,7 +1310,8 @@ impl Store {
             .conn
             .query_row("SELECT v FROM kv WHERE k='settings'", [], |r| r.get(0))
             .optional()?;
-        Ok(s.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default())
+        Ok(s.and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default())
     }
 
     pub fn set_settings(&self, settings: Settings) -> Result<()> {
@@ -1084,7 +1330,10 @@ impl Store {
              {ranked} ?2"
         ))?;
         let it = s.query_map(params![glob_pat(query.trim()), limit as i64], |r| {
-            Ok(Addr { name: r.get(0)?, email: r.get(1)? })
+            Ok(Addr {
+                name: r.get(0)?,
+                email: r.get(1)?,
+            })
         })?;
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
@@ -1092,10 +1341,8 @@ impl Store {
 
 // ----------------------------------------------------------------- searching
 
-const FTS_IN: &str =
-    "t.id IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
-const FTS_NOT_IN: &str =
-    "t.id NOT IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
+const FTS_IN: &str = "t.id IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
+const FTS_NOT_IN: &str = "t.id NOT IN (SELECT m.thread_id FROM msgs_fts JOIN messages m ON m.id=msgs_fts.rowid WHERE msgs_fts MATCH ?)";
 
 #[derive(Default)]
 struct Parsed {
@@ -1146,7 +1393,14 @@ fn parse_query(raw: &str) -> Parsed {
     p
 }
 
-fn apply_token(p: &mut Parsed, free: &mut Vec<(String, bool)>, neg: bool, field: Option<String>, value: &str, quoted: bool) {
+fn apply_token(
+    p: &mut Parsed,
+    free: &mut Vec<(String, bool)>,
+    neg: bool,
+    field: Option<String>,
+    value: &str,
+    quoted: bool,
+) {
     let term = |v: &str| format!("\"{}\"", v.replace('"', "\"\""));
     match field.as_deref() {
         None if value.is_empty() => {}
@@ -1166,7 +1420,11 @@ fn apply_token(p: &mut Parsed, free: &mut Vec<(String, bool)>, neg: bool, field:
         }
         Some("is") => p.flag(value, neg),
         Some("before" | "after") if valid_date(value) => {
-            let op = if (field.as_deref() == Some("before")) != neg { "<" } else { ">=" };
+            let op = if (field.as_deref() == Some("before")) != neg {
+                "<"
+            } else {
+                ">="
+            };
             p.conds.push(format!("t.date {op} unixepoch(?) * 1000"));
             p.params.push(Value::Text(value.to_string()));
         }
@@ -1184,7 +1442,11 @@ fn apply_token(p: &mut Parsed, free: &mut Vec<(String, bool)>, neg: bool, field:
 
 impl Parsed {
     fn people(&mut self, is_from: bool, value: &str, neg: bool) {
-        let kind = if is_from { "p.kind='from'" } else { "p.kind IN ('to','cc')" };
+        let kind = if is_from {
+            "p.kind='from'"
+        } else {
+            "p.kind IN ('to','cc')"
+        };
         let ex = format!(
             "EXISTS (SELECT 1 FROM messages m JOIN message_people p ON p.message_id=m.id
                      WHERE m.thread_id=t.id AND {kind}
@@ -1213,14 +1475,23 @@ impl Parsed {
 
 /// Lowercased prefix pattern for `GLOB`, with GLOB metacharacters dropped so input stays literal.
 fn glob_pat(s: &str) -> String {
-    let mut out: String = s.to_ascii_lowercase().chars().filter(|&c| !matches!(c, '*' | '?' | '[' | ']')).collect();
+    let mut out: String = s
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|&c| !matches!(c, '*' | '?' | '[' | ']'))
+        .collect();
     out.push('*');
     out
 }
 
 fn valid_date(s: &str) -> bool {
     let b = s.as_bytes();
-    b.len() == 10 && b[4] == b'-' && b[7] == b'-' && b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+    b.len() == 10
+        && b[4] == b'-'
+        && b[7] == b'-'
+        && b.iter()
+            .enumerate()
+            .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
 }
 
 // --------------------------------------------------------------- tiny helpers
@@ -1241,17 +1512,29 @@ fn mailbox_cond(m: Mailbox) -> &'static str {
 
 fn mb_str(m: Mailbox) -> &'static str {
     match m {
-        Mailbox::Inbox => "inbox", Mailbox::Starred => "starred", Mailbox::Snoozed => "snoozed",
-        Mailbox::Drafts => "drafts", Mailbox::Sent => "sent", Mailbox::Archive => "archive",
-        Mailbox::Trash => "trash", Mailbox::Spam => "spam", Mailbox::All => "all",
+        Mailbox::Inbox => "inbox",
+        Mailbox::Starred => "starred",
+        Mailbox::Snoozed => "snoozed",
+        Mailbox::Drafts => "drafts",
+        Mailbox::Sent => "sent",
+        Mailbox::Archive => "archive",
+        Mailbox::Trash => "trash",
+        Mailbox::Spam => "spam",
+        Mailbox::All => "all",
     }
 }
 
 fn mb_parse(s: &str) -> Mailbox {
     match s {
-        "starred" => Mailbox::Starred, "snoozed" => Mailbox::Snoozed, "drafts" => Mailbox::Drafts,
-        "sent" => Mailbox::Sent, "archive" => Mailbox::Archive, "trash" => Mailbox::Trash,
-        "spam" => Mailbox::Spam, "all" => Mailbox::All, _ => Mailbox::Inbox,
+        "starred" => Mailbox::Starred,
+        "snoozed" => Mailbox::Snoozed,
+        "drafts" => Mailbox::Drafts,
+        "sent" => Mailbox::Sent,
+        "archive" => Mailbox::Archive,
+        "trash" => Mailbox::Trash,
+        "spam" => Mailbox::Spam,
+        "all" => Mailbox::All,
+        _ => Mailbox::Inbox,
     }
 }
 
@@ -1283,11 +1566,19 @@ fn addrs_from_json(s: &str) -> Vec<Addr> {
 
 fn display_name(name: &str, email: &str) -> String {
     let n = name.trim();
-    if n.is_empty() { email.split('@').next().unwrap_or(email).to_string() } else { n.to_string() }
+    if n.is_empty() {
+        email.split('@').next().unwrap_or(email).to_string()
+    } else {
+        n.to_string()
+    }
 }
 
 fn email_domain(email: &str) -> String {
-    email.split_once('@').map(|(_, d)| d).unwrap_or("").to_string()
+    email
+        .split_once('@')
+        .map(|(_, d)| d)
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Strips `Re:`/`Fwd:`/`AW:`-style prefixes and whitespace noise so replies group.
@@ -1296,7 +1587,10 @@ fn norm_subject(s: &str) -> String {
     while let Some(rest) = strip_reply_prefix(t) {
         t = rest;
     }
-    t.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase()
+    t.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn strip_reply_prefix(s: &str) -> Option<&str> {
@@ -1344,5 +1638,8 @@ fn snip(s: &str) -> String {
 }
 
 fn now_ms() -> Ms {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }

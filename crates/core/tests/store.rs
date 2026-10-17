@@ -78,11 +78,21 @@ fn with_attachment(mut m: RemoteMsg, name: &str) -> RemoteMsg {
 }
 
 fn view(mb: Mailbox) -> View {
-    View { account_id: None, mailbox: mb, split: None, query: None }
+    View {
+        account_id: None,
+        mailbox: mb,
+        split: None,
+        query: None,
+    }
 }
 
 fn search(mb: Mailbox, q: &str) -> View {
-    View { account_id: None, mailbox: mb, split: None, query: Some(q.into()) }
+    View {
+        account_id: None,
+        mailbox: mb,
+        split: None,
+        query: Some(q.into()),
+    }
 }
 
 fn up(m: RemoteMsg) -> Delta {
@@ -94,7 +104,10 @@ fn temp_db(tag: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("kite-store-{}-{tag}-{nanos}.db", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "kite-store-{}-{tag}-{nanos}.db",
+        std::process::id()
+    ))
 }
 
 fn cleanup(path: &std::path::Path) {
@@ -126,16 +139,27 @@ const DUE: Ms = i64::MAX / 4;
 #[test]
 fn deltas_thread_together_and_refresh_the_thread_row() {
     let s = Store::memory().unwrap();
-    let a = s.add_account(Provider::Proton, "Me@Example.com", "Me").unwrap();
+    let a = s
+        .add_account(Provider::Proton, "Me@Example.com", "Me")
+        .unwrap();
 
     let root = body(msg("a1", "alice@a.com", "Project update", D0), "Hello team");
-    let reply = replying_to(body(msg("b1", "bob@b.com", "Re: Project update", D0 + 60_000), "Sounds good"), "a1");
+    let reply = replying_to(
+        body(
+            msg("b1", "bob@b.com", "Re: Project update", D0 + 60_000),
+            "Sounds good",
+        ),
+        "a1",
+    );
     s.apply_deltas(a.id, &[up(root), up(reply)]).unwrap();
 
     let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
     assert_eq!(inbox.len(), 1, "the reply must join the root's thread");
     let t = &inbox[0];
-    assert_eq!(t.subject, "Project update", "thread keeps the root's subject");
+    assert_eq!(
+        t.subject, "Project update",
+        "thread keeps the root's subject"
+    );
     assert_eq!(t.count, 2);
     assert_eq!(t.participants, "alice, bob");
     assert_eq!(t.snippet, "Sounds good");
@@ -147,7 +171,11 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     // Flags on one message bubble up to the thread.
     s.apply_deltas(
         a.id,
-        &[Delta::Flags { remote_id: "b1".into(), unread: true, starred: true }],
+        &[Delta::Flags {
+            remote_id: "b1".into(),
+            unread: true,
+            starred: true,
+        }],
     )
     .unwrap();
     let t = &s.threads(&view(Mailbox::Inbox), 0, 50).unwrap()[0];
@@ -160,33 +188,99 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     g2.thread_hint = Some("conv-9".into());
     s.apply_deltas(a.id, &[up(g1), up(g2)]).unwrap();
     let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
-    assert_eq!(inbox.len(), 2, "hint groups the two, the rest stay separate");
-    let hinted = inbox.iter().find(|t| t.participants == "carol, dave").expect("hinted thread");
-    let subjects: Vec<String> = s.thread(hinted.id).unwrap().into_iter().map(|m| m.subject).collect();
+    assert_eq!(
+        inbox.len(),
+        2,
+        "hint groups the two, the rest stay separate"
+    );
+    let hinted = inbox
+        .iter()
+        .find(|t| t.participants == "carol, dave")
+        .expect("hinted thread");
+    let subjects: Vec<String> = s
+        .thread(hinted.id)
+        .unwrap()
+        .into_iter()
+        .map(|m| m.subject)
+        .collect();
     assert_eq!(subjects, vec!["Odd one", "Totally unrelated"]);
 
     // Deleting messages shrinks the thread, then removes it.
-    s.apply_deltas(a.id, &[Delta::Delete { remote_id: "b1".into() }]).unwrap();
-    let t = &s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().iter().find(|t| t.id == tid).cloned().unwrap();
+    s.apply_deltas(
+        a.id,
+        &[Delta::Delete {
+            remote_id: "b1".into(),
+        }],
+    )
+    .unwrap();
+    let t = &s
+        .threads(&view(Mailbox::Inbox), 0, 50)
+        .unwrap()
+        .iter()
+        .find(|t| t.id == tid)
+        .cloned()
+        .unwrap();
     assert_eq!(t.count, 1);
     assert_eq!(t.snippet, "Hello team");
 
     // A re-sync of the same remote message updates in place and re-indexes it for search.
-    s.apply_deltas(a.id, &[up(body(msg("a1", "alice@a.com", "Project update", D0), "Second draft"))]).unwrap();
-    let t = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().iter().find(|t| t.id == tid).cloned().unwrap();
-    assert_eq!(t.count, 1, "the same remote id must not create a second message");
+    s.apply_deltas(
+        a.id,
+        &[up(body(
+            msg("a1", "alice@a.com", "Project update", D0),
+            "Second draft",
+        ))],
+    )
+    .unwrap();
+    let t = s
+        .threads(&view(Mailbox::Inbox), 0, 50)
+        .unwrap()
+        .iter()
+        .find(|t| t.id == tid)
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        t.count, 1,
+        "the same remote id must not create a second message"
+    );
     assert_eq!(t.snippet, "Second draft");
-    assert_eq!(s.threads(&search(Mailbox::Inbox, "draft"), 0, 50).unwrap().len(), 1, "FTS follows the update");
-    assert_eq!(s.threads(&search(Mailbox::Inbox, "Hello"), 0, 50).unwrap().len(), 0, "stale text is unindexed");
-    s.apply_deltas(a.id, &[Delta::Delete { remote_id: "a1".into() }]).unwrap();
-    assert!(s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().iter().all(|t| t.id != tid));
+    assert_eq!(
+        s.threads(&search(Mailbox::Inbox, "draft"), 0, 50)
+            .unwrap()
+            .len(),
+        1,
+        "FTS follows the update"
+    );
+    assert_eq!(
+        s.threads(&search(Mailbox::Inbox, "Hello"), 0, 50)
+            .unwrap()
+            .len(),
+        0,
+        "stale text is unindexed"
+    );
+    s.apply_deltas(
+        a.id,
+        &[Delta::Delete {
+            remote_id: "a1".into(),
+        }],
+    )
+    .unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Inbox), 0, 50)
+            .unwrap()
+            .iter()
+            .all(|t| t.id != tid)
+    );
 }
 
 #[test]
 fn our_own_reply_makes_a_thread_important() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
-    let sent = in_mailbox(msg("s1", "me@x.com", "Re: Question", D0 + 60_000), Mailbox::Sent);
+    let sent = in_mailbox(
+        msg("s1", "me@x.com", "Re: Question", D0 + 60_000),
+        Mailbox::Sent,
+    );
     let sent = replying_to(sent, "q1");
     let ask = msg("q1", "stranger@far.com", "Question", D0);
     s.apply_deltas(a.id, &[up(ask), up(sent)]).unwrap();
@@ -201,16 +295,23 @@ fn search_grammar_selects_the_right_threads_and_is_injection_proof() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
 
-    let mut t1 = body(msg("1", "alice@github.com", "Fix the bug", JAN1), "apple banana");
+    let mut t1 = body(
+        msg("1", "alice@github.com", "Fix the bug", JAN1),
+        "apple banana",
+    );
     t1 = with_attachment(t1, "patch.diff");
     let mut t2 = unread(msg("2", "bob@corp.com", "Lunch", JAN2));
-    t2.to = vec![Addr { name: "me".into(), email: "me@x.com".into() }];
+    t2.to = vec![Addr {
+        name: "me".into(),
+        email: "me@x.com".into(),
+    }];
     t2.text = "pizza".into();
     let mut t3 = msg("3", "alice@github.com", "Deploy", JAN3);
     t3.text = "banana".into();
     t3.starred = true;
     let t4 = flagged(msg("4", "carol@corp.com", "Quarterly", JAN4), true);
-    s.apply_deltas(a.id, &[up(t1), up(t2), up(t3), up(t4)]).unwrap();
+    s.apply_deltas(a.id, &[up(t1), up(t2), up(t3), up(t4)])
+        .unwrap();
 
     let count = |mb, q: &str| s.threads(&search(mb, q), 0, 50).unwrap().len();
     let subjects = |q: &str| {
@@ -235,10 +336,16 @@ fn search_grammar_selects_the_right_threads_and_is_injection_proof() {
     assert_eq!(subjects("is:unread"), vec!["Lunch"]);
     assert_eq!(subjects("is:starred"), vec!["Deploy"]);
     assert_eq!(subjects("is:important"), vec!["Quarterly"]);
-    assert_eq!(subjects("-is:important"), vec!["Deploy", "Fix the bug", "Lunch"]);
+    assert_eq!(
+        subjects("-is:important"),
+        vec!["Deploy", "Fix the bug", "Lunch"]
+    );
     assert_eq!(subjects("before:2024-01-02"), vec!["Fix the bug"]);
     assert_eq!(subjects("after:2024-01-04"), vec!["Quarterly"]);
-    assert_eq!(subjects("after:2024-01-01 before:2024-01-03"), vec!["Fix the bug", "Lunch"]);
+    assert_eq!(
+        subjects("after:2024-01-01 before:2024-01-03"),
+        vec!["Fix the bug", "Lunch"]
+    );
 
     // Full text, prefix-as-you-type and phrases.
     assert_eq!(subjects("banana"), vec!["Deploy", "Fix the bug"]);
@@ -254,6 +361,22 @@ fn search_grammar_selects_the_right_threads_and_is_injection_proof() {
         "has:attachment' DELETE FROM threads WHERE '1'='1",
     ] {
         assert_eq!(count(Mailbox::Inbox, evil), 0, "query {evil:?} leaked rows");
+    }
+    // Half-typed queries are searched on every keystroke and must never error.
+    for partial in [
+        "\"",
+        "\"apple",
+        "(",
+        "ban*",
+        "AND",
+        "NEAR(",
+        "from:",
+        "-",
+        "is:",
+        "before:20",
+    ] {
+        s.threads(&search(Mailbox::Inbox, partial), 0, 50)
+            .unwrap_or_else(|e| panic!("query {partial:?} errored: {e}"));
     }
     assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().len(), 4);
 }
@@ -279,16 +402,34 @@ fn splits_partition_the_inbox() {
     .unwrap();
 
     let imp = s
-        .threads(&View { split: Some(splits[0].id), ..view(Mailbox::Inbox) }, 0, 50)
+        .threads(
+            &View {
+                split: Some(splits[0].id),
+                ..view(Mailbox::Inbox)
+            },
+            0,
+            50,
+        )
         .unwrap();
     let other = s
-        .threads(&View { split: Some(splits[1].id), ..view(Mailbox::Inbox) }, 0, 50)
+        .threads(
+            &View {
+                split: Some(splits[1].id),
+                ..view(Mailbox::Inbox)
+            },
+            0,
+            50,
+        )
         .unwrap();
     let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
 
     assert_eq!(imp.len(), 2);
     assert_eq!(other.len(), 2);
-    assert_eq!(imp.len() + other.len(), inbox.len(), "Important ∪ Other = Inbox");
+    assert_eq!(
+        imp.len() + other.len(),
+        inbox.len(),
+        "Important ∪ Other = Inbox"
+    );
     let ids: Vec<Id> = imp.iter().chain(other.iter()).map(|t| t.id).collect();
     let unique: std::collections::HashSet<Id> = ids.iter().copied().collect();
     assert_eq!(unique.len(), 4, "the splits are disjoint");
@@ -301,7 +442,10 @@ fn archive_queues_an_op_and_undo_restores_or_inverts() {
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
     s.apply_deltas(
         a.id,
-        &[up(msg("1", "a@a.com", "One", D0)), up(msg("2", "b@b.com", "Two", D0 + 1))],
+        &[
+            up(msg("1", "a@a.com", "One", D0)),
+            up(msg("2", "b@b.com", "Two", D0 + 1)),
+        ],
     )
     .unwrap();
     let inbox = |s: &Store| s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
@@ -313,7 +457,13 @@ fn archive_queues_an_op_and_undo_restores_or_inverts() {
     assert_eq!(s.threads(&view(Mailbox::Archive), 0, 50).unwrap().len(), 1);
     let queued = s.pending_ops(a.id, DUE, 10).unwrap();
     assert_eq!(queued.len(), 1);
-    assert!(matches!(queued[0].1, Op::Move { to: Mailbox::Archive, .. }));
+    assert!(matches!(
+        queued[0].1,
+        Op::Move {
+            to: Mailbox::Archive,
+            ..
+        }
+    ));
     s.undo(token).unwrap();
     assert_eq!(inbox(&s).len(), 2);
     assert!(s.pending_ops(a.id, DUE, 10).unwrap().is_empty());
@@ -326,16 +476,90 @@ fn archive_queues_an_op_and_undo_restores_or_inverts() {
     assert_eq!(inbox(&s).len(), 2, "local state is restored");
     let queued = s.pending_ops(a.id, DUE, 10).unwrap();
     assert_eq!(queued.len(), 1);
-    assert!(matches!(queued[0].1, Op::Move { to: Mailbox::Inbox, .. }), "inverse queued");
+    assert!(
+        matches!(
+            queued[0].1,
+            Op::Move {
+                to: Mailbox::Inbox,
+                ..
+            }
+        ),
+        "inverse queued"
+    );
 
     // Actions apply per message.
     let one = inbox(&s).iter().find(|t| t.subject == "One").unwrap().id;
-    s.apply_deltas(a.id, &[up(replying_to(msg("1b", "a@a.com", "Re: One", D0 + 2), "1"))]).unwrap();
+    s.apply_deltas(
+        a.id,
+        &[up(replying_to(
+            msg("1b", "a@a.com", "Re: One", D0 + 2),
+            "1",
+        ))],
+    )
+    .unwrap();
     s.act(&[one], &Action::Trash).unwrap();
     let ops = s.pending_ops(a.id, DUE, 10).unwrap();
-    let trashed = ops.iter().filter(|(_, o)| matches!(o, Op::Move { to: Mailbox::Trash, .. })).count();
+    let trashed = ops
+        .iter()
+        .filter(|(_, o)| {
+            matches!(
+                o,
+                Op::Move {
+                    to: Mailbox::Trash,
+                    ..
+                }
+            )
+        })
+        .count();
     assert_eq!(trashed, 2, "one op per message");
     assert_eq!(s.threads(&view(Mailbox::Trash), 0, 50).unwrap().len(), 1);
+}
+
+#[test]
+fn sync_does_not_undo_a_local_change_that_is_still_queued() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(unread(msg("1", "a@a.com", "One", D0)))])
+        .unwrap();
+    let id = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap()[0].id;
+
+    s.act(&[id], &Action::Archive).unwrap();
+    s.act(&[id], &Action::Read).unwrap();
+    // The server has not seen either change yet and reports the old state, both ways.
+    s.apply_deltas(
+        a.id,
+        &[Delta::Flags {
+            remote_id: "1".into(),
+            unread: true,
+            starred: false,
+        }],
+    )
+    .unwrap();
+    s.apply_deltas(a.id, &[up(unread(msg("1", "a@a.com", "One", D0)))])
+        .unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().is_empty(),
+        "still archived"
+    );
+    assert!(
+        !s.threads(&view(Mailbox::Archive), 0, 50).unwrap()[0].unread,
+        "still read"
+    );
+
+    // Once the ops are done, the server is authoritative again.
+    for (op, _) in s.pending_ops(a.id, DUE, 10).unwrap() {
+        s.op_done(op, None).unwrap();
+    }
+    s.apply_deltas(
+        a.id,
+        &[Delta::Flags {
+            remote_id: "1".into(),
+            unread: true,
+            starred: false,
+        }],
+    )
+    .unwrap();
+    assert!(s.threads(&view(Mailbox::Archive), 0, 50).unwrap()[0].unread);
 }
 
 #[test]
@@ -344,7 +568,10 @@ fn snooze_hides_from_inbox_and_wake_due_brings_it_back_unread() {
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
     s.apply_deltas(
         a.id,
-        &[up(msg("1", "a@a.com", "Later", D0)), up(msg("2", "b@b.com", "Waiting", D0 + 1))],
+        &[
+            up(msg("1", "a@a.com", "Later", D0)),
+            up(msg("2", "b@b.com", "Waiting", D0 + 1)),
+        ],
     )
     .unwrap();
     let find = |subject: &str| {
@@ -361,14 +588,21 @@ fn snooze_hides_from_inbox_and_wake_due_brings_it_back_unread() {
     s.act(&[later], &Action::Snooze { until }).unwrap();
     assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().len(), 1);
     assert_eq!(s.threads(&view(Mailbox::Snoozed), 0, 50).unwrap().len(), 1);
-    assert!(s.pending_ops(a.id, DUE, 10).unwrap().is_empty(), "snooze is local only");
+    assert!(
+        s.pending_ops(a.id, DUE, 10).unwrap().is_empty(),
+        "snooze is local only"
+    );
 
     let changed = s.wake_due(until + 1).unwrap();
     assert_eq!(changed, vec![a.id]);
     let woken = find("Later");
     assert!(woken.unread, "a woken thread comes back unread");
     assert!(woken.snoozed_until.is_none());
-    assert!(s.threads(&view(Mailbox::Snoozed), 0, 50).unwrap().is_empty());
+    assert!(
+        s.threads(&view(Mailbox::Snoozed), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
 
     // A reminder is dropped when a real reply arrived after it was set.
     let at = now() + 3_600_000;
@@ -377,20 +611,30 @@ fn snooze_hides_from_inbox_and_wake_due_brings_it_back_unread() {
     let reply = replying_to(msg("1b", "a@a.com", "Re: Later", now() + 60_000), "1");
     s.apply_deltas(a.id, &[up(reply)]).unwrap();
     s.wake_due(at).unwrap();
-    assert!(!find("Later").unread, "the reminder did not fire, so it is not forced unread");
+    assert!(
+        !find("Later").unread,
+        "the reminder did not fire, so it is not forced unread"
+    );
 
     // The same reminder on a thread nobody answered does fire.
     s.act(&[waiting], &Action::Read).unwrap();
     s.remind_if_no_reply(waiting, at).unwrap();
     s.wake_due(at).unwrap();
-    assert!(find("Waiting").unread, "no reply arrived, so the reminder disturbs the thread");
+    assert!(
+        find("Waiting").unread,
+        "no reply arrived, so the reminder disturbs the thread"
+    );
 }
 
 #[test]
 fn outbox_orders_by_due_time_and_cancels() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
-    let draft = |subject: &str| Draft { account_id: a.id, subject: subject.into(), ..Draft::default() };
+    let draft = |subject: &str| Draft {
+        account_id: a.id,
+        subject: subject.into(),
+        ..Draft::default()
+    };
 
     let id_a = s.outbox_add(&draft("A"), 100).unwrap();
     let id_b = s.outbox_add(&draft("B"), 50).unwrap();
@@ -409,7 +653,12 @@ fn outbox_orders_by_due_time_and_cancels() {
     assert!(s.outbox_cancel(id_b).unwrap().is_none());
 
     s.outbox_sent(id_a).unwrap();
-    let rest: Vec<String> = s.outbox_due(1_000).unwrap().into_iter().map(|(_, d)| d.subject).collect();
+    let rest: Vec<String> = s
+        .outbox_due(1_000)
+        .unwrap()
+        .into_iter()
+        .map(|(_, d)| d.subject)
+        .collect();
     assert_eq!(rest, vec!["C"]);
     assert_eq!(s.outbox_due(199).unwrap().len(), 0);
     assert_eq!(s.outbox_due(200).unwrap()[0].0, id_c);
@@ -424,7 +673,11 @@ fn a_reader_connection_sees_committed_writes_from_the_writer() {
         assert!(reader.accounts()?.is_empty());
 
         let a = writer.add_account(Provider::Microsoft, "me@x.com", "Me")?;
-        assert_eq!(reader.accounts()?.len(), 1, "the reader must see committed writes");
+        assert_eq!(
+            reader.accounts()?.len(),
+            1,
+            "the reader must see committed writes"
+        );
 
         writer.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hello", D0))])?;
         assert_eq!(reader.threads(&view(Mailbox::Inbox), 0, 50)?.len(), 1);
@@ -448,10 +701,19 @@ fn reply_context_carries_the_threading_headers() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
     let mut m = msg("q1", "alice@a.com", "Question", D0);
-    m.to = vec![Addr { name: "Me".into(), email: "me@x.com".into() }];
-    m.cc = vec![Addr { name: "Carol".into(), email: "carol@c.com".into() }];
+    m.to = vec![Addr {
+        name: "Me".into(),
+        email: "me@x.com".into(),
+    }];
+    m.cc = vec![Addr {
+        name: "Carol".into(),
+        email: "carol@c.com".into(),
+    }];
     s.apply_deltas(a.id, &[up(m)]).unwrap();
-    let local: Id = s.thread(s.threads(&view(Mailbox::Inbox), 0, 5).unwrap()[0].id).unwrap()[0].id;
+    let local: Id = s
+        .thread(s.threads(&view(Mailbox::Inbox), 0, 5).unwrap()[0].id)
+        .unwrap()[0]
+        .id;
 
     let ctx = s.reply_context(local).unwrap().unwrap();
     assert_eq!(ctx.account_id, a.id);
@@ -469,7 +731,10 @@ fn contacts_and_attachments_round_trip() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
     let mut sent = in_mailbox(msg("s1", "me@x.com", "Hello", D0), Mailbox::Sent);
-    sent.to = vec![Addr { name: "Alice".into(), email: "alice@a.com".into() }];
+    sent.to = vec![Addr {
+        name: "Alice".into(),
+        email: "alice@a.com".into(),
+    }];
     sent.text = "hi".into();
     let mut got = with_attachment(msg("1", "zeta@z.com", "Doc", D0 + 1), "report.pdf");
     got.important = Some(false);
@@ -477,34 +742,64 @@ fn contacts_and_attachments_round_trip() {
 
     let addrs = s.contacts("al", 10).unwrap();
     assert_eq!(addrs.len(), 1);
-    assert_eq!(addrs[0], Addr { name: "Alice".into(), email: "alice@a.com".into() });
+    assert_eq!(
+        addrs[0],
+        Addr {
+            name: "Alice".into(),
+            email: "alice@a.com".into()
+        }
+    );
     assert_eq!(s.contacts("nobody", 10).unwrap().len(), 0);
 
     let tid = s.threads(&view(Mailbox::Inbox), 0, 5).unwrap()[0].id;
     let att = s.thread(tid).unwrap()[0].attachments[0].clone();
     assert_eq!(att.name, "report.pdf");
     let (acct, remote_msg, remote_att, name) = s.attachment(att.id).unwrap().unwrap();
-    assert_eq!((acct, remote_msg.as_str(), remote_att.as_str(), name.as_str()), (a.id, "1", "att-report.pdf", "report.pdf"));
+    assert_eq!(
+        (
+            acct,
+            remote_msg.as_str(),
+            remote_att.as_str(),
+            name.as_str()
+        ),
+        (a.id, "1", "att-report.pdf", "report.pdf")
+    );
 }
 
 #[test]
 fn settings_and_splits_round_trip() {
     let s = Store::memory().unwrap();
-    assert_eq!(s.settings().unwrap().undo_send_secs, 5, "defaults when nothing is stored");
+    assert_eq!(
+        s.settings().unwrap().undo_send_secs,
+        5,
+        "defaults when nothing is stored"
+    );
     let mut settings = s.settings().unwrap();
     settings.theme = "dark".into();
     settings.ai_model = "m".into();
     s.set_settings(settings).unwrap();
     assert_eq!(s.settings().unwrap().theme, "dark");
 
-    s.set_splits(vec![Split { id: 0, name: "GitHub".into(), query: "from:github.com".into() }])
-        .unwrap();
+    s.set_splits(vec![Split {
+        id: 0,
+        name: "GitHub".into(),
+        query: "from:github.com".into(),
+    }])
+    .unwrap();
     let splits = s.splits().unwrap();
     assert_eq!(splits.len(), 1);
     assert_eq!(splits[0].name, "GitHub");
     s.set_splits(vec![
-        Split { id: 0, name: "A".into(), query: "is:important".into() },
-        Split { id: 0, name: "B".into(), query: "-is:important".into() },
+        Split {
+            id: 0,
+            name: "A".into(),
+            query: "is:important".into(),
+        },
+        Split {
+            id: 0,
+            name: "B".into(),
+            query: "-is:important".into(),
+        },
     ])
     .unwrap();
     let names: Vec<String> = s.splits().unwrap().into_iter().map(|s| s.name).collect();
@@ -515,7 +810,8 @@ fn settings_and_splits_round_trip() {
 fn accounts_cascade_on_removal() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
-    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))]).unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
     assert_eq!(s.account_provider(a.id).unwrap(), Some(Provider::Proton));
     s.remove_account(a.id).unwrap();
     assert!(s.accounts().unwrap().is_empty());
@@ -533,7 +829,11 @@ fn perf_budgets() {
     let start = Instant::now();
     for i in 0..THREADS {
         for k in 0..PER_THREAD {
-            let rid = if k == 0 { format!("r{i}") } else { format!("r{i}-{k}") };
+            let rid = if k == 0 {
+                format!("r{i}")
+            } else {
+                format!("r{i}-{k}")
+            };
             let mut m = msg(
                 &rid,
                 &format!("person{}@example.com", (i + k) % 40),
@@ -547,7 +847,11 @@ fn perf_budgets() {
             };
             m.unread = k == 0 && i % 2 == 0;
             if k > 0 {
-                let parent = if k == 1 { format!("r{i}") } else { format!("r{i}-{}", k - 1) };
+                let parent = if k == 1 {
+                    format!("r{i}")
+                } else {
+                    format!("r{i}-{}", k - 1)
+                };
                 m = replying_to(m, &parent);
                 m.subject = format!("Re: Subject {i}");
             }
@@ -563,7 +867,10 @@ fn perf_budgets() {
     }
     assert_eq!(THREADS * PER_THREAD, 50_000);
     let insert = start.elapsed();
-    assert!(insert < Duration::from_secs(10), "50k messages in batches of 200 took {insert:?}");
+    assert!(
+        insert < Duration::from_secs(10),
+        "50k messages in batches of 200 took {insert:?}"
+    );
 
     let inbox = view(Mailbox::Inbox);
     let mut times = Vec::new();
@@ -574,12 +881,17 @@ fn perf_budgets() {
         assert_eq!(rows.len(), 200);
     }
     let list = median(times);
-    assert!(list <= Duration::from_millis(5), "threads(inbox, 0, 200) took {list:?}");
+    assert!(
+        list <= Duration::from_millis(5),
+        "threads(inbox, 0, 200) took {list:?}"
+    );
 
     let mut times = Vec::new();
     for _ in 0..5 {
         let t = Instant::now();
-        let rows = s.threads(&search(Mailbox::Inbox, "banana"), 0, 200).unwrap();
+        let rows = s
+            .threads(&search(Mailbox::Inbox, "banana"), 0, 200)
+            .unwrap();
         times.push(t.elapsed());
         assert!(!rows.is_empty());
     }
@@ -590,13 +902,20 @@ fn perf_budgets() {
     for _ in 0..5 {
         let t = Instant::now();
         let rows = s
-            .threads(&search(Mailbox::Inbox, "from:person7@example.com banana"), 0, 200)
+            .threads(
+                &search(Mailbox::Inbox, "from:person7@example.com banana"),
+                0,
+                200,
+            )
             .unwrap();
         times.push(t.elapsed());
         assert!(!rows.is_empty());
     }
     let fts_from = median(times);
-    assert!(fts_from <= Duration::from_millis(20), "from: + FTS took {fts_from:?}");
+    assert!(
+        fts_from <= Duration::from_millis(20),
+        "from: + FTS took {fts_from:?}"
+    );
 
     println!("perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?}");
 }
