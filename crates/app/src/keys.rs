@@ -97,14 +97,26 @@ pub struct Act {
 }
 
 pub fn bind(cx: &mut App) {
-    cx.bind_keys(
-        COMMANDS
-            .iter()
-            .flat_map(|c| {
-                c.keys
-                    .iter()
-                    .map(move |keys| KeyBinding::new(keys, Act { cmd: c.id }, Some(c.ctx)))
-            })
-            .collect::<Vec<_>>(),
-    );
+    let mut bindings = Vec::new();
+    for command in COMMANDS {
+        for key in command.keys {
+            bindings.push(KeyBinding::new(
+                key,
+                Act { cmd: command.id },
+                Some(command.ctx),
+            ));
+            // Reading actions must not match while the titlebar search input has focus.
+            if matches!(
+                command.id,
+                cmd::DONE | cmd::INBOX | cmd::TRASH | cmd::SNOOZE | cmd::STAR | cmd::TOGGLE_READ
+            ) {
+                bindings.push(KeyBinding::new(
+                    key,
+                    Act { cmd: command.id },
+                    Some("KiteThread"),
+                ));
+            }
+        }
+    }
+    cx.bind_keys(bindings);
 }

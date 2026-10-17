@@ -1,10 +1,30 @@
 //! The thread view: HTML bodies, text bodies, collapsing, and side effects.
 mod common;
-use common::{Fixture, HTML, mount};
+use common::{Fixture, HTML, mount, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
 use kite_core::model::Action;
 use std::time::Duration;
+
+#[gpui_kit::test]
+fn archiving_from_the_reading_view_returns_to_the_remaining_inbox(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter e");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), None);
+        assert_eq!(kite.row_ids(), vec![2, 3]);
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("thread-subject").is_none());
+        assert_eq!(
+            window.find(("row", 0usize)).label(),
+            Some("Sender 2: Thread 2")
+        );
+    })
+    .unwrap();
+}
 
 #[gpui_kit::test]
 async fn opening_a_thread_renders_its_html_body_at_the_rendered_height(cx: &mut TestAppContext) {

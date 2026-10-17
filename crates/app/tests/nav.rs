@@ -183,3 +183,37 @@ fn question_mark_opens_the_cheat_sheet(cx: &mut TestAppContext) {
     .unwrap();
     let _ = px(1.);
 }
+
+#[gpui_kit::test]
+fn clicking_a_palette_command_changes_the_visible_inbox(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "secondary-k d o n e");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("palette-row", 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("palette").is_none());
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 2);
+        assert!(!kite.row_ids().contains(&1));
+    });
+}
+
+#[gpui_kit::test]
+fn palette_navigation_keeps_the_selected_command_visible(cx: &mut TestAppContext) {
+    let (window, _) = mount(cx, Fixture::new(3));
+    cx.simulate_keystrokes(
+        window.into(),
+        "secondary-k down down down down down down down down down down",
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let row = window.find(("palette-row", 10usize));
+        assert_eq!(row.selected(), Some(true));
+        assert!(row.bounds().bottom() <= window.find("palette").bounds().bottom());
+    })
+    .unwrap();
+}

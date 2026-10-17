@@ -3,10 +3,12 @@ use crate::app::Kite;
 use crate::keys::{self, Cmd};
 use crate::theme::{ROW_H, Theme};
 use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
+use gpui_kit::assets::IconName;
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Ms, ThreadSummary};
+use kite_core::model::{Mailbox, Ms, ThreadSummary};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -39,7 +41,7 @@ impl Kite {
             cx.processor(
                 move |this: &mut Kite,
                       range: Range<usize>,
-                      _window: &mut Window,
+                      window: &mut Window,
                       cx: &mut Context<Kite>| {
                     if !this.loaded_all && range.end + 50 >= this.rows.len() {
                         this.load_more(cx);
@@ -49,35 +51,53 @@ impl Kite {
                         let Some(row) = this.rows.get(ix) else {
                             continue;
                         };
-                        items.push(row_element(this, row, ix, cx));
+                        let sender_width = if window.viewport_size().width < px(900.) {
+                            140.
+                        } else {
+                            180.
+                        };
+                        items.push(row_element(this, row, ix, sender_width, cx));
                     }
                     items
                 },
             ),
         )
         .track_scroll(&scroll)
+        .w_full()
         .h_full();
         div()
             .flex_1()
             .flex()
             .flex_col()
+            .min_h_0()
             .overflow_hidden()
+            .px_5()
+            .pb_4()
             .child(list)
             .into_any_element()
     }
 
     fn render_empty(&self) -> AnyElement {
         let t = self.theme;
-        let searching = self.view.query.is_some();
-        let title = if searching {
-            "No results"
+        let (title, note) = if self.view.query.is_some() {
+            ("No results", "Try another name, subject, or search term.")
+        } else if self.accounts.is_empty() {
+            (
+                "Welcome to Kite",
+                "Your email deserves a little breathing room.",
+            )
         } else {
-            "Inbox Zero"
-        };
-        let note = if searching {
-            "Nothing matches that search."
-        } else {
-            "You're all caught up."
+            match self.view.mailbox {
+                Mailbox::Inbox => ("Inbox Zero", "You're all caught up. Enjoy the quiet."),
+                Mailbox::Starred => ("No starred mail", "Star a conversation to find it here."),
+                Mailbox::Snoozed => (
+                    "Nothing snoozed",
+                    "Conversations you snooze will wait here.",
+                ),
+                Mailbox::Drafts => ("No drafts", "Your unfinished messages will appear here."),
+                Mailbox::Sent => ("No sent mail", "Messages you send will appear here."),
+                _ => ("No conversations", "There's no mail in this view."),
+            }
         };
         div()
             .id("inbox-zero")
@@ -88,7 +108,7 @@ impl Kite {
             .flex_col()
             .items_center()
             .justify_center()
-            .gap_2()
+            .gap_3()
             .bg(linear_gradient(
                 135.,
                 linear_color_stop(Theme::alpha(t.accent, 0.12), 0.),
@@ -100,7 +120,16 @@ impl Kite {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child(title),
             )
-            .child(div().text_color(t.fg2).child(note))
+            .child(div().text_size(px(14.)).text_color(t.fg2).child(note))
+            .when(self.accounts.is_empty(), |d| {
+                d.child(
+                    div()
+                        .mt_4()
+                        .text_size(px(12.))
+                        .text_color(t.fg2)
+                        .child("Account connection is not available in this build."),
+                )
+            })
             .into_any_element()
     }
 
@@ -161,7 +190,13 @@ impl Kite {
 }
 
 /// One list row. Borrows its summary, so painting a frame copies no threads.
-fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kite>) -> AnyElement {
+fn row_element(
+    kite: &Kite,
+    row: &ThreadSummary,
+    ix: usize,
+    sender_width: f32,
+    cx: &mut Context<Kite>,
+) -> AnyElement {
     let t = kite.theme;
     let selected = ix == kite.sel;
     let checked = kite.multi.contains(&row.id);
@@ -178,7 +213,9 @@ fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kit
         .flex_row()
         .items_center()
         .flex_shrink_0()
+        .w_full()
         .h(px(ROW_H))
+        .rounded(px(6.))
         .px_3()
         .gap_3()
         .cursor_pointer()
@@ -206,7 +243,7 @@ fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kit
         )
         .child(
             div()
-                .w(px(180.))
+                .w(px(sender_width))
                 .flex_shrink_0()
                 .truncate()
                 .text_size(px(13.))
@@ -225,11 +262,18 @@ fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kit
                 .flex()
                 .items_center()
                 .gap_2()
+                .min_w_0()
                 .overflow_hidden()
                 .child(
                     div()
                         .max_w(px(360.))
+                        .min_w_0()
                         .truncate()
+                        .font_weight(if row.unread {
+                            FontWeight::MEDIUM
+                        } else {
+                            FontWeight::NORMAL
+                        })
                         .text_size(px(13.))
                         .text_color(t.fg)
                         .child(row.subject.clone()),
@@ -237,20 +281,34 @@ fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kit
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .truncate()
                         .text_size(px(13.))
-                        .text_color(t.fg3)
+                        .text_color(t.fg2)
                         .child(row.snippet.clone()),
                 ),
         )
+        .when(row.starred, |d| {
+            d.child(
+                Icon::new(IconName::Star)
+                    .with_size(px(13.))
+                    .text_color(t.accent),
+            )
+        })
         .when(!row.labels.is_empty(), |d| {
             d.child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
+                    .max_w(px(160.))
+                    .overflow_hidden()
+                    .flex_shrink_0()
                     .children(row.labels.iter().take(2).map(|label| {
                         div()
+                            .max_w(px(120.))
+                            .min_w_0()
+                            .truncate()
                             .px_2()
                             .py_0p5()
                             .rounded(px(6.))
@@ -263,8 +321,12 @@ fn row_element(kite: &Kite, row: &ThreadSummary, ix: usize, cx: &mut Context<Kit
         })
         .child(
             div()
+                .id(("row-time", ix))
+                .test_support()
+                .aria_label(when(row.date, now))
                 .relative()
                 .w(px(64.))
+                .flex_shrink_0()
                 .flex()
                 .justify_end()
                 .text_size(px(12.))

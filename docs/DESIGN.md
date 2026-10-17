@@ -26,7 +26,7 @@ radius:    10px;  radius-sm: 6px
 font:        system UI font (".SystemUIFont" on macOS = SF Pro, "Segoe UI Variable" on Windows)
 mono:        "SF Mono" / "Cascadia Code"
 ```
-Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread subject · 28 empty-state. Weights: 400 / 500 / 650. Letter-spacing −0.01em at ≥ 15px. No fonts are bundled, which keeps the binary small.
+Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread subject · 24 mailbox heading · 28 empty-state. Weights: 400 / 500 / 650. Letter-spacing −0.01em at ≥ 15px. No fonts are bundled, which keeps the binary small.
 
 ## Layout
 ```
@@ -38,13 +38,16 @@ Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread su
 │  …                                                            │
 └──────────────────────────────────────────────────────────────┘
 ```
-- **List row:** grid `[sender 180px] [subject + snippet 1fr] [labels auto] [time 64px]`. The subject is `fg` and the snippet is `fg3`, on one line with an ellipsis. Hovering shows inline action hints (`e` done · `h` remind) in place of the time.
+- **Chrome:** the 44px titlebar contains the quiet Kite wordmark, split tabs with a 2px accent underline, search, and the command shortcut. Mail actions live beside the mailbox heading instead of crowding the titlebar. The mailbox header uses 32px horizontal / 24px vertical padding, with the account identity beneath the heading. A 38px footer teaches navigation, opening, and archive shortcuts and opens keyboard help.
+- **List row:** grid `[sender 180px] [subject + snippet 1fr] [labels auto] [time 64px]`, inset 20px from the window edges. The sender narrows to 140px below a 900px window width. The subject is `fg` and the snippet is `fg2`, on one line with an ellipsis. Snippets shrink before the fixed timestamp column; unread subjects have medium weight. Hovering shows inline action hints (`e` done · `h` remind) in place of the time. A star is visible beside starred conversations.
 - **Thread view** replaces the list (it does not split). The content column is max 760px and centred. The subject is 20px/650. Each message card has the sender, the time, and the body: the HTML part rendered by Blitz (`html.rs`) with our theme defaults injected, or the plain text part as GPUI text with clickable links. The reply box is docked at the bottom and expands on `r`.
 - **Compose** is a floating panel bottom-right (560×480), or full-height when replying in a thread. Fields (To, Cc on demand, Subject) are borderless. The send button has the accent gradient and the hint `⌘↵`.
 - **Command palette** is centred at 18vh from the top, 600px wide, on `bg2` with a soft shadow `0 20px 60px #0008`. Rows are 36px, and the selected row has an accent glow on its left edge.
+- The palette shows at most nine commands and keeps the keyboard selection visible as it advances. Commands work by click as well as keyboard; the footer shows navigation and execution hints. Empty searches say “No matching commands.”
 - **Toasts** (gpui-component notifications, restyled) appear bottom-centre, pill shaped, e.g. "Marked done · **z** to undo". They auto-dismiss after 4 s.
 - **Calendar sidebar** is 280px on the right, with an hour grid for today and event blocks tinted with `accent` at 18%.
 - **Empty inbox:** a full-bleed gradient wash (`accent`→`accent2` at 12% opacity), large "Inbox Zero" text and a single line of copy. No illustrations.
+- Empty non-inbox views name the relevant mailbox instead of claiming Inbox Zero. With no accounts, show “Welcome to Kite” and the current account-connection limitation; do not imply mail has synced.
 
 ## Icons (Lucide, animated)
 - Lucide icons come from gpui-kit's bundled set (`gpui_kit::component` `Icon`/`IconName`, or our own `AssetSource` for icons outside the default 101). Sizes are 16px (list/toolbar) and 18px (compose/thread actions), coloured with `currentColor`-equivalent theme tokens. Tooltips and palette rows always pair an icon with its `<kbd>` hint.

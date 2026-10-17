@@ -78,20 +78,18 @@ impl Mail for Empty {
 }
 
 fn main() {
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(|cx| {
-            gpui_kit::init(cx);
-            let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
-            gpui_kit::open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    window_min_size: Some(size(px(720.), px(480.))),
-                    ..TitleBar::window_options()
-                },
-                cx,
-                |window, cx| cx.new(|cx| kite::app::Kite::new(Arc::new(Empty), window, cx)),
-            )
-            .expect("failed to open window");
-        });
+    gpui_kit::application().with_assets(kite::Assets).run(|cx| {
+        gpui_kit::init(cx);
+        let bounds = Bounds::centered(None, size(px(1200.), px(800.)), cx);
+        gpui_kit::open_window(
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                window_min_size: Some(size(px(720.), px(480.))),
+                ..TitleBar::window_options()
+            },
+            cx,
+            |window, cx| cx.new(|cx| kite::app::Kite::new(Arc::new(Empty), window, cx)),
+        )
+        .expect("failed to open window");
+    });
 }

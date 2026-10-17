@@ -193,7 +193,7 @@ impl Kite {
             msgs: Lru::new(24),
             html_cache: thread::HtmlCache::new(24),
             html_bounds: Rc::new(RefCell::new(HashMap::new())),
-            html_width: MAX_COL - 48.,
+            html_width: MAX_COL - 80.,
             html_scale: 1.,
             loaded_all: false,
             pulse: None,
@@ -730,7 +730,7 @@ impl Kite {
     // ---- view --------------------------------------------------------------------
 
     /// A toolbar icon that plays its DESIGN › Icons animation when its action runs.
-    fn action_icon(
+    pub(crate) fn action_icon(
         &self,
         cmd: u8,
         icon: IconName,
@@ -739,7 +739,7 @@ impl Kite {
     ) -> AnyElement {
         let t = self.theme;
         let pulse = self.pulse.filter(|(c, _)| *c == cmd).map(|(_, seq)| seq);
-        let base = Icon::new(icon).with_size(px(16.)).text_color(t.fg3);
+        let base = Icon::new(icon).with_size(px(16.)).text_color(t.fg2);
         // A fresh element id per (action, run) restarts the animation each time.
         let key = cmd as usize * 64 + (pulse.unwrap_or(0) % 64) as usize;
         let glyph = match pulse {
@@ -774,7 +774,7 @@ impl Kite {
             .flex()
             .items_center()
             .justify_center()
-            .size(px(26.))
+            .size(px(30.))
             .rounded(px(6.))
             .cursor_pointer()
             .hover(|s| s.bg(t.bg3))
@@ -785,7 +785,6 @@ impl Kite {
 
     fn render_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
-        let unread = self.rows.iter().filter(|r| r.unread).count();
         let active = self
             .tabs
             .iter()
@@ -803,44 +802,37 @@ impl Kite {
                     .test_support()
                     .aria_label(tab.name.clone())
                     .aria_selected(selected)
+                    .relative()
                     .flex()
                     .items_center()
-                    .gap_2()
-                    .px_2()
-                    .py_1()
-                    .rounded(px(6.))
+                    .h_full()
+                    .px_3()
                     .cursor_pointer()
-                    .when(selected, |d| d.bg(Theme::alpha(t.accent, 0.14)))
-                    .when(!selected, |d| {
-                        d.text_color(t.fg2).hover(|s| s.bg(t.bg3).text_color(t.fg))
+                    .text_size(px(13.))
+                    .font_weight(if selected {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
                     })
+                    .text_color(if selected { t.fg } else { t.fg2 })
+                    .hover(|s| s.text_color(t.fg).bg(t.bg3))
                     .on_click(cx.listener(move |this, _, _, cx| this.select_split(ix, cx)))
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .font_weight(if selected {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::MEDIUM
-                            })
-                            .child(tab.name.clone()),
-                    )
-                    .when(selected && unread > 0, |d| {
+                    .child(tab.name.clone())
+                    .when(selected, |d| {
                         d.child(
                             div()
-                                .text_size(px(12.))
-                                .text_color(t.accent)
-                                .child(unread.to_string()),
+                                .absolute()
+                                .bottom_0()
+                                .left_3()
+                                .right_3()
+                                .h(px(2.))
+                                .rounded_full()
+                                .bg(t.accent),
                         )
                     })
                     .into_any_element()
             })
             .collect();
-        let mailbox = GO_MAILBOXES
-            .iter()
-            .find(|(mailbox, _)| *mailbox == self.view.mailbox)
-            .filter(|(mailbox, _)| *mailbox != Mailbox::Inbox)
-            .map(|(_, name)| *name);
         TitleBar::new()
             .h(px(BAR_H))
             .bg(t.bg)
@@ -850,55 +842,241 @@ impl Kite {
                 div()
                     .flex()
                     .flex_1()
-                    .flex_row()
+                    .min_w_0()
+                    .h_full()
                     .items_center()
-                    .gap_1()
-                    .overflow_hidden()
-                    .when_some(mailbox, |d, name| {
-                        d.child(
-                            div()
-                                .px_2()
-                                .text_size(px(13.))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(t.fg2)
-                                .child(name),
-                        )
-                    })
-                    .children(tabs)
+                    .gap_3()
+                    .child(
+                        div()
+                            .px_3()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight(650.))
+                            .child("Kite"),
+                    )
+                    .child(div().flex().h_full().items_center().children(tabs))
                     .child(div().flex_1())
-                    .child(self.action_icon(cmd::DONE, IconName::Archive, "Mark done (e)", cx))
-                    .child(self.action_icon(cmd::SNOOZE, IconName::Clock, "Snooze (h)", cx))
-                    .child(self.action_icon(cmd::STAR, IconName::Star, "Star (s)", cx))
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap_2()
+                            .px_2()
+                            .h(px(30.))
+                            .rounded(px(6.))
+                            .when(focused, |d| d.bg(t.bg3))
+                            .child(
+                                Icon::new(IconName::Search)
+                                    .with_size(px(14.))
+                                    .text_color(t.fg2),
+                            )
                             .child(
                                 Input::new(&self.search)
                                     .id("search")
                                     .aria_label("Search")
                                     .appearance(false)
                                     .bordered(false)
-                                    .w(px(if focused { 240. } else { 160. }))
+                                    .w(px(if focused && window.viewport_size().width >= px(900.) {
+                                        210.
+                                    } else {
+                                        120.
+                                    }))
                                     .text_size(px(13.))
-                                    .when(!focused, |d| d.text_color(t.fg3)),
+                                    .text_color(t.fg2),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("palette-hint")
+                            .test_support()
+                            .aria_label("Command palette")
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .h(px(30.))
+                            .px_2()
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(t.bg3))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.run(cmd::PALETTE, window, cx)
+                                }),
                             )
-                            .child(
-                                div()
-                                    .id("palette-hint")
-                                    .test_support()
-                                    .aria_label("Command palette")
-                                    .when_some(
-                                        Kbd::binding_for_action(
-                                            &Act { cmd: cmd::PALETTE },
-                                            Some("Kite"),
-                                            window,
-                                        ),
-                                        |d, hint| d.child(hint.outline()),
-                                    ),
+                            .when_some(
+                                Kbd::binding_for_action(
+                                    &Act { cmd: cmd::PALETTE },
+                                    Some("Kite"),
+                                    window,
+                                ),
+                                |d, hint| d.child(hint.outline()),
                             ),
                     ),
+            )
+    }
+
+    fn render_inbox_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        let title = if self.view.query.is_some() {
+            "Search results"
+        } else {
+            GO_MAILBOXES
+                .iter()
+                .find(|(mailbox, _)| *mailbox == self.view.mailbox)
+                .map(|(_, name)| *name)
+                .unwrap_or("Mail")
+        };
+        let account = self
+            .view
+            .account_id
+            .and_then(|id| self.accounts.iter().find(|a| a.id == id));
+        let identity = account.map(|a| a.email.as_str()).unwrap_or_else(|| {
+            if self.accounts.len() == 1 {
+                self.accounts[0].email.as_str()
+            } else if self.accounts.is_empty() {
+                "No accounts connected"
+            } else {
+                "All accounts"
+            }
+        });
+        let count = self.rows.len();
+        let summary = if self.multi.is_empty() {
+            format!(
+                "{count}{} {}",
+                if self.loaded_all { "" } else { "+" },
+                if count == 1 {
+                    "conversation"
+                } else {
+                    "conversations"
+                }
+            )
+        } else {
+            format!("{} selected", self.multi.len())
+        };
+        div()
+            .id("inbox-header")
+            .test_support()
+            .aria_label(title)
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .px_8()
+            .py_6()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(24.))
+                            .font_weight(FontWeight(650.))
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(t.fg2)
+                            .child(identity.to_string()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .when(!self.rows.is_empty(), |d| {
+                        d.child(div().text_size(px(12.)).text_color(t.fg2).child(summary))
+                            .child(div().w(px(1.)).h(px(18.)).bg(t.line))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(self.action_icon(
+                                        cmd::DONE,
+                                        IconName::Archive,
+                                        "Mark done (e)",
+                                        cx,
+                                    ))
+                                    .child(self.action_icon(
+                                        cmd::SNOOZE,
+                                        IconName::Clock,
+                                        "Snooze (h)",
+                                        cx,
+                                    ))
+                                    .child(self.action_icon(
+                                        cmd::STAR,
+                                        IconName::Star,
+                                        "Star (s)",
+                                        cx,
+                                    )),
+                            )
+                    }),
+            )
+    }
+
+    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_between()
+            .h(px(38.))
+            .px_8()
+            .border_t_1()
+            .border_color(t.line)
+            .text_size(px(12.))
+            .text_color(t.fg2)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(crate::list::keys_pills(t, "j k"))
+                            .child("Navigate"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(crate::list::keys_pills(
+                                t,
+                                if self.open.is_some() { "u" } else { "enter" },
+                            ))
+                            .child(if self.open.is_some() { "Back" } else { "Open" }),
+                    )
+                    .when(!self.rows.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(crate::list::keys_pills(t, "e"))
+                                .child("Done"),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("shortcut-help")
+                    .test_support()
+                    .aria_label("Keyboard shortcuts")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(t.fg))
+                    .on_click(cx.listener(|this, _, window, cx| this.run(cmd::HELP, window, cx)))
+                    .child("Shortcuts")
+                    .child(crate::list::keys_pills(t, "shift-/")),
             )
     }
 
@@ -908,7 +1086,7 @@ impl Kite {
         Some(
             div()
                 .absolute()
-                .bottom_6()
+                .bottom(px(54.))
                 .left_0()
                 .w_full()
                 .flex()
@@ -979,10 +1157,13 @@ impl Render for Kite {
             .flex_col()
             .bg(self.theme.bg)
             .text_color(self.theme.fg)
+            .font_family(theme::FONT)
+            .text_size(px(14.))
             .key_context("Kite")
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::action))
             .child(self.render_bar(window, cx))
+            .when(!open, |d| d.child(self.render_inbox_header(cx)))
             .child(
                 div()
                     .id("body")
@@ -994,6 +1175,7 @@ impl Render for Kite {
                     .track_focus(&self.focus)
                     .child(body),
             )
+            .child(self.render_footer(cx))
             .children(self.render_overlay(window, cx))
             .children(self.render_toast(window))
     }

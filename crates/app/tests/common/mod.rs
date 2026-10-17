@@ -19,6 +19,8 @@ pub const SPLITS: [Id; 2] = [1, 2];
 pub const HTML: &str = "<p>Hello there.</p><p>Second paragraph with enough text to lay out.</p>";
 
 pub struct Fixture {
+    pub settings: Mutex<Settings>,
+    pub accounts: Mutex<Vec<Account>>,
     threads: Mutex<Vec<ThreadSummary>>,
     messages: Mutex<HashMap<Id, Vec<Message>>>,
     /// Every `act` call, in order.
@@ -81,6 +83,16 @@ impl Fixture {
             );
         }
         Arc::new(Self {
+            settings: Mutex::new(Settings {
+                theme: "dark".into(),
+                ..Settings::default()
+            }),
+            accounts: Mutex::new(vec![Account {
+                id: 1,
+                provider: kite_core::model::Provider::Proton,
+                email: "me@example.com".into(),
+                name: "Me".into(),
+            }]),
             threads: Mutex::new(threads),
             messages: Mutex::new(messages),
             actions: Mutex::new(Vec::new()),
@@ -114,6 +126,98 @@ impl Fixture {
             .max()
             .unwrap_or(0)
             + 1
+    }
+
+    /// Realistic local content for the native preview; never included in the app binary.
+    pub fn showcase() -> Arc<Self> {
+        let samples = [
+            (
+                "Alice Chen",
+                "A few thoughts on the next chapter",
+                "Hey, I've been thinking about what we talked about yesterday.",
+            ),
+            (
+                "Daniel, Sofia",
+                "Re: A place to get away",
+                "That little house by the coast looks perfect. Let's book it.",
+            ),
+            (
+                "Linear",
+                "Your team's week in review",
+                "A quieter inbox, a faster workflow, and a few things shipped.",
+            ),
+            (
+                "Oliver Grant",
+                "Coffee on Thursday?",
+                "I'll be near your office around 10. Your usual place?",
+            ),
+            (
+                "Maya Patel",
+                "The final selects",
+                "Here are my favourites from the shoot. Would love your thoughts.",
+            ),
+            (
+                "GitHub",
+                "[kite] Improve keyboard navigation",
+                "The changes you requested are ready for another look.",
+            ),
+            (
+                "Nora Williams",
+                "One for the reading list",
+                "I think you'll enjoy this essay. Especially the last paragraph.",
+            ),
+            (
+                "James, You",
+                "Re: Sunday lunch",
+                "Perfect. I'll bring something for dessert.",
+            ),
+            (
+                "Figma",
+                "A little inspiration for your next project",
+                "Fresh ideas from the design community.",
+            ),
+            (
+                "Amelia Brooks",
+                "Notes from our conversation",
+                "Thanks again for making the time. A few things to follow up on.",
+            ),
+            (
+                "Theo Martin",
+                "A good weekend for a long walk",
+                "The forecast is looking promising. Shall we head out early?",
+            ),
+            (
+                "Sofia Reyes",
+                "Something worth sharing",
+                "This reminded me of your idea. Thought you'd want to see it.",
+            ),
+        ];
+        let fixture = Self::new(samples.len());
+        fixture.accounts.lock().unwrap()[0].email = "karl@example.com".into();
+        let mut rows = fixture.threads.lock().unwrap();
+        let mut messages = fixture.messages.lock().unwrap();
+        for (ix, (sender, subject, snippet)) in samples.into_iter().enumerate() {
+            let row = &mut rows[ix];
+            row.participants = sender.into();
+            row.subject = subject.into();
+            row.snippet = snippet.into();
+            row.unread = ix < 3;
+            row.starred = ix == 4;
+            row.date = chrono::Local::now().timestamp_millis() - ix as i64 * 1_800_000;
+            if let Some(thread) = messages.get_mut(&row.id) {
+                for message in thread {
+                    message.from.name = sender.into();
+                    message.subject = subject.into();
+                    message.html = None;
+                    message.text = format!(
+                        "Hi Karl,\n\n{snippet}\n\nThere is a lot to be said for doing fewer things, with a little more care. I'd love to hear what you think when you have a moment.\n\nTalk soon,\n{sender}"
+                    );
+                }
+            }
+        }
+        drop(rows);
+        drop(messages);
+        fixture
     }
 
     /// Adds a thread and tells the UI the store changed.
@@ -190,12 +294,7 @@ fn message(
 
 impl Mail for Fixture {
     fn accounts(&self) -> anyhow::Result<Vec<Account>> {
-        Ok(vec![Account {
-            id: 1,
-            provider: kite_core::model::Provider::Proton,
-            email: "me@example.com".into(),
-            name: "Me".into(),
-        }])
+        Ok(self.accounts.lock().unwrap().clone())
     }
 
     fn add_proton(&self, _: ProtonLogin) -> anyhow::Result<Account> {
@@ -324,10 +423,7 @@ impl Mail for Fixture {
     }
 
     fn settings(&self) -> anyhow::Result<Settings> {
-        Ok(Settings {
-            theme: "dark".into(),
-            ..Settings::default()
-        })
+        Ok(self.settings.lock().unwrap().clone())
     }
 
     fn set_settings(&self, _: Settings) -> anyhow::Result<()> {

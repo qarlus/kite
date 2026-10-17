@@ -71,7 +71,7 @@ impl Kite {
     pub fn render_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let scale = window.scale_factor();
-        let body_width = (window.viewport_size().width.as_f32().min(MAX_COL) - 48.).max(120.);
+        let body_width = (window.viewport_size().width.as_f32().min(MAX_COL) - 80.).max(120.);
         self.html_scale = scale;
         self.html_width = body_width;
         let Some(open) = &self.open else {
@@ -102,24 +102,80 @@ impl Kite {
             .child(
                 div()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
+                    .flex_shrink_0()
+                    .justify_center()
                     .px_6()
-                    .py_4()
-                    .border_b_1()
-                    .border_color(t.line)
+                    .pt_6()
+                    .pb_2()
                     .child(
                         div()
-                            .id("thread-subject")
-                            .test_support()
-                            .aria_label(subject.clone())
-                            .text_size(px(20.))
-                            .font_weight(FontWeight(650.))
-                            .truncate()
-                            .child(subject),
-                    )
-                    .child(crate::list::keys_pills(t, "u")),
+                            .w_full()
+                            .max_w(px(MAX_COL - 48.))
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .id("back-to-inbox")
+                                            .test_support()
+                                            .aria_label("Back to list")
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .text_size(px(12.))
+                                            .text_color(t.fg2)
+                                            .cursor_pointer()
+                                            .hover(|s| s.text_color(t.fg))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.run(crate::keys::cmd::BACK, window, cx)
+                                            }))
+                                            .child("Back to list")
+                                            .child(crate::list::keys_pills(t, "u")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(self.action_icon(
+                                                crate::keys::cmd::DONE,
+                                                gpui_kit::assets::IconName::Archive,
+                                                "Mark done (e)",
+                                                cx,
+                                            ))
+                                            .child(self.action_icon(
+                                                crate::keys::cmd::SNOOZE,
+                                                gpui_kit::assets::IconName::Clock,
+                                                "Snooze (h)",
+                                                cx,
+                                            ))
+                                            .child(self.action_icon(
+                                                crate::keys::cmd::STAR,
+                                                gpui_kit::assets::IconName::Star,
+                                                "Star (s)",
+                                                cx,
+                                            )),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("thread-subject")
+                                    .test_support()
+                                    .aria_label(subject.clone())
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight(650.))
+                                    .child(subject),
+                            )
+                            .child(div().text_size(px(12.)).text_color(t.fg2).child(format!(
+                                "{count} {}",
+                                if count == 1 { "message" } else { "messages" }
+                            ))),
+                    ),
             )
             .child(
                 div()
@@ -159,9 +215,15 @@ impl Kite {
             .flex_shrink_0()
             .child(
                 div()
-                    .w(px(20.))
-                    .text_size(px(13.))
-                    .text_color(t.fg3)
+                    .size(px(32.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .flex_shrink_0()
+                    .rounded_full()
+                    .bg(t.bg3)
+                    .text_size(px(12.))
+                    .text_color(t.fg2)
                     .child(initials(&message.from.name)),
             )
             .child(
@@ -221,7 +283,7 @@ impl Kite {
                 .test_support()
                 .aria_label(message.text.clone())
                 .text_size(px(15.))
-                .line_height(relative(1.5))
+                .line_height(relative(1.7))
                 .child(message.text.clone())
                 .into_any_element(),
         };

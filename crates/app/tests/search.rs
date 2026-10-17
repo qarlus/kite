@@ -71,3 +71,19 @@ fn a_search_with_no_results_says_so(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn typing_in_search_from_a_thread_does_not_run_mail_shortcuts(cx: &mut TestAppContext) {
+    let (window, kite) = mount(cx, Fixture::new(5));
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("search", cx);
+        window.input("thread 3", cx);
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_ids(), vec![3]);
+        assert_eq!(kite.open_id(), None);
+    });
+}

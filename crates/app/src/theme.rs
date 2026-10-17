@@ -23,7 +23,7 @@ pub const CARBON: Theme = Theme {
     bg2: rgb_const(0x15161c),
     bg3: rgb_const(0x1d1f27),
     sel: rgb_const(0x23253a),
-    line: rgb_const(0xffffff10),
+    line: rgba_const(0xffffff10),
     fg: rgb_const(0xe9e9ee),
     fg2: rgb_const(0xa3a5b1),
     fg3: rgb_const(0x6b6d7a),
@@ -39,7 +39,7 @@ pub const PAPER: Theme = Theme {
     bg2: rgb_const(0xf3f3f6),
     bg3: rgb_const(0xe9e9ee),
     sel: rgb_const(0xecebff),
-    line: rgb_const(0x0000000d),
+    line: rgba_const(0x0000000d),
     fg: rgb_const(0x16171d),
     fg2: rgb_const(0x5b5d6b),
     fg3: rgb_const(0x9a9caa),
@@ -54,6 +54,16 @@ pub const ROW_H: f32 = 44.;
 pub const BAR_H: f32 = 44.;
 /// Content column width for the thread view.
 pub const MAX_COL: f32 = 760.;
+#[cfg(target_os = "windows")]
+pub const FONT: &str = "Segoe UI Variable";
+#[cfg(not(target_os = "windows"))]
+pub const FONT: &str = ".SystemUIFont";
+
+const fn rgba_const(hex: u32) -> Rgba {
+    let mut color = rgb_const(hex >> 8);
+    color.a = (hex & 0xff) as f32 / 255.;
+    color
+}
 
 const fn rgb_const(hex: u32) -> Rgba {
     Rgba {
@@ -103,7 +113,7 @@ pub fn install(t: &Theme, cx: &mut App) {
         ui.colors.selection = Theme::alpha(t.accent, 0.25);
         ui.radius = px(10.);
         ui.radius_lg = px(12.);
-        ui.font_family = ".SystemUIFont".into();
+        ui.font_family = FONT.into();
         ui.mono_font_family = "Cascadia Code".into();
     });
     let _ = cx.theme();

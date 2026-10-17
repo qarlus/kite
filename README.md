@@ -15,6 +15,19 @@ cargo run -p kite          # first build compiles GPUI + Stylo (~3-5 min)
 cargo test --workspace
 ```
 
+To inspect the native UI with local sample conversations:
+
+```sh
+cargo run -p kite --example preview
+cargo run -p kite --example preview -- --light --narrow
+cargo run -p kite --example preview -- --thread
+cargo run -p kite --example preview -- --palette
+```
+
+The preview uses the integration-test fixture and sends no email. `--empty` shows
+Inbox Zero. Sample messages and the preview are not included in the shipped app.
+The current UI-shell build still starts without a connected mail engine.
+
 ## Microsoft account setup (one-time, ~2 min)
 1. Go to https://entra.microsoft.com, then **App registrations → New registration**.
 2. Name it `Kite`. For supported accounts, choose *Any Entra ID directory + personal Microsoft accounts*.

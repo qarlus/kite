@@ -2,8 +2,11 @@
 use crate::app::{Kite, Overlay};
 use crate::keys::{self, Cmd};
 use crate::list::{keys_pills, overlay};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use std::collections::HashSet;
 
 pub struct Palette {
     pub query: String,
@@ -14,11 +17,13 @@ pub struct Palette {
 
 impl Default for Palette {
     fn default() -> Self {
-        Self {
+        let mut palette = Self {
             query: String::new(),
             sel: 0,
-            items: keys::COMMANDS.iter().map(|c| c.id).collect(),
-        }
+            items: Vec::new(),
+        };
+        palette.refilter();
+        palette
     }
 }
 
@@ -60,6 +65,8 @@ impl Palette {
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
         self.items = scored.into_iter().map(|(_, id)| id).collect();
+        let mut seen = HashSet::new();
+        self.items.retain(|id| seen.insert(*id));
         self.sel = 0;
     }
 }
@@ -92,7 +99,7 @@ fn fuzzy(query: &str, text: &str) -> Option<i32> {
     Some(score)
 }
 
-pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyElement {
+pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
     let Overlay::Palette(palette) = &kite.overlay else {
         return div().into_any_element();
@@ -100,17 +107,25 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
     let rows: Vec<AnyElement> = palette
         .items
         .iter()
-        .take(9)
         .enumerate()
+        .skip(palette.sel.saturating_sub(8))
+        .take(9)
         .filter_map(|(ix, id)| {
             let cmd: &Cmd = keys::COMMANDS.iter().find(|c| c.id == *id)?;
             let selected = ix == palette.sel;
+            let command_id = *id;
             Some(
                 div()
                     .id(("palette-row", ix))
                     .test_support()
                     .aria_label(cmd.title)
                     .aria_selected(selected)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.overlay = Overlay::None;
+                        window.focus(&this.focus, cx);
+                        this.run(command_id, window, cx);
+                    }))
                     .relative()
                     .flex()
                     .items_center()
@@ -119,6 +134,9 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                     .px_3()
                     .rounded(px(8.))
                     .when(selected, |d| d.bg(t.sel))
+                    .when(!selected, |d| {
+                        d.text_color(t.fg2).hover(|s| s.bg(t.bg3).text_color(t.fg))
+                    })
                     .child(
                         div()
                             .text_size(px(14.))
@@ -153,8 +171,10 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
             .w(px(600.))
             .rounded(px(12.))
             .bg(t.bg2)
-            .border_1()
-            .border_color(t.line)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(20.), crate::theme::Theme::alpha(t.bg, 0.65))
+                    .blur_radius(px(60.)),
+            ])
             .p_2()
             .flex()
             .flex_col()
@@ -163,21 +183,58 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 div()
                     .flex()
                     .items_center()
-                    .h(px(36.))
+                    .h(px(48.))
                     .px_3()
+                    .gap_3()
                     .text_size(px(14.))
                     .text_color(if palette.query.is_empty() {
                         t.fg3
                     } else {
                         t.fg
                     })
+                    .child(
+                        Icon::new(IconName::Search)
+                            .with_size(px(18.))
+                            .text_color(t.fg2),
+                    )
                     .child(if palette.query.is_empty() {
                         "Type a command…".to_string()
                     } else {
                         palette.query.clone()
                     }),
             )
-            .children(rows),
+            .children(rows)
+            .when(palette.items.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_6()
+                        .text_color(t.fg2)
+                        .child("No matching commands"),
+                )
+            })
+            .child(
+                div()
+                    .mt_2()
+                    .px_3()
+                    .py_2()
+                    .border_t_1()
+                    .border_color(t.line)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .text_size(px(12.))
+                    .text_color(t.fg2)
+                    .child("↑ ↓ to navigate")
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(keys_pills(t, "enter"))
+                            .child("Run command"),
+                    ),
+            ),
     )
     .into_any_element()
 }
