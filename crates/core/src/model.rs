@@ -42,6 +42,16 @@ pub struct View {
     pub mailbox: Mailbox,
     pub split: Option<Id>,
     pub query: Option<String>,
+    /// Provider folder identity. Always paired with a specific account.
+    #[serde(default)]
+    pub folder: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct Folder {
+    pub id: String,
+    pub account_id: Id,
+    pub name: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]

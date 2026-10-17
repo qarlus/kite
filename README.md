@@ -22,9 +22,11 @@ cargo run -p kite --example preview
 cargo run -p kite --example preview -- --light --narrow
 cargo run -p kite --example preview -- --thread
 cargo run -p kite --example preview -- --palette
+cargo run -p kite --example preview -- --create-folder
+cargo run -p kite --example preview -- --move
 ```
 
-The preview uses the integration-test fixture and sends no email. `--empty` shows
+The preview uses two sample accounts, account-owned Work/Receipts folders and local conversations. Folder creation, moving and undo change only the in-memory integration-test fixture; it sends no email. `--empty` shows
 Inbox Zero. Sample messages and the preview are not included in the shipped app.
 The current UI-shell build still starts without a connected mail engine.
 

@@ -11,6 +11,8 @@ fn main() {
     let light = args.iter().any(|arg| arg == "--light");
     let thread = args.iter().any(|arg| arg == "--thread");
     let palette = args.iter().any(|arg| arg == "--palette");
+    let create = args.iter().any(|arg| arg == "--create-folder");
+    let move_mail = args.iter().any(|arg| arg == "--move");
     let empty = args.iter().any(|arg| arg == "--empty");
     gpui_kit::application()
         .with_assets(kite::Assets)
@@ -45,6 +47,12 @@ fn main() {
                         let mut view = kite::app::Kite::new(mail, window, cx);
                         if thread {
                             view.run(kite::keys::cmd::OPEN, window, cx);
+                        }
+                        if create {
+                            view.run(kite::keys::cmd::CREATE_FOLDER, window, cx);
+                        }
+                        if move_mail {
+                            view.run(kite::keys::cmd::MOVE, window, cx);
                         }
                         if palette {
                             view.run(kite::keys::cmd::PALETTE, window, cx);

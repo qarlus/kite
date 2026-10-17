@@ -10,6 +10,15 @@ pub trait Mail: Send + Sync + 'static {
     fn add_microsoft(&self) -> Result<Account>;
     fn remove_account(&self, id: Id) -> Result<()>;
 
+    /// Locally known custom folders, with provider identities scoped to their accounts.
+    fn folders(&self) -> Result<Vec<Folder>> {
+        Ok(Vec::new())
+    }
+    /// May contact the provider; callers must run this off the UI thread.
+    fn create_folder(&self, _account: Id, _name: &str) -> Result<Folder> {
+        anyhow::bail!("Folder creation is not available for this account")
+    }
+
     fn threads(&self, view: &View, offset: u32, limit: u32) -> Result<Vec<ThreadSummary>>;
     fn thread(&self, id: Id) -> Result<Vec<Message>>;
     /// Applies locally at once and queues the remote op. Returns an undo token.

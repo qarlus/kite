@@ -5,6 +5,7 @@ use crate::app::{Kite, Lru};
 use crate::html::{self, Rendered};
 use crate::theme::{MAX_COL, Theme};
 use chrono::{Local, TimeZone as _};
+use gpui_kit::component::Sizable;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::{Id, Message};
@@ -71,13 +72,22 @@ impl Kite {
     pub fn render_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let scale = window.scale_factor();
-        let body_width = (window.viewport_size().width.as_f32().min(MAX_COL) - 80.).max(120.);
+        let body_width = ((window.viewport_size().width.as_f32() - crate::sidebar::width(window))
+            .min(MAX_COL)
+            - 80.)
+            .max(120.);
         self.html_scale = scale;
         self.html_width = body_width;
         let Some(open) = &self.open else {
             return div().into_any_element();
         };
         let subject = open.subject.clone();
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == open.account_id)
+            .map(|account| account.email.clone())
+            .unwrap_or_default();
         let messages = open.messages.clone();
         let expanded = open.expanded;
         let count = messages.len();
@@ -155,6 +165,12 @@ impl Kite {
                                                 cx,
                                             ))
                                             .child(self.action_icon(
+                                                crate::keys::cmd::MOVE,
+                                                gpui_kit::assets::IconName::FolderInput,
+                                                "Move to folder (l)",
+                                                cx,
+                                            ))
+                                            .child(self.action_icon(
                                                 crate::keys::cmd::STAR,
                                                 gpui_kit::assets::IconName::Star,
                                                 "Star (s)",
@@ -171,10 +187,18 @@ impl Kite {
                                     .font_weight(FontWeight(650.))
                                     .child(subject),
                             )
-                            .child(div().text_size(px(12.)).text_color(t.fg2).child(format!(
-                                "{count} {}",
-                                if count == 1 { "message" } else { "messages" }
-                            ))),
+                            .child(
+                                div()
+                                    .id("thread-account")
+                                    .test_support()
+                                    .aria_label(account.clone())
+                                    .text_size(px(12.))
+                                    .text_color(t.fg2)
+                                    .child(format!(
+                                        "{count} {} · {account}",
+                                        if count == 1 { "message" } else { "messages" }
+                                    )),
+                            ),
                     ),
             )
             .child(
@@ -206,11 +230,60 @@ impl Kite {
         let when = Local
             .timestamp_millis_opt(message.date)
             .single()
-            .map(|at| at.format("%b %-d, %-H:%M").to_string())
+            .map(|at| at.format("%a, %-d %b %Y · %H:%M %:z").to_string())
             .unwrap_or_default();
+        let metadata = |field: &'static str, value: String| {
+            div()
+                .id(format!("message-{}-{ix}", field.to_lowercase()))
+                .test_support()
+                .aria_label(format!("{field}: {value}"))
+                .flex()
+                .items_start()
+                .gap_2()
+                .text_size(px(12.))
+                .text_color(t.fg2)
+                .child(div().w(px(36.)).flex_shrink_0().child(field))
+                .child(div().flex_1().min_w_0().child(value))
+        };
+        let mut details = div().flex_1().min_w_0().flex().flex_col().gap_1().child(
+            div()
+                .text_size(px(14.))
+                .font_weight(FontWeight(650.))
+                .child(if message.from.name.is_empty() {
+                    message.from.email.clone()
+                } else {
+                    message.from.name.clone()
+                }),
+        );
+        if open {
+            details = details
+                .child(metadata("From", address(&message.from)))
+                .child(metadata("To", addresses(&message.to)))
+                .when(!message.cc.is_empty(), |d| {
+                    d.child(metadata("Cc", addresses(&message.cc)))
+                })
+                .child(metadata("Date", when));
+            if self
+                .open
+                .as_ref()
+                .is_some_and(|thread| thread.subject != message.subject)
+            {
+                details = details.child(metadata("Subject", message.subject.clone()));
+            }
+        } else {
+            details = details
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(12.))
+                        .text_color(t.fg2)
+                        .child(snippet(&message)),
+                )
+                .child(div().text_size(px(11.)).text_color(t.fg2).child(when));
+        }
         let header = div()
             .flex()
-            .items_center()
+            .items_start()
             .gap_3()
             .flex_shrink_0()
             .child(
@@ -226,30 +299,7 @@ impl Kite {
                     .text_color(t.fg2)
                     .child(initials(&message.from.name)),
             )
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .font_weight(FontWeight(650.))
-                    .child(if message.from.name.is_empty() {
-                        message.from.email.clone()
-                    } else {
-                        message.from.name.clone()
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(12.))
-                    .text_color(t.fg3)
-                    .child(if open {
-                        format!("to {}", recipients(&message))
-                    } else {
-                        snippet(&message)
-                    }),
-            )
-            .child(div().text_size(px(12.)).text_color(t.fg3).child(when))
-            .when(!open, |d| d.text_color(t.fg2));
+            .child(details);
         let card = div()
             .id(format!("msg-{ix}"))
             .test_support()
@@ -294,14 +344,54 @@ impl Kite {
                         .flex()
                         .flex_wrap()
                         .gap_2()
-                        .children(message.attachments.iter().map(|a| {
+                        .children(message.attachments.iter().map(|attachment| {
+                            let id = attachment.id;
                             div()
-                                .px_2()
-                                .py_1()
+                                .id(format!("attachment-{id}"))
+                                .test_support()
+                                .aria_label(format!(
+                                    "{} ({} bytes)",
+                                    attachment.name, attachment.size
+                                ))
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
                                 .rounded(px(6.))
                                 .bg(t.bg3)
                                 .text_size(px(12.))
-                                .child(a.name.clone())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(t.sel))
+                                .child(
+                                    gpui_kit::component::Icon::new(
+                                        gpui_kit::assets::IconName::Paperclip,
+                                    )
+                                    .with_size(px(14.)),
+                                )
+                                .child(format!(
+                                    "{} · {} KB",
+                                    attachment.name,
+                                    attachment.size.div_ceil(1024)
+                                ))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let mail = this.mail.clone();
+                                    let task = cx
+                                        .background_executor()
+                                        .spawn(async move { mail.open_attachment(id) });
+                                    cx.spawn(async move |this, cx| {
+                                        if let Err(error) = task.await {
+                                            this.update(cx, |this, cx| {
+                                                this.toast(
+                                                    format!("Could not open attachment: {error}"),
+                                                    cx,
+                                                )
+                                            })
+                                            .ok();
+                                        }
+                                    })
+                                    .detach();
+                                }))
                         })),
                 )
             })
@@ -427,19 +517,16 @@ fn initials(name: &str) -> String {
         .to_uppercase()
 }
 
-fn recipients(message: &Message) -> String {
-    let names: Vec<String> = message
-        .to
-        .iter()
-        .map(|a| {
-            if a.name.is_empty() {
-                a.email.clone()
-            } else {
-                a.name.clone()
-            }
-        })
-        .collect();
-    names.join(", ")
+fn address(addr: &kite_core::model::Addr) -> String {
+    if addr.name.is_empty() {
+        addr.email.clone()
+    } else {
+        format!("{} <{}>", addr.name, addr.email)
+    }
+}
+
+fn addresses(addrs: &[kite_core::model::Addr]) -> String {
+    addrs.iter().map(address).collect::<Vec<_>>().join(", ")
 }
 
 /// The first 120 characters of the text part, for collapsed headers.

@@ -2,13 +2,14 @@
 #[cfg(not(debug_assertions))]
 #[test]
 fn release_binary_within_budget() {
-    let exe = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/release/kite",
-        env!("EXE_SUFFIX_FOR_BUDGET")
-    );
-    let size = std::fs::metadata(exe)
-        .unwrap_or_else(|e| panic!("build the release binary first ({exe}): {e}"))
+    let target = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target"));
+    let exe = target
+        .join("release")
+        .join(concat!("kite", env!("EXE_SUFFIX_FOR_BUDGET")));
+    let size = std::fs::metadata(&exe)
+        .unwrap_or_else(|e| panic!("build the release binary first ({}): {e}", exe.display()))
         .len();
     assert!(
         size <= 20 * 1024 * 1024,

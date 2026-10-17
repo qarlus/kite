@@ -31,6 +31,7 @@ fn typical_email_renders_within_budget() {
         })
         .collect();
     times.sort();
+    eprintln!("Median HTML render: {:?}", times[2]);
     assert!(
         times[2].as_millis() <= 15,
         "median Blitz render {:?}, budget 15 ms",

@@ -16,6 +16,7 @@ fn first_frame_of_a_ten_thousand_thread_inbox_is_fast(cx: &mut TestAppContext) {
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
         .unwrap();
     let elapsed = started.elapsed();
+    eprintln!("10k inbox first frame: {elapsed:?}");
     assert!(
         elapsed <= Duration::from_millis(50),
         "first frame took {elapsed:?}, budget 50 ms"
@@ -40,6 +41,7 @@ fn j_repaints_within_four_milliseconds(cx: &mut TestAppContext) {
         assert_eq!(kite.sel_index(), 20)
     });
     times.sort();
+    eprintln!("Median j repaint: {:?}", times[10]);
     assert!(
         times[10] <= Duration::from_millis(4),
         "median j frame {:?}, budget 4 ms",

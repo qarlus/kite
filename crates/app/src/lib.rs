@@ -1,13 +1,29 @@
 pub mod app;
+pub mod folders;
 pub mod html;
 pub mod keys;
 pub mod list;
 pub mod palette;
+pub mod sidebar;
 pub mod snooze;
 pub mod theme;
 pub mod thread;
 
-gpui_kit::assets::icon_assets!(ExtraIcons, [Archive, Clock]);
+gpui_kit::assets::icon_assets!(
+    ExtraIcons,
+    [
+        Archive,
+        Clock,
+        Inbox,
+        FileText,
+        Send,
+        ShieldAlert,
+        Trash,
+        Mails,
+        FolderInput,
+        Paperclip
+    ]
+);
 
 /// Component icons plus the two toolbar icons outside the default bundle.
 pub struct Assets;

@@ -47,3 +47,11 @@ Agents edit only their files. Shared manifests (`Cargo.toml`s) may only gain the
 - `threads()` is a single indexed SQL query over a denormalized `threads` table, with no N+1.
 - On thread open, the UI prefetches `thread()` for the neighbouring threads and renders their HTML on a background thread, so `j`/`k` in thread view are instant.
 - Blitz work (parse, style, layout, raster) runs on `cx.background_executor()`. Only the finished `RenderImage` crosses back to the UI thread.
+
+## Sidebar and custom folder contract
+
+`sidebar.rs` owns account/mailbox navigation in a cached GPUI view, invalidated when scope, folder catalog or theme changes, so list navigation does not rebuild the sidebar; `folders.rs` owns folder creation and moving captured conversation IDs. `View.account_id == None` means combined. `View.folder` is an opaque provider folder ID, paired with a specific account, and supersedes the standard mailbox filter. Folder IDs may collide across accounts. `Folder` exposes only ID, account and display name.
+
+`Mail::folders()` must read locally cached folders. `Mail::create_folder(account, name)` may contact a provider and is called on the background executor. A successful return must persist the folder in the local catalog before returning. The default implementation reports unsupported creation and discovers no folders; it never reports fake success. The engine must validate ownership for `Action::Move`, persist the move locally, sync it, and support undo. Creation itself is not undoable through mail undo.
+
+This UI branch still has the placeholder core engine and production `main.rs` uses Empty Mail. The dev-only preview/test fixture implements the new contract with two accounts and retained mailbox/folder state. Connecting the merged engine and implementing provider folder discovery/creation plus `View.folder` queries remain separate integration work. Live account syncing and provider folder operations are not delivered by this branch.

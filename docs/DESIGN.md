@@ -29,18 +29,10 @@ mono:        "SF Mono" / "Cascadia Code"
 Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread subject · 24 mailbox heading · 28 empty-state. Weights: 400 / 500 / 650. Letter-spacing −0.01em at ≥ 15px. No fonts are bundled, which keeps the binary small.
 
 ## Layout
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Important 12   Other 48   GitHub 3        ⌕ /      ⌘K       │  ← split bar, 44px, doubles as the custom titlebar (drag region)
-├──────────────────────────────────────────────────────────────┤
-│ ▍Alice Chen      Q3 plan — draft attached   Hey, see…  9:41  │  ← row 44px; selected = sel + 2px accent bar left
-│  GitHub          [kite] PR #12 merged        …        9:12   │     unread = sender 650 weight + accent dot
-│  …                                                            │
-└──────────────────────────────────────────────────────────────┘
-```
+- **Persistent sidebar:** 216px wide, or 180px below a 900px window. Account choices precede the standard mailboxes; custom folders and New folder follow. The sidebar remains present while reading. Active account uses `bg3`, active mailbox/folder uses `sel`, with quiet Lucide icons and no invented unread totals. The whole sidebar scrolls in short windows.
 - **Chrome:** the 44px titlebar contains the quiet Kite wordmark, split tabs with a 2px accent underline, search, and the command shortcut. Mail actions live beside the mailbox heading instead of crowding the titlebar. The mailbox header uses 32px horizontal / 24px vertical padding, with the account identity beneath the heading. A 38px footer teaches navigation, opening, and archive shortcuts and opens keyboard help.
-- **List row:** grid `[sender 180px] [subject + snippet 1fr] [labels auto] [time 64px]`, inset 20px from the window edges. The sender narrows to 140px below a 900px window width. The subject is `fg` and the snippet is `fg2`, on one line with an ellipsis. Snippets shrink before the fixed timestamp column; unread subjects have medium weight. Hovering shows inline action hints (`e` done · `h` remind) in place of the time. A star is visible beside starred conversations.
-- **Thread view** replaces the list (it does not split). The content column is max 760px and centred. The subject is 20px/650. Each message card has the sender, the time, and the body: the HTML part rendered by Blitz (`html.rs`) with our theme defaults injected, or the plain text part as GPUI text with clickable links. The reply box is docked at the bottom and expands on `r`.
+- **List row:** grid `[sender 180px] [subject + snippet 1fr] [labels auto] [time 64px]`, inset 20px from the content pane edges. The sender narrows to 112px when the content pane is below 700px. Combined views show the owning account beneath the sender. A separate selection target avoids opening the conversation when multi-selecting. The subject is `fg` and the snippet is `fg2`, on one line with an ellipsis. Snippets shrink before the fixed timestamp column; unread subjects have medium weight. Hovering shows inline action hints (`e` done · `h` remind) in place of the time. A star is visible beside starred conversations.
+- **Thread view** replaces the list (it does not split). The content column is max 760px and centred in the space remaining beside the sidebar. HTML layout and prefetch widths subtract the sidebar, content margins and card padding. The subject is 20px/650. Expanded message cards show full From/To/Cc addresses, date and time with UTC offset, a differing per-message subject, and attachment controls. Each card has the sender and body: the HTML part rendered by Blitz (`html.rs`) with our theme defaults injected, or the plain text part as GPUI text with clickable links. The reply box is docked at the bottom and expands on `r`.
 - **Compose** is a floating panel bottom-right (560×480), or full-height when replying in a thread. Fields (To, Cc on demand, Subject) are borderless. The send button has the accent gradient and the hint `⌘↵`.
 - **Command palette** is centred at 18vh from the top, 600px wide, on `bg2` with a soft shadow `0 20px 60px #0008`. Rows are 36px, and the selected row has an accent glow on its left edge.
 - The palette shows at most nine commands and keeps the keyboard selection visible as it advances. Commands work by click as well as keyboard; the footer shows navigation and execution hints. Empty searches say “No matching commands.”
@@ -66,3 +58,5 @@ Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 20 thread su
 
 ## Accessibility
 Use visible focus rings (accent, 2px), with all actions reachable by keyboard. Contrast is ≥ 4.5:1 for `fg2` on `bg`. Every interactive element gets `.id(..).test_support().aria_label(..)`, which also feeds native accessibility.
+
+Folder dialogs use a 400px panel with an account choice, native text input, inline validation and a busy state. The dimmed overlay blocks clicks to the inbox. Move destinations are paged to fit the window, with Previous/More controls and arrow-key selection; mixed-account selections explain why custom folders are unavailable.

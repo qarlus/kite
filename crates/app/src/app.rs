@@ -4,7 +4,7 @@
 //! so every keystroke paints from local state on the same frame.
 use crate::keys::{self, Act, GO_MAILBOXES, cmd};
 use crate::theme::{self, BAR_H, MAX_COL, Theme};
-use crate::{palette, snooze, thread};
+use crate::{folders, palette, snooze, thread};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -13,7 +13,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action as MailAction, Event, Id, Mailbox, Message, Settings, ThreadSummary, View,
+    Account, Action as MailAction, Event, Folder, Id, Mailbox, Message, Settings, ThreadSummary,
+    View,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -74,6 +75,7 @@ pub(crate) struct Toast {
 
 pub struct Open {
     pub id: Id,
+    pub account_id: Id,
     pub subject: String,
     pub messages: Vec<Message>,
     pub expanded: usize,
@@ -84,6 +86,8 @@ pub enum Overlay {
     Palette(palette::Palette),
     Help,
     Snooze(snooze::Snooze),
+    Move(folders::MoveDialog),
+    CreateFolder(folders::CreateDialog),
 }
 
 pub struct Kite {
@@ -92,6 +96,10 @@ pub struct Kite {
     pub(crate) dark: bool,
     pub(crate) settings: Settings,
     pub(crate) accounts: Vec<Account>,
+    pub(crate) folders: Vec<Folder>,
+    sidebar: Option<Entity<crate::sidebar::Sidebar>>,
+    pub(crate) sidebar_dirty: bool,
+    pub(crate) refocus: bool,
     pub(crate) tabs: Vec<Tab>,
     pub(crate) view: View,
     pub(crate) rows: Vec<ThreadSummary>,
@@ -172,11 +180,16 @@ impl Kite {
             dark,
             settings,
             accounts: Vec::new(),
+            folders: Vec::new(),
+            sidebar: None,
+            sidebar_dirty: true,
+            refocus: false,
             view: View {
                 account_id: None,
                 mailbox: Mailbox::Inbox,
                 split: tabs[0].split,
                 query: None,
+                folder: None,
             },
             tabs,
             rows: Vec::new(),
@@ -201,6 +214,7 @@ impl Kite {
             subs: Vec::new(),
         };
         this.accounts = this.mail.accounts().unwrap_or_default();
+        this.folders = this.mail.folders().unwrap_or_default();
         this.subs.push(cx.subscribe_in(
             &search,
             window,
@@ -239,7 +253,7 @@ impl Kite {
 
     // ---- data -----------------------------------------------------------------
 
-    fn reload(&mut self) {
+    pub(crate) fn reload(&mut self) {
         self.rows = self.mail.threads(&self.view, 0, PAGE).unwrap_or_default();
         self.loaded_all = self.rows.len() < PAGE as usize;
         self.sel = self.sel.min(self.rows.len().saturating_sub(1));
@@ -261,13 +275,15 @@ impl Kite {
         cx.notify();
     }
 
-    fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+    pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
         let changed = view.account_id != self.view.account_id
             || view.mailbox != self.view.mailbox
             || view.split != self.view.split
-            || view.query != self.view.query;
+            || view.query != self.view.query
+            || view.folder != self.view.folder;
         self.view = view;
         if changed {
+            self.sidebar_dirty = true;
             self.open = None;
             self.sel = 0;
             self.list_scroll = UniformListScrollHandle::new();
@@ -289,6 +305,8 @@ impl Kite {
     fn on_event(&mut self, event: Event, cx: &mut Context<Self>) {
         match event {
             Event::Changed(_) => {
+                self.folders = self.mail.folders().unwrap_or_default();
+                self.sidebar_dirty = true;
                 self.reload();
                 if let Some(open) = &self.open {
                     let id = open.id;
@@ -307,7 +325,10 @@ impl Kite {
     }
 
     /// The ids an action applies to: the multi-selection, or the selected row.
-    fn target_ids(&self) -> Vec<Id> {
+    pub(crate) fn target_ids(&self) -> Vec<Id> {
+        if let Some(open) = &self.open {
+            return vec![open.id];
+        }
         if !self.multi.is_empty() {
             return self.multi.clone();
         }
@@ -317,7 +338,7 @@ impl Kite {
             .unwrap_or_default()
     }
 
-    fn toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+    pub(crate) fn toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         self.seq += 1;
         let seq = self.seq;
         self.toast = Some(Toast {
@@ -367,8 +388,10 @@ impl Kite {
                 messages
             }
         };
+        self.multi.clear();
         self.open = Some(Open {
             id: row.id,
+            account_id: row.account_id,
             subject: row.subject.clone(),
             expanded: messages.len().saturating_sub(1),
             messages,
@@ -416,7 +439,17 @@ impl Kite {
     }
 
     fn act(&mut self, action: MailAction, remove: bool, text: &str, cx: &mut Context<Self>) {
-        let ids = self.target_ids();
+        self.act_on(self.target_ids(), action, remove, text, cx);
+    }
+
+    pub(crate) fn act_on(
+        &mut self,
+        ids: Vec<Id>,
+        action: MailAction,
+        remove: bool,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
         if ids.is_empty() {
             return;
         }
@@ -440,8 +473,13 @@ impl Kite {
         self.multi.clear();
         // Paint the new state first; only then tell the engine.
         cx.notify();
-        if let Ok(token) = self.mail.act(&ids, &action) {
-            self.undo = Some(token);
+        match self.mail.act(&ids, &action) {
+            Ok(token) => self.undo = Some(token),
+            Err(error) => {
+                self.reload();
+                self.toast(format!("Could not change mail: {error}"), cx);
+                return;
+            }
         }
         self.toast(text, cx);
     }
@@ -484,7 +522,8 @@ impl Kite {
         };
         let mut view = self.view.clone();
         view.split = tab.split;
-        view.account_id = None;
+        view.mailbox = Mailbox::Inbox;
+        view.folder = None;
         self.set_view(view, cx);
     }
 
@@ -556,6 +595,8 @@ impl Kite {
                 self.pulse = Some((id, self.seq));
                 cx.notify();
             }
+            cmd::MOVE => self.show_move(window, cx),
+            cmd::CREATE_FOLDER => self.show_create_folder(window, cx),
             cmd::STAR => {
                 self.star(cx);
                 self.pulse = Some((id, self.seq));
@@ -586,22 +627,17 @@ impl Kite {
                     self.toast("Undone", cx);
                 }
             }
-            id if (cmd::GO..cmd::GO + 6).contains(&id) => {
+            cmd::UNIFIED => self.select_account(None, window, cx),
+            id if (cmd::GO..cmd::GO + GO_MAILBOXES.len() as u8).contains(&id) => {
                 let ix = (id - cmd::GO) as usize;
                 if let Some(mailbox) = GO_MAILBOXES.get(ix) {
-                    let mut view = self.view.clone();
-                    view.mailbox = mailbox.0;
-                    view.split = None;
-                    view.query = None;
-                    self.set_view(view, cx);
+                    self.select_mailbox(mailbox.0, window, cx);
                 }
             }
             id if (cmd::ACCOUNT..=cmd::ACCOUNT + 8).contains(&id) => {
                 let ix = (id - cmd::ACCOUNT) as usize;
                 if let Some(account) = self.accounts.get(ix) {
-                    let mut view = self.view.clone();
-                    view.account_id = Some(account.id);
-                    self.set_view(view, cx);
+                    self.select_account(Some(account.id), window, cx);
                 }
             }
             _ => {}
@@ -625,6 +661,49 @@ impl Kite {
         let typed = typed_char(event);
         match &mut self.overlay {
             Overlay::None => {}
+            Overlay::Move(dialog) => {
+                match key {
+                    "escape" => self.overlay = Overlay::None,
+                    "up" => dialog.selected = dialog.selected.saturating_sub(1),
+                    "down" => {
+                        dialog.selected =
+                            (dialog.selected + 1).min(dialog.targets.len().saturating_sub(1))
+                    }
+                    "enter" => {
+                        let index = dialog.selected;
+                        self.confirm_move(index, cx);
+                    }
+                    _ => {}
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Overlay::CreateFolder(dialog) => match key {
+                "up" | "down" if !dialog.busy && !self.accounts.is_empty() => {
+                    let current = self
+                        .accounts
+                        .iter()
+                        .position(|account| account.id == dialog.account)
+                        .unwrap_or(0);
+                    let delta = if key == "up" { -1 } else { 1 };
+                    let next = (current as isize + delta).rem_euclid(self.accounts.len() as isize)
+                        as usize;
+                    dialog.account = self.accounts[next].id;
+                    dialog.error = None;
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+                "escape" => {
+                    self.close_overlay(cx);
+                    window.focus(&self.focus, cx);
+                    cx.stop_propagation();
+                }
+                "enter" => {
+                    self.create_folder(cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
             Overlay::Help => {
                 if key == "escape" || typed == Some('?') {
                     self.close_overlay(cx);
@@ -848,12 +927,15 @@ impl Kite {
                     .gap_3()
                     .child(
                         div()
+                            .w(px(crate::sidebar::width(window) - 24.))
                             .px_3()
                             .text_size(px(14.))
                             .font_weight(FontWeight(650.))
                             .child("Kite"),
                     )
-                    .child(div().flex().h_full().items_center().children(tabs))
+                    .when(self.view.mailbox == Mailbox::Inbox, |d| {
+                        d.child(div().flex().h_full().items_center().children(tabs))
+                    })
                     .child(div().flex_1())
                     .child(
                         div()
@@ -914,16 +996,17 @@ impl Kite {
             )
     }
 
-    fn render_inbox_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_inbox_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
-        let title = if self.view.query.is_some() {
+        let title = if let Some(folder) = self.folders.iter().find(|folder| {
+            Some(folder.account_id) == self.view.account_id
+                && Some(&folder.id) == self.view.folder.as_ref()
+        }) {
+            folder.name.as_str()
+        } else if self.view.query.is_some() {
             "Search results"
         } else {
-            GO_MAILBOXES
-                .iter()
-                .find(|(mailbox, _)| *mailbox == self.view.mailbox)
-                .map(|(_, name)| *name)
-                .unwrap_or("Mail")
+            crate::sidebar::mailbox_name(self.view.mailbox)
         };
         let account = self
             .view
@@ -955,7 +1038,7 @@ impl Kite {
         div()
             .id("inbox-header")
             .test_support()
-            .aria_label(title)
+            .aria_label(title.to_string())
             .flex()
             .flex_shrink_0()
             .items_center()
@@ -964,14 +1047,18 @@ impl Kite {
             .py_6()
             .child(
                 div()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_1()
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_size(px(24.))
                             .font_weight(FontWeight(650.))
-                            .child(title),
+                            .child(title.to_string()),
                     )
                     .child(
                         div()
@@ -986,32 +1073,36 @@ impl Kite {
                     .items_center()
                     .gap_4()
                     .when(!self.rows.is_empty(), |d| {
-                        d.child(div().text_size(px(12.)).text_color(t.fg2).child(summary))
-                            .child(div().w(px(1.)).h(px(18.)).bg(t.line))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .child(self.action_icon(
-                                        cmd::DONE,
-                                        IconName::Archive,
-                                        "Mark done (e)",
-                                        cx,
-                                    ))
-                                    .child(self.action_icon(
-                                        cmd::SNOOZE,
-                                        IconName::Clock,
-                                        "Snooze (h)",
-                                        cx,
-                                    ))
-                                    .child(self.action_icon(
-                                        cmd::STAR,
-                                        IconName::Star,
-                                        "Star (s)",
-                                        cx,
-                                    )),
-                            )
+                        d.when(
+                            !self.multi.is_empty() || window.viewport_size().width >= px(1000.),
+                            |d| d.child(div().text_size(px(12.)).text_color(t.fg2).child(summary)),
+                        )
+                        .child(div().w(px(1.)).h(px(18.)).bg(t.line))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(self.action_icon(
+                                    cmd::DONE,
+                                    IconName::Archive,
+                                    "Mark done (e)",
+                                    cx,
+                                ))
+                                .child(self.action_icon(
+                                    cmd::SNOOZE,
+                                    IconName::Clock,
+                                    "Snooze (h)",
+                                    cx,
+                                ))
+                                .child(self.action_icon(
+                                    cmd::MOVE,
+                                    IconName::FolderInput,
+                                    "Move to folder (l)",
+                                    cx,
+                                ))
+                                .child(self.action_icon(cmd::STAR, IconName::Star, "Star (s)", cx)),
+                        )
                     }),
             )
     }
@@ -1137,13 +1228,35 @@ fn typed_char(event: &KeyDownEvent) -> Option<char> {
 
 impl Render for Kite {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.refocus {
+            window.focus(&self.focus, cx);
+            self.refocus = false;
+        }
         let dark = theme::wants_dark(&self.settings.theme, window.appearance());
         if dark != self.dark {
             self.dark = dark;
             self.theme = theme::pick(dark);
+            self.sidebar_dirty = true;
             theme::install(self.theme, cx);
             self.html_cache.clear();
         }
+        if self.sidebar_dirty {
+            let state = crate::sidebar::Sidebar::new(self, cx.entity().downgrade());
+            if let Some(sidebar) = &self.sidebar {
+                sidebar.update(cx, |sidebar, cx| {
+                    *sidebar = state;
+                    cx.notify();
+                });
+            } else {
+                self.sidebar = Some(cx.new(|_| state));
+            }
+            self.sidebar_dirty = false;
+        }
+        self.html_width = ((window.viewport_size().width.as_f32() - crate::sidebar::width(window))
+            .min(MAX_COL)
+            - 80.)
+            .max(120.);
+        self.html_scale = window.scale_factor();
         let open = self.open.is_some();
         let body = if open {
             self.render_thread(window, cx)
@@ -1163,17 +1276,39 @@ impl Render for Kite {
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::action))
             .child(self.render_bar(window, cx))
-            .when(!open, |d| d.child(self.render_inbox_header(cx)))
             .child(
                 div()
-                    .id("body")
                     .flex_1()
+                    .min_h_0()
                     .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .key_context(if open { "KiteThread" } else { "KiteList" })
-                    .track_focus(&self.focus)
-                    .child(body),
+                    .children(self.sidebar.as_ref().map(|sidebar| {
+                        sidebar.clone().cached(
+                            StyleRefinement::default()
+                                .w(px(crate::sidebar::width(window)))
+                                .h_full()
+                                .flex_shrink_0(),
+                        )
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .when(!open, |d| d.child(self.render_inbox_header(window, cx)))
+                            .child(
+                                div()
+                                    .id("body")
+                                    .flex_1()
+                                    .min_h_0()
+                                    .flex()
+                                    .flex_col()
+                                    .overflow_hidden()
+                                    .key_context(if open { "KiteThread" } else { "KiteList" })
+                                    .track_focus(&self.focus)
+                                    .child(body),
+                            ),
+                    ),
             )
             .child(self.render_footer(cx))
             .children(self.render_overlay(window, cx))
@@ -1192,6 +1327,7 @@ impl Kite {
             Overlay::Help => Some(self.render_help(cx)),
             Overlay::Palette(_) => Some(palette::render(self, window, cx)),
             Overlay::Snooze(_) => Some(snooze::render(self, window, cx)),
+            Overlay::Move(_) | Overlay::CreateFolder(_) => Some(folders::render(self, window, cx)),
         }
     }
 }

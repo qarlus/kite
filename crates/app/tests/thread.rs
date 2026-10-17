@@ -52,6 +52,30 @@ async fn opening_a_thread_renders_its_html_body_at_the_rendered_height(cx: &mut 
 }
 
 #[gpui_kit::test]
+async fn compact_html_uses_only_the_space_remaining_beside_the_sidebar(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, _) = common::open_window(
+        cx,
+        Some(gpui_kit::size(gpui_kit::px(720.), gpui_kit::px(800.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(Fixture::new(2), window, cx)),
+    );
+    cx.simulate_keystrokes(window.into(), "j enter");
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("html-22").is_some()
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let sidebar = window.find("sidebar").bounds();
+        let body = window.find("html-22").bounds();
+        assert_eq!(body.size.width, gpui_kit::px(460.));
+        assert!(body.origin.x >= sidebar.right());
+        assert!(body.right() <= gpui_kit::px(720.));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn opening_an_unread_thread_renders_its_text_body_and_marks_it_read(cx: &mut TestAppContext) {
     let fixture = Fixture::new(3);
     let (window, kite) = mount(cx, fixture.clone());

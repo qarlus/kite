@@ -21,8 +21,11 @@ pub mod cmd {
     pub const PREV_SPLIT: u8 = 15;
     pub const UNDO: u8 = 16;
     pub const HELP: u8 = 17;
+    pub const UNIFIED: u8 = 18;
+    pub const MOVE: u8 = 19;
     /// Go-to mailboxes, then account switching at `ACCOUNT + n`.
     pub const GO: u8 = 20;
+    pub const CREATE_FOLDER: u8 = 30;
     pub const ACCOUNT: u8 = 40;
 }
 
@@ -56,6 +59,13 @@ pub static COMMANDS: &[Cmd] = &[
     c("Snooze / remind", &["h"], "KiteList", cmd::SNOOZE),
     c("Star", &["s"], "KiteList", cmd::STAR),
     c("Toggle read", &["shift-u"], "KiteList", cmd::TOGGLE_READ),
+    c("Move to folder", &["l"], "KiteList", cmd::MOVE),
+    c(
+        "New folder",
+        &["secondary-shift-n"],
+        "Kite",
+        cmd::CREATE_FOLDER,
+    ),
     c("Select", &["x"], "KiteList", cmd::SELECT),
     c("Search", &["/"], "KiteList", cmd::SEARCH),
     c("Command palette", &["secondary-k"], "Kite", cmd::PALETTE),
@@ -68,6 +78,10 @@ pub static COMMANDS: &[Cmd] = &[
     c("Go to sent", &["g t"], "Kite", cmd::GO + 3),
     c("Go to snoozed", &["g h"], "Kite", cmd::GO + 4),
     c("Go to all mail", &["g a"], "Kite", cmd::GO + 5),
+    c("Go to archive", &["g e"], "Kite", cmd::GO + 6),
+    c("Go to spam", &["g p"], "Kite", cmd::GO + 7),
+    c("Go to trash", &["g b"], "Kite", cmd::GO + 8),
+    c("All inboxes", &["secondary-0"], "Kite", cmd::UNIFIED),
     c("Shortcut help", &["shift-/"], "Kite", cmd::HELP),
     c("Account 1", &["secondary-1"], "Kite", cmd::ACCOUNT),
     c("Account 2", &["secondary-2"], "Kite", cmd::ACCOUNT + 1),
@@ -81,13 +95,16 @@ pub static COMMANDS: &[Cmd] = &[
 ];
 
 /// The mailboxes reachable through the `g` sequences, in the same order as the table above.
-pub const GO_MAILBOXES: [(Mailbox, &str); 6] = [
+pub const GO_MAILBOXES: [(Mailbox, &str); 9] = [
     (Mailbox::Inbox, "Inbox"),
     (Mailbox::Starred, "Starred"),
     (Mailbox::Drafts, "Drafts"),
     (Mailbox::Sent, "Sent"),
     (Mailbox::Snoozed, "Snoozed"),
     (Mailbox::All, "All Mail"),
+    (Mailbox::Archive, "Archive"),
+    (Mailbox::Spam, "Spam"),
+    (Mailbox::Trash, "Trash"),
 ];
 
 #[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
@@ -108,7 +125,13 @@ pub fn bind(cx: &mut App) {
             // Reading actions must not match while the titlebar search input has focus.
             if matches!(
                 command.id,
-                cmd::DONE | cmd::INBOX | cmd::TRASH | cmd::SNOOZE | cmd::STAR | cmd::TOGGLE_READ
+                cmd::DONE
+                    | cmd::INBOX
+                    | cmd::TRASH
+                    | cmd::SNOOZE
+                    | cmd::STAR
+                    | cmd::TOGGLE_READ
+                    | cmd::MOVE
             ) {
                 bindings.push(KeyBinding::new(
                     key,

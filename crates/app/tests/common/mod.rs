@@ -7,8 +7,8 @@ use gpui_kit::{
 };
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action, Addr, CalEvent, ChatMsg, Draft, Event, Id, Mailbox, Message, Ms, ProtonLogin,
-    Settings, Split, ThreadSummary, View,
+    Account, Action, Addr, Attachment, CalEvent, ChatMsg, Draft, Event, Folder, Id, Mailbox,
+    Message, Ms, ProtonLogin, Settings, Split, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -18,7 +18,14 @@ pub const SPLITS: [Id; 2] = [1, 2];
 /// The HTML body served for even-numbered threads.
 pub const HTML: &str = "<p>Hello there.</p><p>Second paragraph with enough text to lay out.</p>";
 
+type Locations = HashMap<Id, (Mailbox, Option<String>)>;
+type Snapshot = (Vec<ThreadSummary>, Locations);
+
 pub struct Fixture {
+    pub folders: Mutex<Vec<Folder>>,
+    pub locations: Mutex<Locations>,
+    pub folder_error: Mutex<Option<String>>,
+    pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
     pub accounts: Mutex<Vec<Account>>,
     threads: Mutex<Vec<ThreadSummary>>,
@@ -29,7 +36,7 @@ pub struct Fixture {
     /// Every `threads` query, in order.
     pub queries: Mutex<Vec<(View, u32)>>,
     pub opened: Mutex<Vec<Id>>,
-    snapshots: Mutex<HashMap<i64, Vec<ThreadSummary>>>,
+    snapshots: Mutex<HashMap<i64, Snapshot>>,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
 }
@@ -83,6 +90,10 @@ impl Fixture {
             );
         }
         Arc::new(Self {
+            folders: Mutex::new(Vec::new()),
+            locations: Mutex::new(HashMap::new()),
+            folder_error: Mutex::new(None),
+            attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
                 ..Settings::default()
@@ -106,7 +117,18 @@ impl Fixture {
     }
 
     pub fn thread_count(&self) -> usize {
-        self.threads.lock().unwrap().len()
+        self.threads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| {
+                self.locations
+                    .lock()
+                    .unwrap()
+                    .get(&t.id)
+                    .is_none_or(|(mailbox, folder)| *mailbox == Mailbox::Inbox && folder.is_none())
+            })
+            .count()
     }
 
     pub fn actions(&self) -> Vec<(Vec<Id>, Action)> {
@@ -193,11 +215,30 @@ impl Fixture {
             ),
         ];
         let fixture = Self::new(samples.len());
-        fixture.accounts.lock().unwrap()[0].email = "karl@example.com".into();
+        fixture.accounts.lock().unwrap()[0].email = "karl@proton.me".into();
+        fixture.accounts.lock().unwrap().push(Account {
+            id: 2,
+            provider: kite_core::model::Provider::Microsoft,
+            email: "karl@outlook.com".into(),
+            name: "Karl".into(),
+        });
+        *fixture.folders.lock().unwrap() = vec![
+            Folder {
+                id: "work".into(),
+                account_id: 1,
+                name: "Work".into(),
+            },
+            Folder {
+                id: "receipts".into(),
+                account_id: 2,
+                name: "Receipts".into(),
+            },
+        ];
         let mut rows = fixture.threads.lock().unwrap();
         let mut messages = fixture.messages.lock().unwrap();
         for (ix, (sender, subject, snippet)) in samples.into_iter().enumerate() {
             let row = &mut rows[ix];
+            row.account_id = if ix % 2 == 0 { 1 } else { 2 };
             row.participants = sender.into();
             row.subject = subject.into();
             row.snippet = snippet.into();
@@ -207,6 +248,28 @@ impl Fixture {
             if let Some(thread) = messages.get_mut(&row.id) {
                 for message in thread {
                     message.from.name = sender.into();
+                    message.to = vec![Addr {
+                        name: "Karl".into(),
+                        email: if row.account_id == 1 {
+                            "karl@proton.me"
+                        } else {
+                            "karl@outlook.com"
+                        }
+                        .into(),
+                    }];
+                    if ix == 0 {
+                        message.cc = vec![Addr {
+                            name: "Sofia Reyes".into(),
+                            email: "sofia@example.com".into(),
+                        }];
+                        message.attachments = vec![Attachment {
+                            id: 501,
+                            name: "Next chapter.pdf".into(),
+                            mime: "application/pdf".into(),
+                            size: 34567,
+                        }];
+                        row.attachments = true;
+                    }
                     message.subject = subject.into();
                     message.html = None;
                     message.text = format!(
@@ -309,6 +372,38 @@ impl Mail for Fixture {
         Ok(())
     }
 
+    fn folders(&self) -> anyhow::Result<Vec<Folder>> {
+        Ok(self.folders.lock().unwrap().clone())
+    }
+
+    fn create_folder(&self, account: Id, name: &str) -> anyhow::Result<Folder> {
+        if let Some(error) = self.folder_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        anyhow::ensure!(
+            self.accounts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|a| a.id == account),
+            "Unknown account"
+        );
+        let mut folders = self.folders.lock().unwrap();
+        anyhow::ensure!(
+            !folders
+                .iter()
+                .any(|f| f.account_id == account && f.name.eq_ignore_ascii_case(name)),
+            "Folder already exists"
+        );
+        let folder = Folder {
+            id: format!("folder-{}", folders.len() + 1),
+            account_id: account,
+            name: name.into(),
+        };
+        folders.push(folder.clone());
+        Ok(folder)
+    }
+
     fn threads(&self, view: &View, offset: u32, limit: u32) -> anyhow::Result<Vec<ThreadSummary>> {
         self.queries.lock().unwrap().push((view.clone(), offset));
         let all = self.threads.lock().unwrap();
@@ -316,11 +411,24 @@ impl Mail for Fixture {
         let query = view.query.as_deref().map(str::to_lowercase);
         let rows: Vec<ThreadSummary> = all
             .iter()
-            .filter(|t| match view.mailbox {
-                Mailbox::Starred => t.starred,
-                Mailbox::Snoozed => t.snoozed_until.is_some(),
-                Mailbox::Trash => false,
-                _ => true,
+            .filter(|t| view.account_id.is_none_or(|id| id == t.account_id))
+            .filter(|t| {
+                let locations = self.locations.lock().unwrap();
+                let (mailbox, folder) = locations
+                    .get(&t.id)
+                    .cloned()
+                    .unwrap_or((Mailbox::Inbox, None));
+                if let Some(wanted) = &view.folder {
+                    return folder.as_ref() == Some(wanted);
+                }
+                match view.mailbox {
+                    Mailbox::All => !matches!(mailbox, Mailbox::Trash | Mailbox::Spam),
+                    Mailbox::Starred => {
+                        t.starred && !matches!(mailbox, Mailbox::Trash | Mailbox::Spam)
+                    }
+                    Mailbox::Snoozed => t.snoozed_until.is_some(),
+                    wanted => mailbox == wanted && folder.is_none(),
+                }
             })
             .filter(|t| important || !t.important)
             .filter(|t| {
@@ -356,7 +464,10 @@ impl Mail for Fixture {
             .push((ids.to_vec(), action.clone()));
         let token = self.next_token.fetch_add(1, Ordering::SeqCst);
         let mut all = self.threads.lock().unwrap();
-        self.snapshots.lock().unwrap().insert(token, all.clone());
+        self.snapshots
+            .lock()
+            .unwrap()
+            .insert(token, (all.clone(), self.locations.lock().unwrap().clone()));
         match action {
             Action::Star => all
                 .iter_mut()
@@ -374,7 +485,27 @@ impl Mail for Fixture {
                 .iter_mut()
                 .filter(|t| ids.contains(&t.id))
                 .for_each(|t| t.unread = true),
-            _ => all.retain(|t| !ids.contains(&t.id)),
+            Action::Snooze { until } => {
+                for t in all.iter_mut().filter(|t| ids.contains(&t.id)) {
+                    t.snoozed_until = Some(*until);
+                    self.locations
+                        .lock()
+                        .unwrap()
+                        .insert(t.id, (Mailbox::Snoozed, None));
+                }
+            }
+            action => {
+                for id in ids {
+                    let location = match action {
+                        Action::Archive => (Mailbox::Archive, None),
+                        Action::Inbox => (Mailbox::Inbox, None),
+                        Action::Trash => (Mailbox::Trash, None),
+                        Action::Move { folder } => (Mailbox::Archive, Some(folder.clone())),
+                        _ => unreachable!(),
+                    };
+                    self.locations.lock().unwrap().insert(*id, location);
+                }
+            }
         }
         Ok(token)
     }
@@ -382,7 +513,8 @@ impl Mail for Fixture {
     fn undo(&self, token: i64) -> anyhow::Result<()> {
         self.undos.lock().unwrap().push(token);
         if let Some(snapshot) = self.snapshots.lock().unwrap().get(&token).cloned() {
-            *self.threads.lock().unwrap() = snapshot;
+            *self.threads.lock().unwrap() = snapshot.0;
+            *self.locations.lock().unwrap() = snapshot.1;
         }
         Ok(())
     }
@@ -399,7 +531,8 @@ impl Mail for Fixture {
         Ok(Vec::new())
     }
 
-    fn open_attachment(&self, _: Id) -> anyhow::Result<()> {
+    fn open_attachment(&self, id: Id) -> anyhow::Result<()> {
+        self.attachments_opened.lock().unwrap().push(id);
         Ok(())
     }
 

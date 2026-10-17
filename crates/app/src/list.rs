@@ -51,8 +51,11 @@ impl Kite {
                         let Some(row) = this.rows.get(ix) else {
                             continue;
                         };
-                        let sender_width = if window.viewport_size().width < px(900.) {
-                            140.
+                        let sender_width = if window.viewport_size().width
+                            - px(crate::sidebar::width(window))
+                            < px(700.)
+                        {
+                            112.
                         } else {
                             180.
                         };
@@ -81,6 +84,11 @@ impl Kite {
         let t = self.theme;
         let (title, note) = if self.view.query.is_some() {
             ("No results", "Try another name, subject, or search term.")
+        } else if self.view.folder.is_some() {
+            (
+                "No conversations",
+                "Move mail here with the folder menu or press L.",
+            )
         } else if self.accounts.is_empty() {
             (
                 "Welcome to Kite",
@@ -202,6 +210,11 @@ fn row_element(
     let checked = kite.multi.contains(&row.id);
     let label = format!("{}: {}", row.participants, row.subject);
     let now = Local::now();
+    let account = kite
+        .accounts
+        .iter()
+        .find(|account| account.id == row.account_id);
+    let row_id = row.id;
     div()
         .id(("row", ix))
         .test_support()
@@ -234,10 +247,34 @@ fn row_element(
         })
         .child(
             div()
-                .w(px(8.))
+                .id(("select-row", ix))
+                .test_support()
+                .aria_label("Select conversation")
+                .aria_selected(checked)
+                .w(px(14.))
+                .h_full()
+                .flex_shrink_0()
                 .flex()
+                .items_center()
                 .justify_center()
-                .when(row.unread || checked, |d| {
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(index) = this.multi.iter().position(|id| *id == row_id) {
+                        this.multi.remove(index);
+                    } else {
+                        this.multi.push(row_id);
+                    }
+                    window.focus(&this.focus, cx);
+                    cx.notify();
+                    cx.stop_propagation();
+                }))
+                .when(checked, |d| {
+                    d.child(
+                        Icon::new(IconName::Check)
+                            .with_size(px(12.))
+                            .text_color(t.accent),
+                    )
+                })
+                .when(!checked && row.unread, |d| {
                     d.child(div().size(px(6.)).rounded_full().bg(t.accent))
                 }),
         )
@@ -245,16 +282,45 @@ fn row_element(
             div()
                 .w(px(sender_width))
                 .flex_shrink_0()
-                .truncate()
-                .text_size(px(13.))
-                // DESIGN: unread senders are heavier (650 rather than 500).
-                .font_weight(if row.unread {
-                    FontWeight(650.)
-                } else {
-                    FontWeight(500.)
-                })
-                .text_color(if row.unread { t.fg } else { t.fg2 })
-                .child(row.participants.clone()),
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .child(
+                    div()
+                        .truncate()
+                        .text_size(px(13.))
+                        .font_weight(if row.unread {
+                            FontWeight(650.)
+                        } else {
+                            FontWeight(500.)
+                        })
+                        .text_color(if row.unread { t.fg } else { t.fg2 })
+                        .child(row.participants.clone()),
+                )
+                .when(
+                    kite.view.account_id.is_none() && kite.accounts.len() > 1,
+                    |d| {
+                        d.child(
+                            div()
+                                .id(("row-account", ix))
+                                .test_support()
+                                .aria_label(
+                                    account
+                                        .map(|account| account.email.clone())
+                                        .unwrap_or_default(),
+                                )
+                                .truncate()
+                                .text_size(px(11.))
+                                .text_color(t.fg2)
+                                .child(
+                                    account
+                                        .map(|account| account.email.clone())
+                                        .unwrap_or_default(),
+                                ),
+                        )
+                    },
+                ),
         )
         .child(
             div()
@@ -352,15 +418,10 @@ fn row_element(
                         ),
                 ),
         )
-        .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.sel = ix;
             window.focus(&this.focus, cx);
-            if event.click_count() > 1 {
-                this.open_thread(cx);
-            } else {
-                this.list_scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
-                cx.notify();
-            }
+            this.open_thread(cx);
         }))
         .into_any_element()
 }
@@ -383,6 +444,7 @@ pub fn overlay(
         .child(panel);
     div()
         .id("overlay")
+        .occlude()
         .test_support()
         .absolute()
         .inset_0()

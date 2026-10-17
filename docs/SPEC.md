@@ -8,12 +8,14 @@ Kite is a keyboard-first email client modelled on Superhuman. Every action has a
 | **Proton Mail** | IMAP + SMTP via Proton Bridge (`127.0.0.1`, IMAP 1143 / SMTP 1025, STARTTLS, Bridge self-signed cert) | Bridge username + password, stored in the OS keychain |
 | **Microsoft 365 / Outlook** | Microsoft Graph v1.0 (`/me/mailFolders`, `/me/messages/delta`, `/me/sendMail`, `/me/calendarView`) | OAuth 2.0 Auth Code + PKCE, public client, loopback redirect `http://localhost:{port}`. Client ID from `KITE_MS_CLIENT_ID` env var or `config.json`. Refresh token kept in the OS keychain. Scopes: `offline_access Mail.ReadWrite Mail.Send Calendars.Read User.Read` |
 
-Multiple accounts are supported. Account switching uses `Ctrl/Cmd+1..9`.
+Multiple accounts are supported. The persistent left sidebar selects all inboxes together or a specific account. Account switching uses `Ctrl/Cmd+1..9`; `Ctrl/Cmd+0` returns to the combined inbox. Split tabs and standard mailbox navigation preserve the selected account.
+
+The sidebar includes Inbox, Drafts, Sent, Starred, Snoozed, Archive, Spam, Trash and All mail. Custom folders belong to an account; the combined sidebar identifies their owner. New folder opens an account chooser and name field (`Ctrl/Cmd+Shift+N`). Creation runs off the UI thread, reports errors, and adds the folder only after success. `L` moves selected conversations into Inbox, Archive, Trash or a custom folder from their account. Mixed-account selections expose only the shared standard destinations. Moving is undoable. Creating a folder does not move any mail automatically.
 
 ## Core (Superhuman parity)
 - **Split inbox**: tabs across the top (`Important`, `Other`, plus user-defined splits by query, e.g. `from:github.com`). Tab and Shift+Tab cycle through splits. Important = (Graph) `inferenceClassification == focused`, or (IMAP) the sender has been replied to before.
 - **Done = archive.** `e` marks done (archives); Inbox Zero shows a calm full-bleed empty state.
-- **Thread view**: conversation with collapsed older messages, the latest one expanded. HTML is rendered natively by Blitz, with no scripts and no network. Remote images are blocked by default, with per-sender allow. `Shift+V` opens the original in the system browser as an escape hatch.
+- **Thread view**: a single click opens the conversation, with collapsed older messages and the latest expanded. The reading view shows the account, subject, complete From/To/Cc names and addresses, full local date and time with UTC offset, and attachment names and sizes. Clicking an attachment delegates opening to the engine. The selection checkbox and `X` select without opening. HTML is rendered natively by Blitz, with no scripts and no network. Remote images are blocked by default, with per-sender allow. `Shift+V` opens the original in the system browser as an escape hatch.
 - **Command palette** (`Cmd/Ctrl+K`): fuzzy search over every command, showing its shortcut.
 - **Instant search** (`/`): local FTS5 with operators `from: to: subject: has:attachment is:unread before: after:`. Results update on each keystroke.
 - **Compose** (`c`), reply (`r`), reply all (`a`), forward (`f`). Plain text with minimal formatting (bold, italic, link, list). `Cmd/Ctrl+Enter` sends.
@@ -45,6 +47,9 @@ Multiple accounts are supported. Account switching uses `Ctrl/Cmd+1..9`.
 | `Cmd/Ctrl+K` | command palette |
 | `Tab` / `Shift+Tab` | next / previous split |
 | `g i` `g s` `g d` `g t` `g h` `g a` | go to inbox / starred / drafts / sent / snoozed / all mail |
+| `g e` / `g p` / `g b` | archive / spam / trash |
+| `Cmd/Ctrl+0` / `Cmd/Ctrl+1..9` | combined inbox / account |
+| `Cmd/Ctrl+Shift+N` | create folder |
 | `z` | undo |
 | `?` | shortcut cheat sheet |
 | `Cmd/Ctrl+Enter` | send |
