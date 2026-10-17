@@ -846,7 +846,10 @@ fn folders_are_account_scoped_and_threads_honour_the_folder_view() {
     let travel_a = s.create_folder(a.id, "Travel").unwrap();
     let travel_b = s.create_folder(b.id, "Travel").unwrap();
     let receipts = s.create_folder(a.id, "Receipts").unwrap();
-    assert_eq!(travel_a.id, travel_b.id, "folder ids collide across accounts");
+    assert_eq!(
+        travel_a.id, travel_b.id,
+        "folder ids collide across accounts"
+    );
     assert_eq!(travel_a.account_id, a.id);
     assert!(s.folder_exists(a.id, &travel_a.id).unwrap());
     assert!(s.folder_exists(b.id, &travel_b.id).unwrap());
@@ -920,10 +923,7 @@ fn folders_are_account_scoped_and_threads_honour_the_folder_view() {
     assert_eq!(receipts_rows[0].subject, "A invoice");
 
     // A folder is always paired with an account; an ambiguous request is rejected.
-    assert!(
-        s.threads(&folder_view(None, &travel_a.id), 0, 50)
-            .is_err()
-    );
+    assert!(s.threads(&folder_view(None, &travel_a.id), 0, 50).is_err());
 }
 
 #[test]
@@ -939,9 +939,12 @@ fn a_move_into_another_accounts_folder_is_rejected() {
 
     // B does not own "Travel", so the move is rejected with no local mutation.
     let error = s
-        .act(&[tid], &Action::Move {
-            folder: folder.id.clone(),
-        })
+        .act(
+            &[tid],
+            &Action::Move {
+                folder: folder.id.clone(),
+            },
+        )
         .unwrap_err();
     assert!(error.to_string().contains("does not belong"), "{error}");
 
@@ -968,10 +971,14 @@ fn a_move_into_another_accounts_folder_is_rejected() {
         .find(|t| t.account_id == b.id)
         .unwrap()
         .id;
-    let token = s.act(&[b_thread], &Action::Move {
-        folder: own_b.id.clone(),
-    })
-    .unwrap();
+    let token = s
+        .act(
+            &[b_thread],
+            &Action::Move {
+                folder: own_b.id.clone(),
+            },
+        )
+        .unwrap();
     let b_rows = s
         .threads(&folder_view(Some(b.id), &own_b.id), 0, 50)
         .unwrap();
@@ -984,9 +991,10 @@ fn a_move_into_another_accounts_folder_is_rejected() {
         "B's move did not touch A's folder with the same id"
     );
     assert!(
-        s.pending_ops(b.id, DUE, 10).unwrap().iter().any(
-            |(_, op)| matches!(op, Op::MoveToFolder { folder: f, .. } if f == &own_b.id)
-        )
+        s.pending_ops(b.id, DUE, 10)
+            .unwrap()
+            .iter()
+            .any(|(_, op)| matches!(op, Op::MoveToFolder { folder: f, .. } if f == &own_b.id))
     );
     s.undo(token).unwrap();
     assert!(

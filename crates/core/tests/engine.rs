@@ -375,7 +375,9 @@ fn creating_a_folder_persists_it_and_a_provider_error_persists_nothing() {
         "discovery is out of scope, so nothing is cached yet"
     );
 
-    let folder = engine.create_folder(account.id, "Receipts").expect("create");
+    let folder = engine
+        .create_folder(account.id, "Receipts")
+        .expect("create");
     assert_eq!(folder.account_id, account.id);
     assert_eq!(folder.name, "Receipts");
     assert!(folder.id.ends_with("Receipts"), "{}", folder.id);

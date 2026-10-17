@@ -1,6 +1,6 @@
 //! Boundary between remote backends and the local store.
 //! Backends never touch SQLite. They turn remote state into `Delta`s and execute `Op`s.
-//! The engine (wave 2) owns the loop: `sync` -> `Store::apply_deltas`, and `Store::pending_ops` -> `apply`.
+//! The engine owns the loop: `sync` -> `Store::apply_deltas`, and `Store::pending_ops` -> `apply`.
 //!
 //! Every backend exposes these inherent methods with these exact signatures (enum dispatch, no trait objects):
 //! ```ignore
