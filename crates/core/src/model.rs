@@ -1,4 +1,4 @@
-//! IPC contract. Mirrors `src/types.ts` exactly. Change both together or neither.
+//! Shared domain types used by the store, the engine and the UI. Owned by the orchestrator.
 use serde::{Deserialize, Serialize};
 
 pub type Id = i64;
@@ -85,7 +85,7 @@ pub struct Message {
     pub cc: Vec<Addr>,
     pub date: Ms,
     pub subject: String,
-    /// Raw HTML. The UI renders it in a sandboxed iframe with a strict CSP, so it is never sanitized here.
+    /// Raw HTML. Rendered by Blitz with no script engine and no network unless remote images are allowed.
     pub html: Option<String>,
     pub text: String,
     pub attachments: Vec<Attachment>,
@@ -130,7 +130,7 @@ pub struct Split {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Event {
+pub struct CalEvent {
     pub id: String,
     pub title: String,
     pub start: Ms,
@@ -177,16 +177,13 @@ pub struct ChatMsg {
     pub content: String,
 }
 
-/// Payload of the `kite://changed` event: the store changed, so views showing these accounts should refetch.
-#[derive(Serialize, Clone, Debug)]
-pub struct Changed {
-    pub account_ids: Vec<Id>,
-}
-
-/// Payload of the `kite://ai` event, streamed per request id.
-#[derive(Serialize, Clone, Debug)]
-pub struct AiChunk {
-    pub req: u32,
-    pub delta: String,
-    pub done: bool,
+/// Engine -> UI notifications, delivered over a channel and handled on the UI thread.
+#[derive(Clone, Debug)]
+pub enum Event {
+    /// The store changed for these accounts, so visible views should re-query.
+    Changed(Vec<Id>),
+    /// A streamed AI completion chunk for request `req`.
+    Ai { req: u32, delta: String, done: bool },
+    /// A user-visible background failure (auth expired, send failed, ...).
+    Error(String),
 }

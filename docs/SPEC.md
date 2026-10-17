@@ -13,7 +13,7 @@ Multiple accounts are supported. Account switching uses `Ctrl/Cmd+1..9`.
 ## Core (Superhuman parity)
 - **Split inbox**: tabs across the top (`Important`, `Other`, plus user-defined splits by query, e.g. `from:github.com`). Tab and Shift+Tab cycle through splits. Important = (Graph) `inferenceClassification == focused`, or (IMAP) the sender has been replied to before.
 - **Done = archive.** `e` marks done (archives); Inbox Zero shows a calm full-bleed empty state.
-- **Thread view**: conversation with collapsed older messages, the latest one expanded. HTML is rendered sanitized in a sandboxed iframe. Remote images are blocked by default, with per-sender allow.
+- **Thread view**: conversation with collapsed older messages, the latest one expanded. HTML is rendered natively by Blitz, with no scripts and no network. Remote images are blocked by default, with per-sender allow. `Shift+V` opens the original in the system browser as an escape hatch.
 - **Command palette** (`Cmd/Ctrl+K`): fuzzy search over every command, showing its shortcut.
 - **Instant search** (`/`): local FTS5 with operators `from: to: subject: has:attachment is:unread before: after:`. Results update on each keystroke.
 - **Compose** (`c`), reply (`r`), reply all (`a`), forward (`f`). Plain text with minimal formatting (bold, italic, link, list). `Cmd/Ctrl+Enter` sends.
@@ -52,6 +52,7 @@ Multiple accounts are supported. Account switching uses `Ctrl/Cmd+1..9`.
 | `Cmd/Ctrl+J` | AI write (compose) |
 | `Shift+S` | AI summarize thread |
 | `Cmd/Ctrl+Shift+C` | toggle calendar |
+| `Shift+V` | view original in browser |
 | `Cmd/Ctrl+,` | settings |
 
 ## Non-goals (v1)

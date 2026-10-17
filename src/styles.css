@@ -1,9 +1,0 @@
-:root {
-  color-scheme: dark;
-  --bg: #0e0f13;
-  --fg: #e9e9ee;
-  --font: ui-sans-serif, -apple-system, "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-}
-* { box-sizing: border-box; margin: 0; }
-html, body, #root { height: 100%; }
-body { background: var(--bg); color: var(--fg); font: 13px/1.4 var(--font); -webkit-font-smoothing: antialiased; }

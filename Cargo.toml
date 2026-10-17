@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+# Versions are pinned here once. Crates use `dep = { workspace = true }`.
+[workspace.dependencies]
+kite-core = { path = "crates/core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+gpui-kit = "=0.7.3"
+blitz-dom = "=0.3.0-beta.4"
+blitz-html = "=0.3.0-beta.4"
+blitz-paint = "=0.3.0-beta.4"
+blitz-traits = "=0.3.0-beta.4"
+anyrender = "0.14"
+anyrender_vello_cpu = "0.18"
+image = { version = "0.25", default-features = false }
+
+[profile.dev]
+debug = "line-tables-only"
+
+# Optimise dependencies in dev: Blitz/Stylo and SQLite are unusably slow at opt-level 0.
+# Costs once on a clean build; incremental builds only recompile our crates.
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

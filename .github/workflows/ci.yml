@@ -9,20 +9,11 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 22, cache: pnpm }
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: clippy }
+        with: { components: "clippy, llvm-tools" }
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: src-tauri }
-      - run: pnpm i --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm exec playwright install --with-deps ${{ matrix.os == 'macos-latest' && 'webkit' || 'chromium' }}
-      - run: pnpm test:e2e --project=${{ matrix.os == 'macos-latest' && 'webkit' || 'chromium' }}
-      - run: cargo clippy --all-targets -- -D warnings
-        working-directory: src-tauri
-      - run: cargo test
-        working-directory: src-tauri
-      - run: pnpm tauri build --no-bundle
-      - run: pnpm test:budget
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo build --release -p kite
+      # Perf and size budgets are asserted only in release.
+      - run: cargo test --workspace --release

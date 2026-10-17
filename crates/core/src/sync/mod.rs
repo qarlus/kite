@@ -49,16 +49,34 @@ pub struct RemoteMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Delta {
     Upsert(Box<RemoteMsg>),
-    Flags { remote_id: String, unread: bool, starred: bool },
-    Delete { remote_id: String },
+    Flags {
+        remote_id: String,
+        unread: bool,
+        starred: bool,
+    },
+    Delete {
+        remote_id: String,
+    },
 }
 
 /// Remote mutation queued by the store and executed by a backend.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Op {
-    Move { remote_id: String, to: Mailbox },
-    MoveToFolder { remote_id: String, folder: String },
-    Flags { remote_id: String, unread: Option<bool>, starred: Option<bool> },
+    Move {
+        remote_id: String,
+        to: Mailbox,
+    },
+    MoveToFolder {
+        remote_id: String,
+        folder: String,
+    },
+    Flags {
+        remote_id: String,
+        unread: Option<bool>,
+        starred: Option<bool>,
+    },
     /// Raw RFC 5322 bytes (built with mail-builder). Both backends send MIME as-is.
-    Send { mime: Vec<u8> },
+    Send {
+        mime: Vec<u8>,
+    },
 }

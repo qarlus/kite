@@ -2,7 +2,7 @@
 
 # Kite
 
-A keyboard-first email client that aims to be faster than Superhuman. Built with Tauri 2, Rust and SolidJS. It supports Proton Mail (via Proton Bridge) and Microsoft 365 / Outlook (via Graph).
+A keyboard-first, fully native email client that aims to be faster than Superhuman. It's pure Rust: GPUI for the UI, Blitz for HTML mail and SQLite for local-first storage. It supports Proton Mail (via Proton Bridge) and Microsoft 365 / Outlook (via Graph).
 
 - Product spec: [docs/SPEC.md](docs/SPEC.md)
 - Design: [docs/DESIGN.md](docs/DESIGN.md)
@@ -11,8 +11,8 @@ A keyboard-first email client that aims to be faster than Superhuman. Built with
 
 ## Develop
 ```sh
-pnpm i
-pnpm tauri dev
+cargo run -p kite          # first build compiles GPUI + Stylo (~3-5 min)
+cargo test --workspace
 ```
 
 ## Microsoft account setup (one-time, ~2 min)
