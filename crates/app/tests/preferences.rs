@@ -577,7 +577,7 @@ fn every_settings_section_opens_from_the_rail(cx: &mut TestAppContext) {
             (0, "theme-dark"),
             (1, "font-size-value"),
             (2, "settings-account-1"),
-            (3, "detect-proton"),
+            (3, "proton-bridge-status"),
             (4, "undo-send-10"),
             (5, "remote-images"),
             (6, "ai-enabled"),

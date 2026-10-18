@@ -88,6 +88,11 @@ impl Kite {
                 scroll: ScrollHandle::new(),
             });
         }
+        // Opening Connections looks for Bridge and creates what it finds, so the user
+        // never has to press a second button.
+        if tab == OPEN_CONNECTIONS {
+            self.find_proton_bridge(cx);
+        }
         self.sidebar_dirty = true;
         window.focus(&self.focus, cx);
         cx.notify();
@@ -411,6 +416,9 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 page.error = None;
                                 page.notice = None;
                                 page.scroll = ScrollHandle::new();
+                            }
+                            if index == OPEN_CONNECTIONS {
+                                this.find_proton_bridge(cx);
                             }
                             cx.notify();
                         }))

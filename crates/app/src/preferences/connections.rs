@@ -1,7 +1,10 @@
 //! Connections: Proton Bridge discovery, Outlook sign-in and manual Bridge credentials.
-use super::{button, card, heading, row};
+//!
+//! Opening this page looks for Bridge and creates any account it finds, so the everyday
+//! path is zero clicks. The manual form is only a fallback when Bridge is missing or locked.
+use super::{card, heading, row, button};
 use crate::app::Kite;
-use crate::theme::Theme;
+use crate::theme::{RADIUS_SM, Theme};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::spinner::Spinner;
@@ -17,9 +20,11 @@ pub struct State {
     pub proton: bool,
     /// `discover_proton` is running off the UI thread.
     pub detecting: bool,
-    /// Accounts Bridge already set up on this machine; host and ports are filled in.
-    pub discovered: Vec<ProtonLogin>,
-    /// Discovery finished without finding a local Bridge.
+    /// Every account Bridge reported, connected or not.
+    pub found: Vec<ProtonLogin>,
+    /// Discovered accounts still waiting to be created, oldest first.
+    pub queue: Vec<ProtonLogin>,
+    /// Discovery ran at least once for this page.
     pub searched: bool,
 }
 
@@ -33,13 +38,14 @@ impl State {
             password,
             proton: false,
             detecting: false,
-            discovered: Vec::new(),
+            found: Vec::new(),
+            queue: Vec::new(),
             searched: false,
         }
     }
 }
 
-/// The one accent action on each group. Provider work stays secondary and quiet.
+/// The one accent action on the page. Everything else stays quiet.
 fn primary(
     id: impl Into<ElementId>,
     label: &str,
@@ -51,57 +57,34 @@ fn primary(
         .text_color(t.bg)
 }
 
-fn detecting_row(t: Theme) -> AnyElement {
+/// A small, borderless action for repeats, so it never competes with the page.
+fn quiet(
+    id: impl Into<ElementId>,
+    label: &str,
+    t: Theme,
+) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
     div()
-        .id("detecting-proton")
+        .id(id)
         .test_support()
-        .aria_label("Looking for Proton Bridge")
-        .flex()
-        .items_center()
-        .gap_3()
-        .child(Spinner::new().with_size(px(16.)).color(t.accent.into()))
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(div().text_size(t.px(13.)).child("Looking for Proton Bridge…"))
-                .child(
-                    div()
-                        .text_size(t.px(12.))
-                        .text_color(t.fg2)
-                        .child("Reading Bridge's local vault. Nothing leaves this computer."),
-                ),
-        )
-        .into_any_element()
+        .aria_label(label.to_string())
+        .px_2()
+        .py_1()
+        .rounded(px(RADIUS_SM))
+        .text_size(t.px(12.))
+        .text_color(t.fg2)
+        .cursor_pointer()
+        .hover(|s| s.bg(t.bg3).text_color(t.fg))
+        .child(label.to_string())
 }
 
-fn no_bridge_found(t: Theme) -> AnyElement {
-    div()
-        .id("no-bridge-found")
-        .test_support()
-        .aria_label("No local Proton Bridge found")
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(
-            div()
-                .text_size(t.px(13.))
-                .child("No local Proton Bridge found"),
-        )
-        .child(
-            div()
-                .text_size(t.px(12.))
-                .text_color(t.fg2)
-                .child("Open Bridge and look again, or connect with the credentials below."),
-        )
-        .into_any_element()
+fn spinner(t: Theme) -> Spinner {
+    Spinner::new().with_size(px(15.)).color(t.accent.into())
 }
 
 impl Kite {
-    /// Looks for Bridge accounts off the UI thread. A failure or an empty result
-    /// opens the manual form so account setup is never blocked.
-    fn find_proton_bridge(&mut self, cx: &mut Context<Self>) {
+    /// Looks for Bridge accounts off the UI thread and creates the ones not connected yet.
+    /// A failure or an empty result reveals the manual form so setup is never blocked.
+    pub(crate) fn find_proton_bridge(&mut self, cx: &mut Context<Self>) {
         if self.account_busy {
             return;
         }
@@ -114,7 +97,8 @@ impl Kite {
             }
             page.connections.detecting = true;
             page.connections.searched = false;
-            page.connections.discovered.clear();
+            page.connections.found.clear();
+            page.connections.queue.clear();
             page.error = None;
             page.notice = None;
             (page.request, self.mail.clone())
@@ -135,13 +119,29 @@ impl Kite {
                 if active {
                     match result {
                         Ok(found) => {
-                            let empty = found.is_empty();
+                            let connected: Vec<String> =
+                                this.accounts.iter().map(|a| a.email.clone()).collect();
                             if let Some(page) = &mut this.preferences {
                                 page.connections.searched = true;
-                                page.connections.discovered = found;
-                                if empty {
+                                page.connections.found = found;
+                                page.connections.queue = page
+                                    .connections
+                                    .found
+                                    .iter()
+                                    .filter(|login| !connected.contains(&login.email))
+                                    .cloned()
+                                    .collect();
+                                // No Bridge at all: offer the manual form straight away.
+                                if page.connections.found.is_empty() {
                                     page.connections.proton = true;
                                 }
+                            }
+                            let next = this
+                                .preferences
+                                .as_ref()
+                                .and_then(|page| page.connections.queue.first().cloned());
+                            if let Some(login) = next {
+                                this.connect_login(Some(login), cx);
                             }
                         }
                         Err(error) => {
@@ -159,10 +159,6 @@ impl Kite {
         })
         .detach();
         cx.notify();
-    }
-
-    fn connect_discovered(&mut self, login: ProtonLogin, cx: &mut Context<Self>) {
-        self.connect_login(Some(login), cx);
     }
 
     fn connect_account(&mut self, proton: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -196,7 +192,7 @@ impl Kite {
         self.connect_login(login, cx);
     }
 
-    /// Starts a provider sign-in. `login` is a Bridge credential (typed or discovered),
+    /// Starts a provider sign-in. `login` is a Bridge credential (discovered or typed),
     /// or `None` for Microsoft. Provider work runs off the UI thread.
     fn connect_login(&mut self, login: Option<ProtonLogin>, cx: &mut Context<Self>) {
         if self.account_busy {
@@ -210,6 +206,7 @@ impl Kite {
         page.error = None;
         page.notice = None;
         let request = page.request;
+        let proton = login.is_some();
         let mail = self.mail.clone();
         let task = cx.background_executor().spawn(async move {
             if let Some(login) = login {
@@ -246,19 +243,27 @@ impl Kite {
                         this.folders = this.mail.folders().unwrap_or_default();
                         this.sidebar_dirty = true;
                         this.reload();
+                        let mut next = None;
                         if active && let Some(page) = &mut this.preferences {
                             page.accounts.busy = false;
                             page.connections.proton = false;
-                            page.connections.searched = false;
-                            page.connections
-                                .discovered
-                                .retain(|login| login.email != email);
+                            page.connections.queue.retain(|login| login.email != email);
                             page.notice = Some("Account connected".into());
+                            next = page.connections.queue.first().cloned();
+                        }
+                        // Bridge can hold several accounts; create them one after another.
+                        if let Some(login) = next {
+                            this.connect_login(Some(login), cx);
                         }
                     }
                     Err(error) => {
                         if active && let Some(page) = &mut this.preferences {
                             page.accounts.busy = false;
+                            // Stop the queue so a failing credential is not retried in a loop.
+                            page.connections.queue.clear();
+                            if proton {
+                                page.connections.proton = true;
+                            }
                             page.error = Some(error.to_string());
                         }
                     }
@@ -272,13 +277,137 @@ impl Kite {
     }
 }
 
+/// The always-present Proton Bridge row: it reports what discovery found and offers a
+/// quiet repeat, never a second required click.
+fn bridge_status(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
+    let Some(page) = &kite.preferences else {
+        return div().into_any_element();
+    };
+    let connections = &page.connections;
+    let searching = connections.detecting || page.accounts.busy;
+    let description = if connections.detecting {
+        "Looking for Proton Bridge…".to_string()
+    } else if page.accounts.busy {
+        "Creating your account from Bridge…".to_string()
+    } else if !connections.found.is_empty() {
+        format!(
+            "Connected {} from Bridge — nothing to type.",
+            connections
+                .found
+                .iter()
+                .map(|login| login.email.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    } else if connections.searched {
+        "No local Proton Bridge found. Open Bridge and look again, or connect below.".to_string()
+    } else {
+        "Uses the accounts Proton Bridge already set up on this computer.".to_string()
+    };
+
+    div()
+        .id("proton-bridge-status")
+        .test_support()
+        .aria_label(description.clone())
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().text_size(t.px(13.)).child("Proton Bridge"))
+                        .when(searching, |d| d.child(spinner(t))),
+                )
+                .child(
+                    div()
+                        .text_size(t.px(12.))
+                        .text_color(if connections.found.is_empty() {
+                            t.fg2
+                        } else {
+                            t.ok
+                        })
+                        .child(description),
+                ),
+        )
+        .when(!searching, |d| {
+            d.child(quiet("look-again-proton", "Look again", t).on_click(
+                cx.listener(|this, _, _, cx| this.find_proton_bridge(cx)),
+            ))
+        })
+        .into_any_element()
+}
+
 pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let Some(page) = &kite.preferences else {
         return div().into_any_element();
     };
     let t = kite.theme;
     let busy = page.accounts.busy;
-    let mut connect = Vec::new();
+
+    let mut connect = vec![bridge_status(kite, t, cx)];
+
+    // Bridge found: confirm each account compactly, with the provider it belongs to.
+    for (index, login) in page.connections.found.iter().enumerate() {
+        connect.push(
+            div()
+                .id(format!("found-proton-{index}"))
+                .test_support()
+                .aria_label(format!("Found {}", login.email))
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(
+                    div()
+                        .size(px(32.))
+                        .flex_shrink_0()
+                        .rounded_full()
+                        .bg(Theme::alpha(t.ok, 0.16))
+                        .text_color(t.ok)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(Icon::new(IconName::CircleCheck).with_size(px(16.))),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(t.px(13.))
+                                .font_weight(FontWeight(650.))
+                                .child(login.email.clone()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(t.px(12.))
+                                .text_color(t.fg2)
+                                .child(match (&login.host, login.imap_port, login.smtp_port) {
+                                    (Some(host), Some(imap), Some(smtp)) => {
+                                        format!("{host} · IMAP {imap} · SMTP {smtp}")
+                                    }
+                                    _ => "Found on this computer".into(),
+                                }),
+                        ),
+                )
+                .into_any_element(),
+        );
+    }
 
     if busy {
         connect.push(
@@ -289,7 +418,7 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(Spinner::new().with_size(px(16.)).color(t.accent.into()))
+                .child(spinner(t))
                 .child(
                     div()
                         .text_size(t.px(13.))
@@ -298,141 +427,63 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 )
                 .into_any_element(),
         );
-    } else {
-        if page.connections.detecting {
-            connect.push(detecting_row(t));
-        } else {
-            connect.push(row(
-                t,
-                "Proton Mail",
-                "Find the accounts Bridge already set up here — no credentials to type.",
-                primary("detect-proton", "Find Proton Bridge", t)
-                    .on_click(cx.listener(|this, _, _, cx| this.find_proton_bridge(cx))),
-            ));
-        }
+    }
 
-        for (index, login) in page.connections.discovered.iter().enumerate() {
-            let login = login.clone();
-            let detail = match (&login.host, login.imap_port, login.smtp_port) {
-                (Some(host), Some(imap), Some(smtp)) => {
-                    format!("{host} · IMAP {imap} · SMTP {smtp}")
+    connect.push(row(
+        t,
+        "Microsoft Outlook",
+        "Sign in through your browser. Kite never sees your password.",
+        button("add-microsoft", "Connect Outlook", t).on_click(
+            cx.listener(|this, _, window, cx| this.connect_account(false, window, cx)),
+        ),
+    ));
+
+    connect.push(row(
+        t,
+        "Proton Mail with Bridge credentials",
+        "Only needed if Bridge is not running on this computer.",
+        button("add-proton", "Enter credentials", t).on_click(cx.listener(
+            |this, _, window, cx| {
+                if let Some(page) = &mut this.preferences {
+                    page.connections.proton = true;
+                    page.error = None;
+                    let focus = page.connections.email.read(cx).focus_handle(cx);
+                    window.focus(&focus, cx);
                 }
-                (Some(host), _, _) => host.clone(),
-                _ => "Found on this computer".into(),
-            };
-            connect.push(
-                div()
-                    .id(format!("found-proton-{index}"))
-                    .test_support()
-                    .aria_label(format!("Found {}", login.email))
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .size(px(36.))
-                            .flex_shrink_0()
-                            .rounded_full()
-                            .bg(Theme::alpha(t.accent, 0.16))
-                            .text_color(t.accent)
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(Icon::new(IconName::CircleUser).with_size(px(17.))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(t.px(13.))
-                                    .font_weight(FontWeight(650.))
-                                    .child(format!("Found {}", login.email)),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(t.px(12.))
-                                    .text_color(t.fg2)
-                                    .child(detail),
-                            ),
-                    )
-                    .child(
-                        primary(format!("connect-discovered-{index}"), "Connect", t).on_click(
-                            cx.listener(move |this, _, _, cx| {
-                                this.connect_discovered(login.clone(), cx)
-                            }),
-                        ),
-                    )
-                    .into_any_element(),
-            );
-        }
+                cx.notify();
+            },
+        )),
+    ));
 
-        if page.connections.searched && page.connections.discovered.is_empty() {
-            connect.push(no_bridge_found(t));
-        }
-
-        connect.push(row(
-            t,
-            "Microsoft Outlook",
-            "Sign in through your browser. Kite never sees your password.",
-            button("add-microsoft", "Connect Outlook", t).on_click(
-                cx.listener(|this, _, window, cx| this.connect_account(false, window, cx)),
-            ),
-        ));
-
-        connect.push(row(
-            t,
-            "Proton Mail with Bridge credentials",
-            "Use the username and password Bridge shows you, not your Proton password.",
-            button("add-proton", "Connect Proton Mail", t).on_click(cx.listener(
-                |this, _, window, cx| {
-                    if let Some(page) = &mut this.preferences {
-                        page.connections.proton = true;
-                        page.error = None;
-                        let focus = page.connections.email.read(cx).focus_handle(cx);
-                        window.focus(&focus, cx);
-                    }
-                    cx.notify();
-                },
-            )),
-        ));
-
-        if page.connections.proton {
-            connect.push(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(t.px(12.))
-                            .text_color(t.fg2)
-                            .child("Bridge must be running on this computer. Credentials live in your OS keychain."),
-                    )
-                    .child(
-                        Input::new(&page.connections.email)
-                            .id("proton-username")
-                            .aria_label("Bridge username"),
-                    )
-                    .child(
-                        Input::new(&page.connections.password)
-                            .id("proton-password")
-                            .aria_label("Bridge password"),
-                    )
-                    .child(
-                        primary("connect-proton", "Connect Bridge", t).on_click(cx.listener(
-                            |this, _, window, cx| this.connect_account(true, window, cx),
-                        )),
-                    )
-                    .into_any_element(),
-            );
-        }
+    if page.connections.proton {
+        connect.push(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .text_size(t.px(12.))
+                        .text_color(t.fg2)
+                        .child("Use the username and password Bridge shows you, not your Proton password."),
+                )
+                .child(
+                    Input::new(&page.connections.email)
+                        .id("proton-username")
+                        .aria_label("Bridge username"),
+                )
+                .child(
+                    Input::new(&page.connections.password)
+                        .id("proton-password")
+                        .aria_label("Bridge password"),
+                )
+                .child(
+                    primary("connect-proton", "Connect Bridge", t).on_click(cx.listener(
+                        |this, _, window, cx| this.connect_account(true, window, cx),
+                    )),
+                )
+                .into_any_element(),
+        );
     }
 
     div()
@@ -449,7 +500,7 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 .child(heading(
                     t,
                     "Connect an account",
-                    "Proton Bridge is discovered, never typed. Outlook opens a secure sign-in.",
+                    "Proton Bridge is found and connected for you. Outlook opens a secure sign-in.",
                 ))
                 .child(card(t, connect)),
         )

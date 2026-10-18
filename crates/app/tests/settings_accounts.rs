@@ -1,4 +1,4 @@
-//! Proton Bridge discovery on the Accounts settings page.
+//! Proton Bridge discovery on the Connections settings page.
 mod common;
 use common::{Fixture, mount};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
@@ -7,7 +7,7 @@ use kite_core::model::ProtonLogin;
 use std::time::Duration;
 
 #[gpui_kit::test]
-async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppContext) {
+async fn a_discovered_bridge_account_is_created_without_any_click(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     *fixture.discovered.lock().unwrap() = vec![ProtonLogin {
         email: "bridge@proton.me".into(),
@@ -17,34 +17,16 @@ async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppCon
         smtp_port: Some(1025),
     }];
     let (window, _) = mount(cx, fixture.clone());
-    cx.simulate_keystrokes(window.into(), "secondary-shift-,");
+    cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        // Opening Connections is the only action: discovery and creation follow.
         window.click(("settings-tab", 3usize), cx);
         window.render_frame(cx);
-        window.click("detect-proton", cx);
-    })
-    .unwrap();
-    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
-        window.try_find("connect-discovered-0").is_some()
-    })
-    .await;
-    cx.update_window(window.into(), |_, window, cx| {
-        window.render_frame(cx);
         assert!(
-            window.try_find("detecting-proton").is_none(),
-            "the busy state should clear after discovery"
+            window.try_find("proton-bridge-status").is_some(),
+            "the Connections page must show its Bridge status"
         );
-        assert_eq!(
-            window.find("found-proton-0").label(),
-            Some("Found bridge@proton.me")
-        );
-        assert!(
-            window.try_find("proton-username").is_none(),
-            "a discovered account must not ask for typing"
-        );
-        window.click("connect-discovered-0", cx);
-        window.render_frame(cx);
         window.click(("settings-tab", 2usize), cx);
     })
     .unwrap();
@@ -61,7 +43,6 @@ async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppCon
             window.find("settings-notice").label(),
             Some("Account connected")
         );
-        assert!(window.try_find("connect-discovered-0").is_none());
     })
     .unwrap();
     assert!(
@@ -71,7 +52,7 @@ async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppCon
             .unwrap()
             .iter()
             .any(|account| account.email == "bridge@proton.me"),
-        "the discovered account was not persisted"
+        "the discovered account was not created"
     );
 }
 
@@ -82,12 +63,10 @@ async fn failed_discovery_shows_the_error_and_the_manual_form_still_connects(
     let fixture = Fixture::showcase();
     *fixture.discover_error.lock().unwrap() = Some("Bridge vault is locked".into());
     let (window, _) = mount(cx, fixture.clone());
-    cx.simulate_keystrokes(window.into(), "secondary-shift-,");
+    cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(("settings-tab", 3usize), cx);
-        window.render_frame(cx);
-        window.click("detect-proton", cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -98,10 +77,6 @@ async fn failed_discovery_shows_the_error_and_the_manual_form_still_connects(
         assert_eq!(
             window.find("settings-error").label(),
             Some("Could not look for Proton Bridge: Bridge vault is locked")
-        );
-        assert!(
-            window.try_find("detecting-proton").is_none(),
-            "the busy state should clear after a failed discovery"
         );
         window.scroll(
             "settings-scroll",
