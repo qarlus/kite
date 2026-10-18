@@ -282,7 +282,8 @@ async fn tick(
     }
 }
 
-/// Drains queued ops, then syncs until backfill is exhausted. Returns whether the store changed.
+/// Drains queued ops, then syncs until backfill is exhausted. Synced batches are announced as they
+/// land; the return value says whether drained ops changed the store (announced by the tick).
 async fn sync_account(
     inner: &Inner,
     account: &Account,
@@ -319,16 +320,19 @@ async fn sync_account(
         let backend = backend_mut(backends, account.id)?;
         let (deltas, next) = backend.sync(cursor.clone()).await?;
         persist_tokens(inner, account.id, backend)?;
-        let more = !deltas.is_empty();
-        if more {
+        if !deltas.is_empty() {
             for chunk in deltas.chunks(APPLY_CHUNK) {
                 inner.write(|s| s.apply_deltas(account.id, chunk))?;
             }
-            changed = true;
+            // Show mail as it lands: a first sync can run many steps before the tick ends.
+            inner.emit(Event::Changed(vec![account.id]));
         }
+        // Keep going only while the cursor advances (backfill/paging). IMAP without CONDSTORE
+        // returns flag deltas on every call, so "got deltas" alone would loop every tick.
+        let advanced = cursor.as_deref() != Some(next.as_str());
         inner.write(|s| s.set_cursor(account.id, &next))?;
         cursor = Some(next);
-        if !more {
+        if deltas.is_empty() || !advanced {
             break;
         }
     }

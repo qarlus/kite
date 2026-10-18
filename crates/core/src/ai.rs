@@ -59,12 +59,14 @@ async fn request(
     }
 
     let mut stream = res.bytes_stream();
-    let mut buffer = String::new();
+    // Buffer bytes, not text: a multi-byte character can straddle two network chunks.
+    let mut buffer: Vec<u8> = Vec::new();
     while let Some(chunk) = stream.next().await {
-        buffer.push_str(&String::from_utf8_lossy(&chunk?));
-        while let Some(newline) = buffer.find('\n') {
-            let line = buffer[..newline].trim_end_matches('\r').to_string();
-            buffer.drain(..=newline);
+        buffer.extend_from_slice(&chunk?);
+        while let Some(newline) = buffer.iter().position(|b| *b == b'\n') {
+            let raw: Vec<u8> = buffer.drain(..=newline).collect();
+            let line = String::from_utf8_lossy(&raw);
+            let line = line.trim_end_matches(['\r', '\n']);
             let Some(data) = line.strip_prefix("data:") else {
                 continue;
             };
