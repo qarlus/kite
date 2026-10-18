@@ -18,7 +18,6 @@ use aes_gcm::Aes256Gcm;
 use aes_gcm::aead::{Aead, KeyInit};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
@@ -110,52 +109,34 @@ pub fn accounts_from_vault(vault: &Path, master_key: &[u8]) -> Result<Vec<Proton
     Ok(accounts)
 }
 
-/// Bridge's on-disk envelope.
-#[derive(Deserialize)]
-struct File {
-    #[serde(rename = "Version")]
-    version: u32,
-    #[serde(rename = "Data")]
-    data: Vec<u8>,
-}
-
 /// The decrypted vault. Go writes struct fields as msgpack map keys, so the names are literal.
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct Data {
-    #[serde(rename = "Settings", default)]
     settings: Settings,
-    #[serde(rename = "Users", default)]
     users: Vec<UserData>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Default)]
 struct Settings {
-    #[serde(rename = "IMAPPort", default)]
     imap_port: i64,
-    #[serde(rename = "SMTPPort", default)]
     smtp_port: i64,
 }
 
-#[derive(Deserialize)]
+#[derive(Default)]
 struct UserData {
-    #[serde(rename = "PrimaryEmail", default)]
     primary_email: String,
-    #[serde(rename = "BridgePass", default)]
     bridge_pass: Vec<u8>,
 }
 
 fn decrypt(bytes: &[u8], master_key: &[u8]) -> Result<Data> {
-    let file: File = rmp_serde::from_slice(bytes)
-        .context("it is not a Proton Bridge vault (unreadable msgpack envelope)")?;
-    if file.version != VAULT_VERSION {
+    let (version, envelope) = envelope(bytes)?;
+    if version != VAULT_VERSION {
         bail!(
-            "it uses vault format version {} but this version of Kite understands version \
-             {VAULT_VERSION}; update Kite, or add the account by hand",
-            file.version
+            "it uses vault format version {version} but this version of Kite understands version \
+             {VAULT_VERSION}; update Kite, or add the account by hand"
         );
     }
-    let (nonce, sealed) = file
-        .data
+    let (nonce, sealed) = envelope
         .split_first_chunk::<NONCE_LEN>()
         .context("it is truncated (no nonce)")?;
     let mut key = Sha256::digest(master_key);
@@ -166,9 +147,69 @@ fn decrypt(bytes: &[u8], master_key: &[u8]) -> Result<Data> {
     });
     key.as_mut_slice().fill(0);
     let mut plain = opened?;
-    let parsed: Data =
-        rmp_serde::from_slice(&plain).context("its contents are not valid msgpack")?;
+    let parsed = parse_data(&plain).context("its contents are not valid msgpack");
     plain.fill(0);
+    parsed
+}
+
+/// `File { Version, Data }`, the msgpack envelope around the sealed vault.
+fn envelope(bytes: &[u8]) -> Result<(u32, Vec<u8>)> {
+    let mut reader = msgpack::Reader::new(bytes);
+    let mut version = None;
+    let mut data = None;
+    reader
+        .map(|reader, key| {
+            match key {
+                "Version" => version = Some(reader.int()? as u32),
+                "Data" => data = Some(reader.bytes()?.to_vec()),
+                _ => reader.skip()?,
+            }
+            Ok(())
+        })
+        .context("it is not a Proton Bridge vault (unreadable msgpack envelope)")?;
+    match (version, data) {
+        (Some(version), Some(data)) => Ok((version, data)),
+        _ => bail!("it is not a Proton Bridge vault (missing Version or Data)"),
+    }
+}
+
+/// The decrypted `Data { Settings, Users }`. Every other field is skipped.
+fn parse_data(bytes: &[u8]) -> Result<Data> {
+    let mut reader = msgpack::Reader::new(bytes);
+    let mut parsed = Data::default();
+    reader.map(|reader, key| {
+        match key {
+            "Settings" => reader.map(|reader, key| match key {
+                "IMAPPort" => {
+                    parsed.settings.imap_port = reader.int()?;
+                    Ok(())
+                }
+                "SMTPPort" => {
+                    parsed.settings.smtp_port = reader.int()?;
+                    Ok(())
+                }
+                _ => reader.skip(),
+            })?,
+            "Users" => reader.array(|reader| {
+                let mut user = UserData::default();
+                reader.map(|reader, key| match key {
+                    "PrimaryEmail" => {
+                        user.primary_email = reader.str()?.to_string();
+                        Ok(())
+                    }
+                    "BridgePass" => {
+                        user.bridge_pass = reader.bytes()?.to_vec();
+                        Ok(())
+                    }
+                    _ => reader.skip(),
+                })?;
+                parsed.users.push(user);
+                Ok(())
+            })?,
+            _ => reader.skip()?,
+        }
+        Ok(())
+    })?;
     Ok(parsed)
 }
 
@@ -316,5 +357,216 @@ fn digit(byte: u8) -> Option<u8> {
         b'a'..=b'f' => Some(byte - b'a' + 10),
         b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
+    }
+}
+
+/// A read-only reader for the small msgpack subset the vault uses: string-keyed maps,
+/// integers, strings, byte strings and arrays. A general msgpack codec cost more binary
+/// than the 20 MB budget allowed, and this is the whole language we need.
+mod msgpack {
+    use anyhow::{Result, bail};
+
+    pub struct Reader<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Reader<'a> {
+        pub fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, at: 0 }
+        }
+
+        fn byte(&mut self) -> Result<u8> {
+            let byte = *self
+                .bytes
+                .get(self.at)
+                .ok_or_else(|| anyhow::anyhow!("unexpected end of input"))?;
+            self.at += 1;
+            Ok(byte)
+        }
+
+        fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+            let end = self
+                .at
+                .checked_add(len)
+                .ok_or_else(|| anyhow::anyhow!("length overflow"))?;
+            let slice = self
+                .bytes
+                .get(self.at..end)
+                .ok_or_else(|| anyhow::anyhow!("truncated value"))?;
+            self.at = end;
+            Ok(slice)
+        }
+
+        fn u16(&mut self) -> Result<u16> {
+            Ok(u16::from_be_bytes(self.take(2)?.try_into()?))
+        }
+
+        fn u32(&mut self) -> Result<u32> {
+            Ok(u32::from_be_bytes(self.take(4)?.try_into()?))
+        }
+
+        fn u64(&mut self) -> Result<u64> {
+            Ok(u64::from_be_bytes(self.take(8)?.try_into()?))
+        }
+
+        pub fn int(&mut self) -> Result<i64> {
+            let prefix = self.byte()?;
+            Ok(match prefix {
+                0x00..=0x7f => prefix as i64,
+                0xe0..=0xff => (prefix as i8) as i64,
+                0xcc => self.byte()? as i64,
+                0xcd => self.u16()? as i64,
+                0xce => self.u32()? as i64,
+                0xcf => self.u64()? as i64,
+                0xd0 => (self.byte()? as i8) as i64,
+                0xd1 => (self.u16()? as i16) as i64,
+                0xd2 => (self.u32()? as i32) as i64,
+                0xd3 => self.u64()? as i64,
+                _ => bail!("expected an integer, found 0x{prefix:02x}"),
+            })
+        }
+
+        pub fn str(&mut self) -> Result<&'a str> {
+            let prefix = self.byte()?;
+            let len = match prefix {
+                0xa0..=0xbf => (prefix & 0x1f) as usize,
+                0xd9 => self.byte()? as usize,
+                0xda => self.u16()? as usize,
+                0xdb => self.u32()? as usize,
+                _ => bail!("expected a string, found 0x{prefix:02x}"),
+            };
+            Ok(std::str::from_utf8(self.take(len)?)?)
+        }
+
+        /// A byte string. Go writes `[]byte` as bin, but str is accepted too.
+        pub fn bytes(&mut self) -> Result<&'a [u8]> {
+            let prefix = self.byte()?;
+            let len = match prefix {
+                0xc4 => self.byte()? as usize,
+                0xc5 => self.u16()? as usize,
+                0xc6 => self.u32()? as usize,
+                0xa0..=0xbf => (prefix & 0x1f) as usize,
+                0xd9 => self.byte()? as usize,
+                0xda => self.u16()? as usize,
+                0xdb => self.u32()? as usize,
+                _ => bail!("expected a byte string, found 0x{prefix:02x}"),
+            };
+            self.take(len)
+        }
+
+        pub fn map(&mut self, mut visit: impl FnMut(&mut Self, &'a str) -> Result<()>) -> Result<()> {
+            let prefix = self.byte()?;
+            let len = match prefix {
+                0x80..=0x8f => (prefix & 0x0f) as usize,
+                0xde => self.u16()? as usize,
+                0xdf => self.u32()? as usize,
+                _ => bail!("expected a map, found 0x{prefix:02x}"),
+            };
+            for _ in 0..len {
+                let key = self.str()?;
+                visit(self, key)?;
+            }
+            Ok(())
+        }
+
+        pub fn array(&mut self, mut visit: impl FnMut(&mut Self) -> Result<()>) -> Result<()> {
+            let prefix = self.byte()?;
+            let len = match prefix {
+                0x90..=0x9f => (prefix & 0x0f) as usize,
+                0xdc => self.u16()? as usize,
+                0xdd => self.u32()? as usize,
+                _ => bail!("expected an array, found 0x{prefix:02x}"),
+            };
+            for _ in 0..len {
+                visit(self)?;
+            }
+            Ok(())
+        }
+
+        /// Steps over any value, so unknown vault fields cannot break discovery.
+        pub fn skip(&mut self) -> Result<()> {
+            let prefix = self.byte()?;
+            match prefix {
+                0x00..=0x7f | 0xe0..=0xff | 0xc0 | 0xc2 | 0xc3 => {}
+                0xcc | 0xd0 => {
+                    self.take(1)?;
+                }
+                0xcd | 0xd1 => {
+                    self.take(2)?;
+                }
+                0xce | 0xd2 | 0xca => {
+                    self.take(4)?;
+                }
+                0xcf | 0xd3 | 0xcb => {
+                    self.take(8)?;
+                }
+                0xa0..=0xbf => {
+                    self.take((prefix & 0x1f) as usize)?;
+                }
+                0xd9 | 0xc4 => {
+                    let len = self.byte()? as usize;
+                    self.take(len)?;
+                }
+                0xda | 0xc5 => {
+                    let len = self.u16()? as usize;
+                    self.take(len)?;
+                }
+                0xdb | 0xc6 => {
+                    let len = self.u32()? as usize;
+                    self.take(len)?;
+                }
+                0x90..=0x9f => {
+                    for _ in 0..(prefix & 0x0f) {
+                        self.skip()?;
+                    }
+                }
+                0xdc | 0xdd => {
+                    let len = if prefix == 0xdc {
+                        self.u16()? as usize
+                    } else {
+                        self.u32()? as usize
+                    };
+                    for _ in 0..len {
+                        self.skip()?;
+                    }
+                }
+                0x80..=0x8f => {
+                    for _ in 0..(prefix & 0x0f) {
+                        self.skip()?;
+                        self.skip()?;
+                    }
+                }
+                0xde | 0xdf => {
+                    let len = if prefix == 0xde {
+                        self.u16()? as usize
+                    } else {
+                        self.u32()? as usize
+                    };
+                    for _ in 0..len {
+                        self.skip()?;
+                        self.skip()?;
+                    }
+                }
+                0xd4..=0xd8 => {
+                    let payload = 1usize << (prefix - 0xd4);
+                    self.take(1 + payload)?;
+                }
+                0xc7 => {
+                    let len = self.byte()? as usize;
+                    self.take(1 + len)?;
+                }
+                0xc8 => {
+                    let len = self.u16()? as usize;
+                    self.take(1 + len)?;
+                }
+                0xc9 => {
+                    let len = self.u32()? as usize;
+                    self.take(1 + len)?;
+                }
+                _ => bail!("unsupported msgpack value 0x{prefix:02x}"),
+            }
+            Ok(())
+        }
     }
 }
