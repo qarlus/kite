@@ -20,6 +20,8 @@ async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppCon
     cx.simulate_keystrokes(window.into(), "secondary-shift-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         window.click("detect-proton", cx);
     })
     .unwrap();
@@ -42,6 +44,8 @@ async fn a_discovered_bridge_account_connects_without_typing(cx: &mut TestAppCon
             "a discovered account must not ask for typing"
         );
         window.click("connect-discovered-0", cx);
+        window.render_frame(cx);
+        window.click(("settings-tab", 2usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -81,6 +85,8 @@ async fn failed_discovery_shows_the_error_and_the_manual_form_still_connects(
     cx.simulate_keystrokes(window.into(), "secondary-shift-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         window.click("detect-proton", cx);
     })
     .unwrap();
@@ -114,6 +120,8 @@ async fn failed_discovery_shows_the_error_and_the_manual_form_still_connects(
         );
         window.render_frame(cx);
         window.click("connect-proton", cx);
+        window.render_frame(cx);
+        window.click(("settings-tab", 2usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {

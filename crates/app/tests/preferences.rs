@@ -109,6 +109,8 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
                 .try_find("settings-error")
                 .and_then(|e| e.label().map(str::to_owned))
         );
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         window.click("font-larger", cx);
         window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
@@ -129,6 +131,8 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
     cx.update_window(reopened.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("theme-linen").selected(), Some(true));
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
     })
     .unwrap();
@@ -222,6 +226,8 @@ fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         window.scroll(
             "settings-scroll",
             ScrollDelta::Pixels(point(px(0.), px(-480.))),
@@ -285,7 +291,7 @@ fn the_general_tab_controls_undo_send_and_the_chrome_keeps_shortcuts(cx: &mut Te
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         window.click("undo-send-10", cx);
         window.click("close-settings", cx);
@@ -309,9 +315,12 @@ async fn account_connect_and_confirmed_remove_update_settings_and_switcher(
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 3usize), cx);
         window.render_frame(cx);
         window.click("add-microsoft", cx);
+        window.render_frame(cx);
+        // The connected row lives on the Accounts section.
+        window.click(("settings-tab", 2usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -359,7 +368,7 @@ async fn failed_account_connection_is_not_reported_as_success(cx: &mut TestAppCo
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 3usize), cx);
         window.render_frame(cx);
         window.click("add-microsoft", cx);
     })
@@ -459,6 +468,8 @@ async fn changing_text_size_reflows_an_already_open_html_message(cx: &mut TestAp
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         window.click("font-larger", cx);
         window.render_frame(cx);
         window.click("font-larger", cx);
@@ -484,6 +495,8 @@ async fn bridge_errors_clear_the_password_and_require_reentry(cx: &mut TestAppCo
     let (window, _) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-shift-,");
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
         window.render_frame(cx);
         window.click("add-proton", cx);
         window.render_frame(cx);
@@ -550,4 +563,40 @@ fn a_failed_save_keeps_the_applied_theme_and_explains_the_error(cx: &mut TestApp
     })
     .unwrap();
     assert_eq!(fixture.settings.lock().unwrap().theme, "dark");
+}
+
+#[gpui_kit::test]
+fn every_settings_section_opens_from_the_rail(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // (rail index, an element only that section renders)
+        let sections: [(usize, &str); 7] = [
+            (0, "theme-dark"),
+            (1, "font-size-value"),
+            (2, "settings-account-1"),
+            (3, "detect-proton"),
+            (4, "undo-send-10"),
+            (5, "remote-images"),
+            (6, "ai-enabled"),
+        ];
+        for (index, marker) in sections {
+            let tab = window.find(("settings-tab", index));
+            window.click(("settings-tab", index), cx);
+            window.render_frame(cx);
+            assert_eq!(
+                window.find(("settings-tab", index)).selected(),
+                Some(true),
+                "section {index} was not selected"
+            );
+            assert!(
+                window.try_find(marker).is_some(),
+                "section {index} ({:?}) did not render {marker}",
+                tab.label()
+            );
+        }
+    })
+    .unwrap();
 }

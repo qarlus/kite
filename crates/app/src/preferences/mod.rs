@@ -3,8 +3,12 @@
 //! Preferences stay behind the Mail boundary; provider work never runs on the UI thread.
 //! Each page owns its own file and state so a page can change without touching the shell.
 pub mod accounts;
+pub mod ai;
 pub mod appearance;
+pub mod connections;
 pub mod general;
+pub mod privacy;
+pub mod typography;
 
 use crate::app::{Kite, Overlay};
 use crate::theme::{self, RADIUS, RADIUS_SM, Theme};
@@ -14,11 +18,20 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::Settings;
 
+/// Rail indices, shared with the shortcuts and the sidebar so they cannot drift.
+pub const OPEN_APPEARANCE: usize = 0;
+pub const OPEN_ACCOUNTS: usize = 2;
+pub const OPEN_CONNECTIONS: usize = 3;
+
 pub struct Preferences {
     pub tab: usize,
     pub appearance: appearance::State,
+    pub typography: typography::State,
     pub accounts: accounts::State,
+    pub connections: connections::State,
     pub general: general::State,
+    pub privacy: privacy::State,
+    pub ai: ai::State,
     pub error: Option<String>,
     pub notice: Option<String>,
     /// Identifies this page instance so a slow account request cannot update a newer one.
@@ -29,11 +42,20 @@ pub struct Preferences {
 pub const TEMPLATE: &str = "{\n  \"name\": \"My midnight\",\n  \"base\": \"dark\",\n  \"colors\": {\n    \"bg\": \"#101820\",\n    \"bg2\": \"#16212b\",\n    \"accent\": \"#77c5dc\"\n  }\n}";
 
 /// `(index, rail label, page subtitle, icon)`. The index is the id the tests and shortcuts use.
-fn tabs() -> [(usize, &'static str, &'static str, IconName); 3] {
+fn tabs() -> [(usize, &'static str, &'static str, IconName); 7] {
     [
-        (0, "Appearance", "Palette, type and density", IconName::Palette),
-        (1, "Accounts", "Every mailbox in one place", IconName::CircleUser),
-        (2, "General", "Defaults for the everyday", IconName::Settings2),
+        (0, "Appearance", "Colours and palette", IconName::Palette),
+        (1, "Typography", "Type, size and colour", IconName::ALargeSmall),
+        (2, "Accounts", "Mailboxes connected to Kite", IconName::CircleUser),
+        (
+            3,
+            "Connections",
+            "Proton Bridge and Outlook",
+            IconName::Network,
+        ),
+        (4, "General", "Everyday defaults", IconName::Settings2),
+        (5, "Privacy", "Remote images and tracking", IconName::EyeOff),
+        (6, "AI", "Writing and summaries", IconName::Bot),
     ]
 }
 
@@ -53,9 +75,13 @@ impl Kite {
             let settings = self.settings.clone();
             self.preferences = Some(Preferences {
                 tab,
-                appearance: appearance::State::new(&settings, window, cx),
-                accounts: accounts::State::new(window, cx),
-                general: general::State::new(&settings, window, cx),
+                appearance: appearance::State,
+                typography: typography::State::new(&settings, window, cx),
+                accounts: accounts::State::default(),
+                connections: connections::State::new(window, cx),
+                general: general::State,
+                privacy: privacy::State,
+                ai: ai::State::new(&settings, window, cx),
                 error: None,
                 notice: None,
                 request,
@@ -207,12 +233,16 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
     let t = kite.theme;
     let compact = window.viewport_size().width < px(1000.);
     let rail = if compact { px(56.) } else { px(200.) };
-    let (_, title, subtitle, _) = tabs()[page.tab.min(2)];
+    let (_, title, subtitle, _) = tabs()[page.tab.min(6)];
     let inset = if compact { px(24.) } else { px(40.) };
 
     let body = match page.tab {
-        1 => accounts::render(kite, window, cx),
-        2 => general::render(kite, window, cx),
+        1 => typography::render(kite, window, cx),
+        2 => accounts::render(kite, window, cx),
+        3 => connections::render(kite, window, cx),
+        4 => general::render(kite, window, cx),
+        5 => privacy::render(kite, window, cx),
+        6 => ai::render(kite, window, cx),
         _ => appearance::render(kite, window, cx),
     };
 
@@ -351,6 +381,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         .aria_label(label)
                         .aria_selected(active)
                         .h(px(34.))
+                        .flex_shrink_0()
                         .rounded(px(RADIUS_SM))
                         .px_2()
                         .flex()

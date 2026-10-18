@@ -50,6 +50,8 @@ fn choosing_a_theme_and_a_larger_text_size_persists_across_a_reopen(cx: &mut Tes
         window.render_frame(cx);
         assert_eq!(window.find("theme-midnight").selected(), Some(true));
         assert_eq!(window.find("theme-dark").selected(), Some(false));
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         window.click("font-larger", cx);
         window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
@@ -69,6 +71,8 @@ fn choosing_a_theme_and_a_larger_text_size_persists_across_a_reopen(cx: &mut Tes
         window.render_frame(cx);
         assert_eq!(window.find("theme-midnight").selected(), Some(true));
         assert_eq!(window.find("theme-dark").selected(), Some(false));
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
         assert_eq!(
             window.find("typography-preview").label(),
@@ -84,6 +88,8 @@ fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut
     let (window, _) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
         window.render_frame(cx);
         assert_eq!(
             window.find("font-color-swatch").label(),

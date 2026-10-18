@@ -399,7 +399,7 @@ impl Sidebar {
                 this.parent
                     .update(cx, |kite, cx| {
                         if kite.accounts.is_empty() {
-                            kite.show_preferences(1, window, cx);
+                            kite.show_preferences(crate::preferences::OPEN_CONNECTIONS, window, cx);
                         } else {
                             kite.run(crate::keys::cmd::ACCOUNT_SWITCHER, window, cx);
                         }
@@ -532,7 +532,7 @@ pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
             .child("Manage accounts")
             .on_click(cx.listener(|this, _, window, cx| {
                 this.overlay = crate::app::Overlay::None;
-                this.show_preferences(1, window, cx);
+                this.show_preferences(crate::preferences::OPEN_ACCOUNTS, window, cx);
             })),
     );
     div()

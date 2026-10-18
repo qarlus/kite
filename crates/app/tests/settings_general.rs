@@ -4,12 +4,16 @@ use common::{Fixture, mount, open_window};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, ScrollDelta, TestAppContext, point, px};
 
-/// Opens Settings on the General tab.
-fn open_general(window: gpui_kit::WindowHandle<gpui_kit::base::Root>, cx: &mut TestAppContext) {
+/// Opens Settings on the given rail section.
+fn open_section(
+    window: gpui_kit::WindowHandle<gpui_kit::base::Root>,
+    cx: &mut TestAppContext,
+    index: usize,
+) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", index), cx);
         window.render_frame(cx);
     })
     .unwrap();
@@ -29,7 +33,7 @@ fn scroll_to_bottom(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
 fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_general(window, cx);
+    open_section(window, cx, 5);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("remote-images").checked(), Some(false));
@@ -45,7 +49,7 @@ fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) 
 fn ai_settings_persist_and_the_key_goes_to_the_keychain(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_general(window, cx);
+    open_section(window, cx, 6);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
@@ -93,7 +97,7 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         let page = window.find("settings-page").bounds();
         for seconds in [0, 5, 10, 20, 30] {
@@ -108,10 +112,10 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn typing_in_general_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
+fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_general(window, cx);
+    open_section(window, cx, 6);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         scroll_to_bottom(window, cx);

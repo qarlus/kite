@@ -619,11 +619,11 @@ impl Kite {
             return;
         }
         if id == cmd::MANAGE_ACCOUNTS {
-            self.show_preferences(1, window, cx);
+            self.show_preferences(crate::preferences::OPEN_ACCOUNTS, window, cx);
             return;
         }
         if id == cmd::SETTINGS {
-            self.show_preferences(0, window, cx);
+            self.show_preferences(crate::preferences::OPEN_APPEARANCE, window, cx);
             return;
         }
         if id == cmd::ACCOUNT_SWITCHER {
