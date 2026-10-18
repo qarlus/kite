@@ -63,16 +63,30 @@ fn go_sequences_switch_mailbox(cx: &mut TestAppContext) {
     let fixture = Fixture::new(3);
     let (window, kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "g i");
-    update_content(window, &kite, cx, |kite, _, _| {
-        assert_eq!(kite.view().mailbox, Mailbox::Inbox)
+    update_content(window, &kite, cx, |kite, window, _| {
+        assert_eq!(kite.view().mailbox, Mailbox::Inbox);
+        assert_eq!(kite.view().split, Some(common::SPLITS[0]));
+        assert_eq!(window.find(("tab", 0usize)).selected(), Some(true));
     });
     cx.simulate_keystrokes(window.into(), "g s");
     update_content(window, &kite, cx, |kite, _, _| {
         assert_eq!(kite.view().mailbox, Mailbox::Starred)
     });
     cx.simulate_keystrokes(window.into(), "g t");
-    update_content(window, &kite, cx, |kite, _, _| {
-        assert_eq!(kite.view().mailbox, Mailbox::Sent)
+    update_content(window, &kite, cx, |kite, window, _| {
+        assert_eq!(kite.view().mailbox, Mailbox::Sent);
+        // The strip only belongs to the inbox, so no tab is on screen here.
+        assert!(window.try_find(("tab", 0usize)).is_none());
+    });
+    // Coming back through the sidebar selects the inbox lens again.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(("mailbox", Mailbox::Inbox as usize), cx);
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, window, _| {
+        assert_eq!(kite.view().mailbox, Mailbox::Inbox);
+        assert_eq!(kite.view().split, Some(common::SPLITS[0]));
+        assert_eq!(window.find(("tab", 0usize)).selected(), Some(true));
     });
     cx.simulate_keystrokes(window.into(), "secondary-1");
     update_content(window, &kite, cx, |kite, _, _| {

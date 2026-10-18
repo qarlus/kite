@@ -17,9 +17,9 @@ use std::sync::{Arc, Mutex};
 pub const SPLITS: [Id; 4] = [1, 2, 3, 4];
 /// The seeded split set, in tab order: the plain inbox lens, then the categories.
 pub const SPLIT_NAMES: [&str; 4] = ["Inbox", "Social", "Newsletters", "GitHub"];
-/// Comma inside `from:` means OR, matching the engine's term syntax.
-pub const SOCIAL_QUERY: &str =
-    "from:facebook.com,instagram.com,linkedin.com,x.com,youtube.com,tiktok.com";
+/// Comma inside `from:` means OR, matching the engine's term syntax. Mirrors the
+/// shipped `DEFAULT_SPLITS` seed so the fixture cannot drift from the product.
+pub const SOCIAL_QUERY: &str = "from:linkedin.com,x.com,twitter.com,facebook.com,instagram.com,threads.net,bsky.app,mastodon.social";
 pub const NEWSLETTER_QUERY: &str = "is:newsletter";
 pub const GITHUB_QUERY: &str = "from:github.com";
 /// The HTML body served for even-numbered threads.
