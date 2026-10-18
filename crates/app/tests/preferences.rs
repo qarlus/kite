@@ -270,7 +270,7 @@ fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
 }
 
 #[gpui_kit::test]
-fn general_settings_control_the_actual_footer(cx: &mut TestAppContext) {
+fn the_general_tab_controls_undo_send_and_the_chrome_keeps_shortcuts(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-,");
@@ -278,17 +278,14 @@ fn general_settings_control_the_actual_footer(cx: &mut TestAppContext) {
         window.render_frame(cx);
         window.click(("settings-tab", 2usize), cx);
         window.render_frame(cx);
-        window.click("toggle-shortcuts", cx);
         window.click("undo-send-10", cx);
         window.click("close-settings", cx);
         window.render_frame(cx);
-        assert!(window.try_find("shortcut-help").is_none());
-        window.click("open-settings", cx);
+        // Keyboard help is a chrome entry now, not a strip across the mail pane.
+        assert!(window.try_find("shortcut-help").is_some());
+        window.click("shortcut-help", cx);
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
-        window.render_frame(cx);
-        assert_eq!(window.find("toggle-shortcuts").label(), Some("Off"));
-        assert_eq!(window.find("undo-send-10").selected(), Some(true));
+        assert!(window.try_find("help").is_some());
     })
     .unwrap();
     assert_eq!(fixture.settings.lock().unwrap().undo_send_secs, 10);

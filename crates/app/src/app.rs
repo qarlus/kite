@@ -375,6 +375,15 @@ impl Kite {
 
     // ---- commands -------------------------------------------------------------
 
+    pub(crate) fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cmd = if self.preferences.is_some() {
+            cmd::BACK
+        } else {
+            cmd::SETTINGS
+        };
+        self.run(cmd, window, cx);
+    }
+
     fn next(&mut self, delta: isize, cx: &mut Context<Self>) {
         if self.rows.is_empty() {
             return;
@@ -929,54 +938,7 @@ impl Kite {
 
     fn render_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
-        let active = self
-            .tabs
-            .iter()
-            .position(|tab| tab.split == self.view.split)
-            .unwrap_or(0);
         let focused = self.search.read(cx).focus_handle(cx).is_focused(window);
-        let tabs: Vec<AnyElement> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .map(|(ix, tab)| {
-                let selected = ix == active;
-                div()
-                    .id(("tab", ix))
-                    .test_support()
-                    .aria_label(tab.name.clone())
-                    .aria_selected(selected)
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .h_full()
-                    .px_3()
-                    .cursor_pointer()
-                    .text_size(t.px(13.))
-                    .font_weight(if selected {
-                        FontWeight(650.)
-                    } else {
-                        FontWeight::MEDIUM
-                    })
-                    .text_color(if selected { t.fg } else { t.fg2 })
-                    .hover(|s| s.text_color(t.fg).bg(t.bg3))
-                    .on_click(cx.listener(move |this, _, _, cx| this.select_split(ix, cx)))
-                    .child(tab.name.clone())
-                    .when(selected, |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_3()
-                                .right_3()
-                                .h(px(2.))
-                                .rounded_full()
-                                .bg(theme::accent_glow(&t)),
-                        )
-                    })
-                    .into_any_element()
-            })
-            .collect();
         TitleBar::new()
             .h(px(BAR_H))
             .bg(t.bg)
@@ -989,19 +951,7 @@ impl Kite {
                     .min_w_0()
                     .h_full()
                     .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .w(px(crate::sidebar::width(window) - 24.))
-                            .px_3()
-                            .text_size(t.px(14.))
-                            .font_weight(FontWeight(650.))
-                            .child("Kite"),
-                    )
-                    .when(
-                        self.view.mailbox == Mailbox::Inbox && self.preferences.is_none(),
-                        |d| d.child(div().flex().h_full().items_center().children(tabs)),
-                    )
+                    .gap_2()
                     .child(div().flex_1())
                     .when(self.preferences.is_none(), |d| {
                         d.child(
@@ -1038,32 +988,79 @@ impl Kite {
                                 ),
                         )
                         .child(
+                            // Keyboard help lives in the chrome, beside search.
                             div()
-                                .id("palette-hint")
+                                .id("shortcut-help")
                                 .test_support()
-                                .aria_label("Command palette")
+                                .aria_label("Keyboard shortcuts")
                                 .flex()
                                 .items_center()
                                 .justify_center()
-                                .h(px(30.))
-                                .px_2()
+                                .size(px(30.))
                                 .rounded(px(RADIUS_SM))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(t.bg3))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.run(cmd::PALETTE, window, cx)
+                                    this.run(cmd::HELP, window, cx)
                                 }))
-                                .when_some(
-                                    Kbd::binding_for_action(
-                                        &Act { cmd: cmd::PALETTE },
-                                        Some("Kite"),
-                                        window,
-                                    ),
-                                    |d, hint| d.child(hint.outline()),
+                                .child(
+                                    div()
+                                        .text_size(t.px(14.))
+                                        .font_weight(FontWeight(650.))
+                                        .text_color(t.fg2)
+                                        .child("?"),
                                 ),
                         )
                     }),
             )
+    }
+
+    /// The inbox splits, as icon tabs directly above the mailbox heading.
+    fn split_tabs(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        div().flex().items_center().gap_5().pb_4().children(
+            self.tabs
+                .iter()
+                .enumerate()
+                .filter(|(_, tab)| tab.split.is_some())
+                .map(|(ix, tab)| {
+                    let selected = tab.split == self.view.split;
+                    div()
+                        .id(("tab", ix))
+                        .test_support()
+                        .aria_label(tab.name.clone())
+                        .aria_selected(selected)
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .pb_2()
+                        .cursor_pointer()
+                        .text_size(t.px(13.))
+                        .font_weight(if selected {
+                            FontWeight(650.)
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(if selected { t.fg } else { t.fg2 })
+                        .hover(|s| s.text_color(t.fg))
+                        .child(Icon::new(split_icon(&tab.name)).with_size(px(14.)))
+                        .child(tab.name.clone())
+                        .when(selected, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .bottom_0()
+                                    .left_0()
+                                    .right_0()
+                                    .h(px(2.))
+                                    .rounded_full()
+                                    .bg(theme::accent_glow(&t)),
+                            )
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| this.select_split(ix, cx)))
+                }),
+        )
     }
 
     fn render_inbox_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1111,135 +1108,95 @@ impl Kite {
             .aria_label(title.to_string())
             .flex()
             .flex_shrink_0()
-            .items_center()
-            .justify_between()
+            .flex_col()
             .px_8()
             .py_6()
+            .when(
+                self.view.mailbox == Mailbox::Inbox
+                    && self.view.folder.is_none()
+                    && self.view.query.is_none(),
+                |d| d.child(self.split_tabs(cx)),
+            )
             .child(
                 div()
+                    .flex()
                     .flex_1()
                     .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .items_center()
+                    .justify_between()
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .text_size(t.px(24.))
-                            .font_weight(FontWeight(650.))
-                            .child(title.to_string()),
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(t.px(24.))
+                                    .font_weight(FontWeight(650.))
+                                    .child(title.to_string()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.px(12.))
+                                    .text_color(t.fg2)
+                                    .child(identity.to_string()),
+                            ),
                     )
                     .child(
                         div()
-                            .text_size(t.px(12.))
-                            .text_color(t.fg2)
-                            .child(identity.to_string()),
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .when(!self.rows.is_empty(), |d| {
+                                d.when(
+                                    !self.multi.is_empty()
+                                        || window.viewport_size().width >= px(1000.),
+                                    |d| {
+                                        d.child(
+                                            div()
+                                                .text_size(t.px(12.))
+                                                .text_color(t.fg2)
+                                                .child(summary),
+                                        )
+                                    },
+                                )
+                                .child(div().w(px(1.)).h(px(18.)).bg(t.line))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .child(self.action_icon(
+                                            cmd::DONE,
+                                            IconName::Archive,
+                                            "Mark done (e)",
+                                            cx,
+                                        ))
+                                        .child(self.action_icon(
+                                            cmd::SNOOZE,
+                                            IconName::Clock,
+                                            "Snooze (h)",
+                                            cx,
+                                        ))
+                                        .child(self.action_icon(
+                                            cmd::MOVE,
+                                            IconName::FolderInput,
+                                            "Move to folder (l)",
+                                            cx,
+                                        ))
+                                        .child(self.action_icon(
+                                            cmd::STAR,
+                                            IconName::Star,
+                                            "Star (s)",
+                                            cx,
+                                        )),
+                                )
+                            }),
                     ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .when(!self.rows.is_empty(), |d| {
-                        d.when(
-                            !self.multi.is_empty() || window.viewport_size().width >= px(1000.),
-                            |d| {
-                                d.child(div().text_size(t.px(12.)).text_color(t.fg2).child(summary))
-                            },
-                        )
-                        .child(div().w(px(1.)).h(px(18.)).bg(t.line))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .child(self.action_icon(
-                                    cmd::DONE,
-                                    IconName::Archive,
-                                    "Mark done (e)",
-                                    cx,
-                                ))
-                                .child(self.action_icon(
-                                    cmd::SNOOZE,
-                                    IconName::Clock,
-                                    "Snooze (h)",
-                                    cx,
-                                ))
-                                .child(self.action_icon(
-                                    cmd::MOVE,
-                                    IconName::FolderInput,
-                                    "Move to folder (l)",
-                                    cx,
-                                ))
-                                .child(self.action_icon(cmd::STAR, IconName::Star, "Star (s)", cx)),
-                        )
-                    }),
-            )
-    }
-
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = self.theme;
-        div()
-            .flex()
-            .flex_shrink_0()
-            .items_center()
-            .justify_between()
-            .h(px(38.))
-            .px_8()
-            .border_t_1()
-            .border_color(t.line)
-            .text_size(t.px(12.))
-            .text_color(t.fg2)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(crate::list::keys_pills(&t, "j k"))
-                            .child("Navigate"),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(crate::list::keys_pills(
-                                &t,
-                                if self.open.is_some() { "u" } else { "enter" },
-                            ))
-                            .child(if self.open.is_some() { "Back" } else { "Open" }),
-                    )
-                    .when(!self.rows.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(crate::list::keys_pills(&t, "e"))
-                                .child("Done"),
-                        )
-                    }),
-            )
-            .child(
-                div()
-                    .id("shortcut-help")
-                    .test_support()
-                    .aria_label("Keyboard shortcuts")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(t.fg))
-                    .on_click(cx.listener(|this, _, window, cx| this.run(cmd::HELP, window, cx)))
-                    .child("Shortcuts")
-                    .child(crate::list::keys_pills(&t, "shift-/")),
             )
     }
 
@@ -1312,6 +1269,21 @@ impl Kite {
                 )
                 .into_any_element(),
         )
+    }
+}
+
+/// Splits arrive as a name and a query, so the icon is chosen from the name.
+fn split_icon(name: &str) -> IconName {
+    if name.eq_ignore_ascii_case("important") {
+        IconName::Asterisk
+    } else if name.eq_ignore_ascii_case("social") {
+        IconName::CircleUser
+    } else if name.eq_ignore_ascii_case("promotions") {
+        IconName::Heart
+    } else if name.eq_ignore_ascii_case("newsletters") {
+        IconName::BookOpen
+    } else {
+        IconName::Ellipsis
     }
 }
 
@@ -1429,9 +1401,6 @@ impl Render for Kite {
                             ),
                     ),
             )
-            .when(self.settings.show_shortcuts && !preferences_open, |d| {
-                d.child(self.render_footer(cx))
-            })
             .children(self.render_overlay(window, cx))
             .children(self.render_toast(window))
     }

@@ -114,11 +114,11 @@ fn palette_opens_filters_and_runs_the_selected_command(cx: &mut TestAppContext) 
     let (window, kite) = mount(cx, fixture.clone());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let hint = window.find("palette-hint");
-        assert_eq!(hint.label(), Some("Command palette"));
+        let help = window.find("shortcut-help");
+        assert_eq!(help.label(), Some("Keyboard shortcuts"));
         assert!(
-            hint.bounds().size.width > gpui_kit::px(0.),
-            "the bar paints the palette shortcut pill"
+            help.bounds().size.width > gpui_kit::px(0.),
+            "the chrome paints the shortcuts entry"
         );
     })
     .unwrap();

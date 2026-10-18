@@ -268,31 +268,6 @@ impl Render for Sidebar {
                     .mt_2()
                     .border_t_1()
                     .border_color(t.line)
-                    .child(
-                        div()
-                            .id("open-settings")
-                            .test_support()
-                            .aria_label("Settings")
-                            .aria_selected(self.settings_open)
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .px_3()
-                            .h(px(36.))
-                            .rounded(px(RADIUS_SM))
-                            .cursor_pointer()
-                            .text_size(t.px(13.))
-                            .text_color(t.fg2)
-                            .when(self.settings_open, |d| d.bg(t.sel).text_color(t.fg))
-                            .hover(|s| s.bg(t.bg3))
-                            .child(Icon::new(IconName::Settings).with_size(px(16.)))
-                            .child("Settings")
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.parent
-                                    .update(cx, |kite, cx| kite.show_preferences(0, window, cx))
-                                    .ok();
-                            })),
-                    )
                     .child(self.switcher(cx)),
             )
             .into_any_element()
@@ -310,7 +285,7 @@ impl Sidebar {
             .map(|a| a.name.as_str())
             .filter(|name| !name.is_empty())
             .unwrap_or(if self.accounts.is_empty() {
-                "Your workspace"
+                "Your emails"
             } else {
                 "All inboxes"
             });
@@ -367,7 +342,8 @@ impl Sidebar {
                     )
                     .into_any_element()
             } else {
-                avatar(title, t).into_any_element()
+                // No account yet: a neutral avatar rather than the wording's initials.
+                avatar(if self.accounts.is_empty() { "" } else { title }, t).into_any_element()
             })
             .child(
                 div()
@@ -392,9 +368,32 @@ impl Sidebar {
                     ),
             )
             .child(
-                Icon::new(IconName::ChevronsUpDown)
-                    .with_size(px(13.))
-                    .text_color(t.fg3),
+                // The only Settings entry: to the right of the account identity.
+                div()
+                    .id("open-settings")
+                    .test_support()
+                    .aria_label("Settings")
+                    .aria_selected(self.settings_open)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(26.))
+                    .flex_shrink_0()
+                    .rounded(px(RADIUS_SM))
+                    .cursor_pointer()
+                    .when(self.settings_open, |d| d.bg(t.sel))
+                    .when(!self.settings_open, |d| d.hover(|s| s.bg(t.bg3)))
+                    .child(
+                        Icon::new(IconName::Settings)
+                            .with_size(px(15.))
+                            .text_color(if self.settings_open { t.fg } else { t.fg2 }),
+                    )
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        cx.stop_propagation();
+                        this.parent
+                            .update(cx, |kite, cx| kite.toggle_settings(window, cx))
+                            .ok();
+                    })),
             )
             .on_click(cx.listener(|this, _, window, cx| {
                 this.parent
@@ -418,6 +417,13 @@ fn avatar(name: &str, theme: Theme) -> Div {
         .take(2)
         .collect::<String>()
         .to_uppercase();
+    let body: AnyElement = if initials.is_empty() {
+        Icon::new(IconName::CircleUser)
+            .with_size(px(15.))
+            .into_any_element()
+    } else {
+        initials.into_any_element()
+    };
     div()
         .size(px(30.))
         .flex_shrink_0()
@@ -429,7 +435,7 @@ fn avatar(name: &str, theme: Theme) -> Div {
         .justify_center()
         .text_size(theme.px(11.))
         .font_weight(FontWeight(650.))
-        .child(initials)
+        .child(body)
 }
 
 pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
@@ -445,13 +451,7 @@ pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
         .aria_label("Switch account")
         .absolute()
         .left(px(12.))
-        .bottom(px(
-            if kite.settings.show_shortcuts && kite.preferences.is_none() {
-                104.
-            } else {
-                66.
-            },
-        ))
+        .bottom(px(66.))
         .w(px(280.))
         .max_h(window.viewport_size().height - px(130.))
         .overflow_y_scroll()

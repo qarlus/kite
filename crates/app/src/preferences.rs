@@ -487,7 +487,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 .text_size(t.px(10.))
                                 .font_weight(FontWeight(650.))
                                 .text_color(t.accent)
-                                .child("YOUR WORKSPACE"),
+                                .child("YOUR EMAIL"),
                         )
                         .child(
                             div()
@@ -946,41 +946,6 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                 "A few useful defaults",
                 "Small choices that make the everyday feel effortless.",
             ));
-            content = content.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(div().text_size(t.px(14.)).child("Keyboard hints"))
-                            .child(
-                                div()
-                                    .text_size(t.px(12.))
-                                    .text_color(t.fg2)
-                                    .child("Show the shortcut guide along the bottom edge."),
-                            ),
-                    )
-                    .child(
-                        button(
-                            "toggle-shortcuts",
-                            if kite.settings.show_shortcuts {
-                                "On"
-                            } else {
-                                "Off"
-                            },
-                            t,
-                        )
-                        .aria_selected(kite.settings.show_shortcuts)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let mut settings = this.settings.clone();
-                            settings.show_shortcuts = !settings.show_shortcuts;
-                            this.save_preferences(settings, window, cx);
-                        })),
-                    ),
-            );
             content = content.child(div().h(px(1.)).bg(t.line)).child(heading(
                 t,
                 "Undo send",
