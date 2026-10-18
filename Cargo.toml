@@ -16,9 +16,10 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gpui-kit = "=0.7.3"
-blitz-dom = "=0.3.0-beta.4"
+# Blitz defaults pull duplicate usvg/accesskit and ICU/WOFF code that mail rendering never uses.
+blitz-dom = { version = "=0.3.0-beta.4", default-features = false, features = ["system-fonts"] }
 blitz-html = "=0.3.0-beta.4"
-blitz-paint = "=0.3.0-beta.4"
+blitz-paint = { version = "=0.3.0-beta.4", default-features = false }
 blitz-traits = "=0.3.0-beta.4"
 anyrender = "0.14"
 anyrender_vello_cpu = "0.18"
@@ -57,3 +58,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Fast-building stand-in for release when iterating on perf budgets: thin LTO over
+# parallel codegen units builds several times faster than fat LTO with 1 unit.
+# Ship and measure the size budget with `release` only.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 16

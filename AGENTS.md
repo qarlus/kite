@@ -48,6 +48,8 @@ cargo test --workspace                 # all tests
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --release       # perf budgets are only asserted in release
 cargo build --release -p kite          # target/release/kite(.exe)
+# Faster perf-budget loop (thin LTO); confirm with --release before merging:
+cargo test --profile perf -p kite --test perf --test html && cargo test --profile perf -p kite-core --test store
 ```
 The first build compiles GPUI and Stylo (~3–5 min). After that, builds are incremental. `.cargo/config.toml` uses `rust-lld` on Windows for fast links.
 
