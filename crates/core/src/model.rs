@@ -114,6 +114,9 @@ pub enum Action {
     Unread,
     Snooze { until: Ms },
     Move { folder: String },
+    /// Local-only for now: no remote op is queued. Unknown tag names are an error.
+    Label { tag: String },
+    Unlabel { tag: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -137,6 +140,16 @@ pub struct Split {
     pub id: Id,
     pub name: String,
     pub query: String,
+}
+
+/// A user tag. `ThreadSummary.labels` carries tag names, ordered by `position`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Tag {
+    pub id: Id,
+    pub name: String,
+    /// `#rrggbb`.
+    pub color: String,
+    pub position: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

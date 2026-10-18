@@ -185,6 +185,19 @@ impl Engine {
     fn wake(&self) {
         let _ = self.inner.wake.try_send(());
     }
+
+    /// Emits `Changed` for every account after a local mutation that queues no remote op (labels,
+    /// tag edits and their undos), so the UI refetches instead of going stale.
+    fn emit_changed(&self) -> Result<()> {
+        let ids = self
+            .inner
+            .read(Store::accounts)?
+            .into_iter()
+            .map(|a| a.id)
+            .collect();
+        self.inner.emit(Event::Changed(ids));
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------- the loop
@@ -695,12 +708,16 @@ impl Mail for Engine {
     fn act(&self, ids: &[Id], action: &Action) -> Result<i64> {
         let token = self.inner.write(|s| s.act(ids, action))?;
         self.wake();
+        if matches!(action, Action::Label { .. } | Action::Unlabel { .. }) {
+            self.emit_changed()?;
+        }
         Ok(token)
     }
 
     fn undo(&self, token: i64) -> Result<()> {
         self.inner.write(|s| s.undo(token))?;
         self.wake();
+        self.emit_changed()?;
         Ok(())
     }
 
@@ -754,6 +771,16 @@ impl Mail for Engine {
 
     fn set_splits(&self, splits: Vec<Split>) -> Result<()> {
         self.inner.write(|s| s.set_splits(splits))
+    }
+
+    fn tags(&self) -> Result<Vec<Tag>> {
+        self.inner.read(Store::tags)
+    }
+
+    fn set_tags(&self, tags: Vec<Tag>) -> Result<()> {
+        self.inner.write(|s| s.set_tags(tags))?;
+        self.emit_changed()?;
+        Ok(())
     }
 
     fn settings(&self) -> Result<Settings> {
