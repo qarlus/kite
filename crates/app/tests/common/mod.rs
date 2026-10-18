@@ -39,6 +39,8 @@ pub struct Fixture {
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
+    /// The AI key the UI handed to `set_ai_key`; never part of `Settings`.
+    pub ai_key: Mutex<Option<String>>,
     pub accounts: Mutex<Vec<Account>>,
     threads: Mutex<Vec<ThreadSummary>>,
     messages: Mutex<HashMap<Id, Vec<Message>>>,
@@ -121,6 +123,7 @@ impl Fixture {
                 theme: "dark".into(),
                 ..Settings::default()
             }),
+            ai_key: Mutex::new(None),
             accounts: Mutex::new(vec![Account {
                 id: 1,
                 provider: kite_core::model::Provider::Proton,
@@ -755,7 +758,8 @@ impl Mail for Fixture {
         Ok(())
     }
 
-    fn set_ai_key(&self, _: &str) -> anyhow::Result<()> {
+    fn set_ai_key(&self, key: &str) -> anyhow::Result<()> {
+        *self.ai_key.lock().unwrap() = Some(key.to_string());
         Ok(())
     }
 
