@@ -33,6 +33,15 @@ pub trait Mail: Send + Sync + 'static {
 
     fn splits(&self) -> Result<Vec<Split>>;
     fn set_splits(&self, splits: Vec<Split>) -> Result<()>;
+    /// Ordered by `position`.
+    fn tags(&self) -> Result<Vec<Tag>> {
+        Ok(Vec::new())
+    }
+    /// Replaces the tag list. Ids <= 0 create; omitted tags are deleted (and leave every thread);
+    /// a rename updates the denormalized `ThreadSummary.labels`.
+    fn set_tags(&self, _tags: Vec<Tag>) -> Result<()> {
+        anyhow::bail!("Tags are not available")
+    }
     fn settings(&self) -> Result<Settings>;
     fn set_settings(&self, settings: Settings) -> Result<()>;
     fn set_ai_key(&self, key: &str) -> Result<()>;
