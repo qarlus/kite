@@ -85,6 +85,88 @@ fn go_sequences_switch_mailbox(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn the_category_tabs_narrow_the_inbox_and_are_reachable_by_keyboard(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let heading = window.find("mailbox-heading").bounds();
+        let mut previous = None;
+        for (ix, name) in common::SPLIT_NAMES.iter().enumerate() {
+            let tab = window.find(("tab", ix));
+            assert_eq!(tab.label(), Some(*name), "tab {ix} is {name}");
+            let bounds = tab.bounds();
+            assert!(
+                bounds.origin.y < heading.origin.y,
+                "{name} sits above the mailbox heading"
+            );
+            if let Some(previous) = previous {
+                assert!(
+                    bounds.origin.x > previous,
+                    "{name} follows the previous tab"
+                );
+            }
+            previous = Some(bounds.origin.x);
+        }
+        assert_eq!(
+            window.find(("tab", 0usize)).selected(),
+            Some(true),
+            "the inbox lens is active by default"
+        );
+    })
+    .unwrap();
+
+    // Social is a lens over the same inbox, so the mailbox does not change.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(("tab", 1usize), cx);
+        window.render_frame(cx);
+        assert_eq!(window.find(("tab", 1usize)).selected(), Some(true));
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.view().mailbox, Mailbox::Inbox);
+        assert_eq!(kite.view().split, Some(common::SPLITS[1]));
+        assert_eq!(
+            kite.row_ids(),
+            vec![5, 12],
+            "only the social senders remain"
+        );
+    });
+    let (view, _) = fixture.queries.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        view.split,
+        Some(common::SPLITS[1]),
+        "the Social tab asks the engine for the Social split"
+    );
+
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click(("tab", 3usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.view().split, Some(common::SPLITS[3]));
+        assert_eq!(kite.row_ids(), vec![6], "only the GitHub sender remains");
+    });
+    let (view, _) = fixture.queries.lock().unwrap().last().cloned().unwrap();
+    assert_eq!(
+        view.split,
+        Some(common::SPLITS[3]),
+        "the GitHub tab asks the engine for the GitHub split"
+    );
+
+    // Tab and Shift+Tab walk the same strip.
+    cx.simulate_keystrokes(window.into(), "shift-tab");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.view().split, Some(common::SPLITS[2]))
+    });
+    cx.simulate_keystrokes(window.into(), "tab");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.view().split, Some(common::SPLITS[3]))
+    });
+}
+
+#[gpui_kit::test]
 fn tab_cycles_splits(cx: &mut TestAppContext) {
     let fixture = Fixture::new(3);
     let (window, kite) = mount(cx, fixture.clone());

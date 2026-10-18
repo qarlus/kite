@@ -1133,6 +1133,9 @@ impl Kite {
                             .gap_1()
                             .child(
                                 div()
+                                    .id("mailbox-heading")
+                                    .test_support()
+                                    .aria_label(title.to_string())
                                     .min_w_0()
                                     .truncate()
                                     .text_size(t.px(24.))
@@ -1273,15 +1276,16 @@ impl Kite {
 }
 
 /// Splits arrive as a name and a query, so the icon is chosen from the name.
+/// Names are user-editable, so anything unrecognised falls back.
 fn split_icon(name: &str) -> IconName {
-    if name.eq_ignore_ascii_case("important") {
-        IconName::Asterisk
+    if name.eq_ignore_ascii_case("inbox") {
+        IconName::Inbox
     } else if name.eq_ignore_ascii_case("social") {
         IconName::CircleUser
-    } else if name.eq_ignore_ascii_case("promotions") {
-        IconName::Heart
     } else if name.eq_ignore_ascii_case("newsletters") {
         IconName::BookOpen
+    } else if name.eq_ignore_ascii_case("github") {
+        IconName::Github
     } else {
         IconName::Ellipsis
     }
