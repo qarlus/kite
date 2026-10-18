@@ -33,9 +33,19 @@ pub struct Fixture {
     pub locations: Mutex<Locations>,
     pub folder_error: Mutex<Option<String>>,
     pub account_error: Mutex<Option<String>>,
+    /// What `discover_proton` returns; set by settings tests to fake a local Bridge.
+    pub discovered: Mutex<Vec<ProtonLogin>>,
+    pub discover_error: Mutex<Option<String>>,
+    /// Whether `start_proton_bridge` finds an install, and how many times it was asked.
+    pub bridge_installed: Mutex<bool>,
+    pub bridge_started: Mutex<usize>,
+    /// Accounts that become discoverable once Bridge has been started.
+    pub bridge_accounts: Mutex<Vec<ProtonLogin>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
+    /// The AI key the UI handed to `set_ai_key`; never part of `Settings`.
+    pub ai_key: Mutex<Option<String>>,
     pub accounts: Mutex<Vec<Account>>,
     threads: Mutex<Vec<ThreadSummary>>,
     messages: Mutex<HashMap<Id, Vec<Message>>>,
@@ -110,12 +120,18 @@ impl Fixture {
             locations: Mutex::new(HashMap::new()),
             folder_error: Mutex::new(None),
             account_error: Mutex::new(None),
+            discovered: Mutex::new(Vec::new()),
+            discover_error: Mutex::new(None),
+            bridge_installed: Mutex::new(false),
+            bridge_started: Mutex::new(0),
+            bridge_accounts: Mutex::new(Vec::new()),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
                 ..Settings::default()
             }),
+            ai_key: Mutex::new(None),
             accounts: Mutex::new(vec![Account {
                 id: 1,
                 provider: kite_core::model::Provider::Proton,
@@ -487,6 +503,27 @@ impl Mail for Fixture {
         Ok(account)
     }
 
+    fn discover_proton(&self) -> anyhow::Result<Vec<ProtonLogin>> {
+        if let Some(error) = self.discover_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        Ok(self.discovered.lock().unwrap().clone())
+    }
+
+    fn start_proton_bridge(&self) -> anyhow::Result<bool> {
+        *self.bridge_started.lock().unwrap() += 1;
+        if !*self.bridge_installed.lock().unwrap() {
+            return Ok(false);
+        }
+        // Bridge is up: its vault is readable again and its port answers.
+        *self.discover_error.lock().unwrap() = None;
+        let accounts = self.bridge_accounts.lock().unwrap().clone();
+        if !accounts.is_empty() {
+            *self.discovered.lock().unwrap() = accounts;
+        }
+        Ok(true)
+    }
+
     fn add_microsoft(&self) -> anyhow::Result<Account> {
         if let Some(error) = self.account_error.lock().unwrap().clone() {
             anyhow::bail!(error);
@@ -743,7 +780,8 @@ impl Mail for Fixture {
         Ok(())
     }
 
-    fn set_ai_key(&self, _: &str) -> anyhow::Result<()> {
+    fn set_ai_key(&self, key: &str) -> anyhow::Result<()> {
+        *self.ai_key.lock().unwrap() = Some(key.to_string());
         Ok(())
     }
 
