@@ -3,7 +3,7 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use common::{FIRST, SECOND, config, serve, upserts, world};
+use common::{BULK_LISTID, BULK_UNSUB, FIRST, SECOND, config, serve, upserts, world};
 use kite_core::model::Mailbox;
 use kite_core::sync::imap::Imap;
 use kite_core::sync::{Delta, Op};
@@ -114,6 +114,43 @@ async fn incremental_sync_reports_new_flags_and_deletes() {
     assert!(
         matches!(&deltas[2], Delta::Flags { remote_id, unread, starred } if remote_id == "INBOX/1/1" && !unread && !starred)
     );
+}
+
+#[tokio::test]
+async fn list_headers_mark_bulk_mail() {
+    let world = Arc::new(Mutex::new(world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(BULK_UNSUB, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(BULK_LISTID, &[]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(SECOND, &[]);
+    let (imap_port, smtp_port) = serve(world.clone()).await.ports();
+
+    let mut imap = Imap::new(config(imap_port, smtp_port));
+    let (deltas, _) = imap.sync(None).await.expect("sync");
+    let messages = upserts(&deltas);
+    let by_subject = |subject: &str| {
+        messages
+            .iter()
+            .find(|m| m.subject == subject)
+            .unwrap_or_else(|| panic!("no {subject}"))
+    };
+    assert!(
+        by_subject("Weekly digest").list_unsubscribe,
+        "List-Unsubscribe"
+    );
+    assert!(by_subject("Mailing list post").list_unsubscribe, "List-Id");
+    assert!(!by_subject("Lunch?").list_unsubscribe, "ordinary mail");
 }
 
 #[tokio::test]

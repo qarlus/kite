@@ -413,6 +413,88 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
     assert!(cursor2.contains("/delta2"));
 }
 
+#[tokio::test]
+async fn internet_message_headers_mark_bulk_mail() {
+    let fake = Fake::start(|c, base| match c.path.as_str() {
+        "/me/mailFolders/inbox/messages/delta" => Reply::json(
+            200,
+            json!({
+                "value": [
+                    {
+                        "id": "b1",
+                        "subject": "Weekly digest",
+                        "receivedDateTime": "2024-05-01T10:00:00Z",
+                        "isRead": true,
+                        "flag": { "flagStatus": "notFlagged" },
+                        "inferenceClassification": "other",
+                        "hasAttachments": false,
+                        "parentFolderId": "FOLDER_INBOX",
+                        "body": { "contentType": "text", "content": "weekly" },
+                        "bodyPreview": "weekly",
+                        "internetMessageHeaders": [
+                            { "name": "List-Unsubscribe", "value": "<mailto:unsub@stack.example>" }
+                        ]
+                    },
+                    {
+                        "id": "b2",
+                        "subject": "Mailing list post",
+                        "receivedDateTime": "2024-05-02T10:00:00Z",
+                        "isRead": true,
+                        "flag": { "flagStatus": "notFlagged" },
+                        "inferenceClassification": "other",
+                        "hasAttachments": false,
+                        "parentFolderId": "FOLDER_INBOX",
+                        "body": { "contentType": "text", "content": "list" },
+                        "bodyPreview": "list",
+                        "internetMessageHeaders": [
+                            { "name": "List-Id", "value": "<dev.example.org>" }
+                        ]
+                    },
+                    {
+                        "id": "b3",
+                        "subject": "Lunch?",
+                        "receivedDateTime": "2024-05-03T10:00:00Z",
+                        "isRead": false,
+                        "flag": { "flagStatus": "notFlagged" },
+                        "inferenceClassification": "focused",
+                        "hasAttachments": false,
+                        "parentFolderId": "FOLDER_INBOX",
+                        "body": { "contentType": "text", "content": "lunch" },
+                        "bodyPreview": "lunch",
+                        "internetMessageHeaders": []
+                    }
+                ],
+                "@odata.deltaLink": format!("{base}/delta1")
+            }),
+        ),
+        p if p.starts_with("/me/mailFolders/") => Reply::json(
+            200,
+            json!({
+                "value": [],
+                "@odata.deltaLink": format!("{base}/f/{}", p.split('/').nth(3).unwrap_or("x"))
+            }),
+        ),
+        p if p.starts_with("/f/") => Reply::json(
+            200,
+            json!({ "value": [], "@odata.deltaLink": format!("{base}{p}") }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    let (deltas, _) = g.sync(None).await.unwrap();
+    assert!(upsert(&deltas, "b1").list_unsubscribe, "List-Unsubscribe");
+    assert!(upsert(&deltas, "b2").list_unsubscribe, "List-Id");
+    assert!(!upsert(&deltas, "b3").list_unsubscribe, "ordinary mail");
+
+    let delta = &fake.path("/me/mailFolders/inbox/messages/delta")[0];
+    assert!(
+        delta.query_pairs()["$select"].contains("internetMessageHeaders"),
+        "the header must be selected or Graph never returns it"
+    );
+}
+
 // -------------------------------------------------------------------- apply
 
 #[tokio::test]

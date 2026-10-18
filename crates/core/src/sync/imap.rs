@@ -676,6 +676,7 @@ fn to_msg(f: &Fetch, uid: Uid, folder: &str, role: Mailbox, validity: u32) -> Op
         unread,
         starred,
         important: None,
+        list_unsubscribe: !msg.list_unsubscribe().is_empty() || !msg.list_id().is_empty(),
         attachments: msg
             .attachments
             .iter()
