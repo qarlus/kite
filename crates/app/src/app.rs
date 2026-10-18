@@ -288,7 +288,12 @@ impl Kite {
         cx.notify();
     }
 
-    pub(crate) fn set_view(&mut self, view: View, cx: &mut Context<Self>) {
+    pub(crate) fn set_view(&mut self, mut view: View, cx: &mut Context<Self>) {
+        // The inbox is always shown through a lens. The plain inbox is the first
+        // seeded split, so the tab strip never renders with nothing selected.
+        if view.mailbox == Mailbox::Inbox && view.folder.is_none() && view.split.is_none() {
+            view.split = self.tabs.first().and_then(|tab| tab.split);
+        }
         let changed = view.account_id != self.view.account_id
             || view.mailbox != self.view.mailbox
             || view.split != self.view.split

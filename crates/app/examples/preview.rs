@@ -20,6 +20,8 @@ fn main() {
     let empty = args.iter().any(|arg| arg == "--empty");
     let no_accounts = args.iter().any(|arg| arg == "--no-accounts");
     let focus_search = args.iter().any(|arg| arg == "--focus-search");
+    // Leaves the inbox and returns with `g i`, for checking the lens is reselected.
+    let roundtrip = args.iter().any(|arg| arg == "--roundtrip");
     // `--split N` opens the Nth seeded split, for reviewing the category lenses.
     let split = args
         .iter()
@@ -87,6 +89,10 @@ fn main() {
                         }
                         if focus_search {
                             view.run(kite::keys::cmd::SEARCH, window, cx);
+                        }
+                        if roundtrip {
+                            view.run(kite::keys::cmd::GO + 1, window, cx);
+                            view.run(kite::keys::cmd::GO, window, cx);
                         }
                         for _ in 0..split.unwrap_or(0) {
                             view.run(kite::keys::cmd::NEXT_SPLIT, window, cx);
