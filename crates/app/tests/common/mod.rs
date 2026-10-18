@@ -597,6 +597,18 @@ impl Mail for Fixture {
                         .insert(t.id, (Mailbox::Snoozed, None));
                 }
             }
+            Action::Label { tag } => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| {
+                    if !t.labels.contains(tag) {
+                        t.labels.push(tag.clone());
+                    }
+                }),
+            Action::Unlabel { tag } => all
+                .iter_mut()
+                .filter(|t| ids.contains(&t.id))
+                .for_each(|t| t.labels.retain(|l| l != tag)),
             action => {
                 for id in ids {
                     let location = match action {

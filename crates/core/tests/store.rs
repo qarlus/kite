@@ -688,7 +688,8 @@ fn a_database_from_before_tags_migrates_and_seeds_tags() {
         {
             let conn = rusqlite::Connection::open(&path)?;
             conn.execute_batch(
-                "DROP TABLE IF EXISTS thread_tags; DROP TABLE IF EXISTS tags; PRAGMA user_version=3;",
+                "DROP TABLE IF EXISTS thread_tags; DROP TABLE IF EXISTS tags;
+                 ALTER TABLE undo_log DROP COLUMN tag_id; PRAGMA user_version=3;",
             )?;
         }
         let s = Store::open(&path)?;
@@ -1125,6 +1126,159 @@ fn removing_an_account_cascades_tag_memberships_but_keeps_tags() {
     })();
     cleanup(&path);
     result.unwrap();
+}
+
+#[test]
+fn deleting_a_tag_then_creating_one_never_reuses_the_id_for_undo() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    let urgent = tag_id(&s, "Urgent");
+    let token = s
+        .act(&[tid], &Action::Label {
+            tag: "Urgent".into(),
+        })
+        .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Urgent"]);
+
+    // Urgent holds the highest rowid, so deleting it would let the next created tag reuse its id
+    // without AUTOINCREMENT; the old undo row must not then delete the new tag's membership.
+    let without_urgent: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name != "Urgent")
+        .collect();
+    s.set_tags(without_urgent).unwrap();
+    let mut tags = s.tags().unwrap();
+    tags.push(Tag {
+        id: 0,
+        name: "Foo".into(),
+        color: "#112233".into(),
+        position: 8,
+    });
+    s.set_tags(tags).unwrap();
+    let foo = tag_id(&s, "Foo");
+    assert_ne!(foo, urgent, "a deleted tag id must not be reused");
+    s.act(&[tid], &Action::Label { tag: "Foo".into() })
+        .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Foo"]);
+
+    s.undo(token).unwrap();
+    assert_eq!(
+        labels_of(&s, tid),
+        vec!["Foo"],
+        "undoing the old Urgent label must not remove Foo"
+    );
+}
+
+#[test]
+fn undoing_a_label_after_a_thread_merge_removes_it_from_the_survivor() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("a1", "alice@a.com", "Alpha", D0)),
+            up(msg("b1", "bob@b.com", "Beta", D0 + 1)),
+        ],
+    )
+    .unwrap();
+    let alpha = thread_id(&s, "Alpha");
+    let beta = thread_id(&s, "Beta");
+    let token = s
+        .act(&[beta], &Action::Label {
+            tag: "Urgent".into(),
+        })
+        .unwrap();
+    assert_eq!(labels_of(&s, beta), vec!["Urgent"]);
+
+    let mut joining = msg("c1", "carol@c.com", "Re: Alpha", D0 + 2);
+    joining.references = vec!["<a1@x>".into(), "<b1@x>".into()];
+    s.apply_deltas(a.id, &[up(joining)]).unwrap();
+    assert_eq!(
+        labels_of(&s, alpha),
+        vec!["Urgent"],
+        "memberships move to the survivor"
+    );
+
+    s.undo(token).unwrap();
+    assert!(
+        labels_of(&s, alpha).is_empty(),
+        "undo must target the surviving thread"
+    );
+}
+
+#[test]
+fn undoing_an_unlabel_after_the_thread_was_deleted_does_not_fail() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    s.act(&[tid], &Action::Label { tag: "Urgent".into() })
+        .unwrap();
+    let token = s
+        .act(&[tid], &Action::Unlabel {
+            tag: "Urgent".into(),
+        })
+        .unwrap();
+
+    // The remote deletes the message, so the empty thread (and its memberships) disappear.
+    s.apply_deltas(a.id, &[Delta::Delete {
+        remote_id: "1".into(),
+    }])
+    .unwrap();
+    assert!(s.threads(&view(Mailbox::All), 0, 50).unwrap().is_empty());
+
+    s.undo(token).unwrap();
+    assert!(s.threads(&view(Mailbox::All), 0, 50).unwrap().is_empty());
+}
+
+#[test]
+fn set_tags_rejects_duplicate_ids() {
+    let s = Store::memory().unwrap();
+    let before = s.tags().unwrap();
+    let newsletter = tag_id(&s, "Newsletter");
+    assert!(
+        s.set_tags(vec![
+            Tag {
+                id: newsletter,
+                name: "A".into(),
+                color: "#112233".into(),
+                position: 0,
+            },
+            Tag {
+                id: newsletter,
+                name: "B".into(),
+                color: "#445566".into(),
+                position: 1,
+            },
+        ])
+        .is_err()
+    );
+    assert_eq!(s.tags().unwrap(), before, "nothing changed");
+}
+
+#[test]
+fn set_tags_rejects_quotes_and_control_characters_in_names() {
+    let s = Store::memory().unwrap();
+    let before = s.tags().unwrap();
+    for name in ["a\"b", "a\tb", "a\nb", "a\u{1}b"] {
+        assert!(
+            s.set_tags(vec![Tag {
+                id: 0,
+                name: name.into(),
+                color: "#112233".into(),
+                position: 0,
+            }])
+            .is_err(),
+            "tag name {name:?} must be rejected"
+        );
+        assert_eq!(s.tags().unwrap(), before);
+    }
 }
 
 #[test]

@@ -151,7 +151,7 @@ CREATE INDEX IF NOT EXISTS messages_bulk ON messages(thread_id) WHERE list_unsub
 /// counterpart of `message_id`: positive means the action labelled the thread, negative unlabelled.
 const SCHEMA_V4: &str = r#"
 CREATE TABLE IF NOT EXISTS tags (
-  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
   color TEXT NOT NULL, position INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS thread_tags (
@@ -692,6 +692,10 @@ fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
             "UPDATE messages SET thread_id=?1 WHERE thread_id=?2",
             params![canon, other],
         )?;
+        tx.execute(
+            "UPDATE undo_log SET thread_id=?1 WHERE thread_id=?2",
+            params![canon, other],
+        )?;
         tx.execute("DELETE FROM threads WHERE id=?1", [other])?;
         refresh_labels(tx, canon)?;
     }
@@ -1206,10 +1210,12 @@ impl Store {
                         params![r.thread_id, tag_id],
                     )?;
                 } else {
-                    // The tag may have been deleted since; then the restored membership is moot.
+                    // The tag or thread may have been deleted since; then the restored membership
+                    // is moot, and the thread guard keeps the INSERT from failing the FK.
                     tx.execute(
                         "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
-                         SELECT ?1, id FROM tags WHERE id=?2",
+                         SELECT ?1, id FROM tags WHERE id=?2
+                           AND EXISTS(SELECT 1 FROM threads WHERE id=?1)",
                         params![r.thread_id, -tag_id],
                     )?;
                 }
@@ -1686,6 +1692,9 @@ impl Store {
             if name.contains(',') {
                 bail!("tag name {name:?} must not contain a comma");
             }
+            if name.contains('"') || name.chars().any(char::is_control) {
+                bail!("tag name {name:?} must not contain quotes or control characters");
+            }
             if !seen.insert(name.to_ascii_lowercase()) {
                 bail!("duplicate tag name {name:?}");
             }
@@ -1703,17 +1712,21 @@ impl Store {
             })?;
             it.collect::<rusqlite::Result<HashMap<_, _>>>()?
         };
+        let mut seen_ids: HashSet<Id> = HashSet::new();
         for (id, _, _) in &desired {
-            if let Some(id) = id
-                && !existing.contains_key(id)
-            {
-                bail!("unknown tag id {id}");
+            if let Some(id) = id {
+                if !seen_ids.insert(*id) {
+                    bail!("duplicate tag id {id}");
+                }
+                if !existing.contains_key(id) {
+                    bail!("unknown tag id {id}");
+                }
             }
         }
         let kept: HashSet<Id> = desired.iter().filter_map(|(id, _, _)| *id).collect();
         let mut changed_tags: HashSet<Id> = existing
             .keys()
-            .filter(|id| !kept.contains(id))
+            .filter(|id| !kept.contains(*id))
             .copied()
             .collect();
         let mut renames: HashMap<String, String> = HashMap::new();
