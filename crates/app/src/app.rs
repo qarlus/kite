@@ -4,7 +4,7 @@
 //! so every keystroke paints from local state on the same frame.
 use crate::keys::{self, Act, GO_MAILBOXES, cmd};
 use crate::theme::{self, BAR_H, MAX_COL, RADIUS_SM, Theme};
-use crate::{folders, palette, snooze, thread};
+use crate::{compose, folders, palette, snooze, thread};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -112,6 +112,10 @@ pub struct Kite {
     pub(crate) sel: usize,
     pub(crate) multi: Vec<Id>,
     pub(crate) open: Option<Open>,
+    pub(crate) compose: Option<compose::Compose>,
+    pub(crate) compose_open: bool,
+    /// The outbox id of the mail just sent, so Undo can cancel it.
+    pub(crate) sent: Option<Id>,
     pub(crate) undo: Option<i64>,
     pub(crate) toast: Option<Toast>,
     pub(crate) overlay: Overlay,
@@ -209,6 +213,9 @@ impl Kite {
             sel: 0,
             multi: Vec::new(),
             open: None,
+            compose: None,
+            compose_open: false,
+            sent: None,
             undo: None,
             toast: None,
             overlay: Overlay::None,
@@ -619,7 +626,9 @@ impl Kite {
             cmd::PREV => self.next(-1, cx),
             cmd::OPEN if !self.rows.is_empty() => self.open_thread(cx),
             cmd::BACK => {
-                if !matches!(self.overlay, Overlay::None) {
+                if self.compose_open {
+                    self.close_compose(window, cx);
+                } else if !matches!(self.overlay, Overlay::None) {
                     self.close_overlay(cx);
                 } else if self.open.is_some() {
                     self.close_thread(cx);
@@ -627,6 +636,12 @@ impl Kite {
                     self.clear_search(window, cx);
                 }
             }
+            cmd::COMPOSE => self.open_compose(window, cx),
+            cmd::REPLY => self.compose_reply(window, cx, false, false),
+            cmd::REPLY_ALL => self.compose_reply(window, cx, true, false),
+            cmd::FORWARD => self.compose_reply(window, cx, false, true),
+            cmd::COMPOSE_CLOSE => self.close_compose(window, cx),
+            cmd::SEND => self.send_compose(window, cx),
             cmd::DONE => {
                 self.act(MailAction::Archive, true, "Marked done", cx);
                 self.pulse = Some((id, self.seq));
@@ -667,7 +682,16 @@ impl Kite {
             cmd::NEXT_SPLIT => self.cycle_split(1, cx),
             cmd::PREV_SPLIT => self.cycle_split(-1, cx),
             cmd::UNDO => {
-                if let Some(token) = self.undo.take() {
+                if let Some(id) = self.sent.take() {
+                    match self.mail.cancel_send(id) {
+                        Ok(Some(draft)) => {
+                            self.reopen_sent(window, draft, cx);
+                            self.toast("Send cancelled", cx);
+                        }
+                        Ok(None) => self.toast("Already sent", cx),
+                        Err(error) => self.toast(format!("Could not cancel: {error}"), cx),
+                    }
+                } else if let Some(token) = self.undo.take() {
                     self.mail.undo(token).ok();
                     self.reload();
                     if let Some(open) = &self.open {
@@ -1208,9 +1232,10 @@ impl Kite {
             )
     }
 
-    fn render_toast(&self, window: &Window) -> Option<AnyElement> {
+    fn render_toast(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let toast = self.toast.as_ref()?;
         let t = self.theme;
+        let can_undo = self.sent.is_some() || self.undo.is_some();
         Some(
             div()
                 .absolute()
@@ -1233,6 +1258,11 @@ impl Kite {
                                 .id("toast")
                                 .test_support()
                                 .aria_label(toast.text.clone())
+                                .when(can_undo, |d| {
+                                    d.cursor_pointer().on_click(cx.listener(
+                                        |this, _, window, cx| this.run(cmd::UNDO, window, cx),
+                                    ))
+                                })
                                 .flex()
                                 .items_center()
                                 .gap_2()
@@ -1410,8 +1440,9 @@ impl Render for Kite {
                             ),
                     ),
             )
+            .children(self.render_compose(window, cx))
             .children(self.render_overlay(window, cx))
-            .children(self.render_toast(window))
+            .children(self.render_toast(window, cx))
     }
 }
 

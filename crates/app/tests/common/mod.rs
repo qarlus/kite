@@ -48,6 +48,11 @@ pub struct Fixture {
     /// Threads the seeded `is:newsletter` split matches.
     pub newsletters: Mutex<Vec<Id>>,
     snapshots: Mutex<HashMap<i64, Snapshot>>,
+    /// Every `send` draft, in order, and the outbox it was queued into.
+    sent: Mutex<Vec<Draft>>,
+    outbox: Mutex<HashMap<Id, Draft>>,
+    cancelled: Mutex<Vec<Id>>,
+    send_seq: AtomicI64,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
 }
@@ -125,6 +130,10 @@ impl Fixture {
             opened: Mutex::new(Vec::new()),
             newsletters: Mutex::new(Vec::new()),
             snapshots: Mutex::new(HashMap::new()),
+            sent: Mutex::new(Vec::new()),
+            outbox: Mutex::new(HashMap::new()),
+            cancelled: Mutex::new(Vec::new()),
+            send_seq: AtomicI64::new(9001),
             senders: Mutex::new(Vec::new()),
             next_token: AtomicI64::new(1),
         })
@@ -151,6 +160,28 @@ impl Fixture {
 
     pub fn last_action(&self) -> Option<(Vec<Id>, Action)> {
         self.actions.lock().unwrap().last().cloned()
+    }
+
+    pub fn drafts(&self) -> Vec<Draft> {
+        self.sent.lock().unwrap().clone()
+    }
+
+    pub fn cancelled(&self) -> Vec<Id> {
+        self.cancelled.lock().unwrap().clone()
+    }
+
+    /// Replaces the latest message's To and Cc lists, so reply-all has addresses to filter.
+    pub fn set_message_recipients(&self, thread: Id, to: Vec<Addr>, cc: Vec<Addr>) {
+        if let Some(message) = self
+            .messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+        {
+            message.to = to;
+            message.cc = cc;
+        }
     }
 
     pub fn next_id(&self) -> Id {
@@ -622,12 +653,16 @@ impl Mail for Fixture {
         Ok(())
     }
 
-    fn send(&self, _: Draft) -> anyhow::Result<Id> {
-        Ok(0)
+    fn send(&self, draft: Draft) -> anyhow::Result<Id> {
+        let id = self.send_seq.fetch_add(1, Ordering::SeqCst);
+        self.sent.lock().unwrap().push(draft.clone());
+        self.outbox.lock().unwrap().insert(id, draft);
+        Ok(id)
     }
 
-    fn cancel_send(&self, _: Id) -> anyhow::Result<Option<Draft>> {
-        Ok(None)
+    fn cancel_send(&self, id: Id) -> anyhow::Result<Option<Draft>> {
+        self.cancelled.lock().unwrap().push(id);
+        Ok(self.outbox.lock().unwrap().remove(&id))
     }
 
     fn contacts(&self, _: &str) -> anyhow::Result<Vec<Addr>> {
