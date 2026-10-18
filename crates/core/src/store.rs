@@ -2,7 +2,7 @@
 //!
 //! The same file is opened twice (a reader for the UI, a writer for sync); WAL makes that work.
 //! Every write is one short transaction so a UI action never waits behind a long sync batch.
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -146,6 +146,35 @@ const SCHEMA_V3: &str = r#"
 CREATE INDEX IF NOT EXISTS messages_bulk ON messages(thread_id) WHERE list_unsubscribe=1;
 "#;
 
+/// Schema v4 adds tags. `threads.labels` stays a denormalized JSON cache of tag names ordered by
+/// `tags.position`, so listing a view never joins `thread_tags`. `undo_log.tag_id` is the tag
+/// counterpart of `message_id`: positive means the action labelled the thread, negative unlabelled.
+const SCHEMA_V4: &str = r#"
+CREATE TABLE IF NOT EXISTS tags (
+  id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  color TEXT NOT NULL, position INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS thread_tags (
+  thread_id INTEGER NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+  tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+  PRIMARY KEY(thread_id, tag_id)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS thread_tags_tag ON thread_tags(tag_id, thread_id);
+"#;
+
+/// Seeded on fresh and migrated stores. None of these become splits; nothing assigns them yet.
+const DEFAULT_TAGS: &str = r#"
+INSERT OR IGNORE INTO tags(id, name, color, position) VALUES
+  (1, 'Newsletter', '#3b82f6', 0),
+  (2, 'To Reply', '#f59e0b', 1),
+  (3, 'Marketing', '#ec4899', 2),
+  (4, 'Calendar', '#8b5cf6', 3),
+  (5, 'Notification', '#14b8a6', 4),
+  (6, 'Cold Email', '#94a3b8', 5),
+  (7, 'Team', '#22c55e', 6),
+  (8, 'Urgent', '#ef4444', 7);
+"#;
+
 /// Fields the engine needs to build reply MIME. `references` already ends with `message_id_header`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplyCtx {
@@ -203,6 +232,21 @@ impl Store {
             }
             tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch("PRAGMA user_version=3")?;
+            tx.commit()?;
+        }
+        if version < 4 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            let has_tag: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('undo_log') WHERE name='tag_id')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_tag {
+                tx.execute_batch("ALTER TABLE undo_log ADD COLUMN tag_id INTEGER")?;
+            }
+            tx.execute_batch(DEFAULT_TAGS)?;
+            tx.execute_batch("PRAGMA user_version=4")?;
             tx.commit()?;
         }
         migrate_split_defaults(&conn)?;
@@ -633,6 +677,13 @@ fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
 
 fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
     if canon != other {
+        // thread_tags is keyed by thread and cascades on delete: move the memberships before the
+        // loser row goes away so the survivor keeps the union (the labels cache is refreshed after).
+        tx.execute(
+            "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+             SELECT ?1, tag_id FROM thread_tags WHERE thread_id=?2",
+            params![canon, other],
+        )?;
         tx.execute(
             "UPDATE OR REPLACE thread_keys SET thread_id=?1 WHERE thread_id=?2",
             params![canon, other],
@@ -642,6 +693,7 @@ fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
             params![canon, other],
         )?;
         tx.execute("DELETE FROM threads WHERE id=?1", [other])?;
+        refresh_labels(tx, canon)?;
     }
     Ok(())
 }
@@ -782,6 +834,23 @@ fn refresh_thread(tx: &Transaction, thread_id: Id) -> Result<()> {
                 rows.iter().any(|r| r.starred), eff.iter().any(|v| *v),
                 rows.iter().any(|r| r.n_att > 0), rows.len() as i64,
                 mailbox.unwrap_or_else(|| "inbox".into()), thread_id],
+    )?;
+    refresh_labels(tx, thread_id)
+}
+
+/// Rewrites the denormalized `threads.labels` cache from current memberships and tag positions.
+fn refresh_labels(tx: &Transaction, thread_id: Id) -> Result<()> {
+    let labels: Vec<String> = {
+        let mut s = tx.prepare(
+            "SELECT g.name FROM thread_tags tt JOIN tags g ON g.id=tt.tag_id
+             WHERE tt.thread_id=?1 ORDER BY g.position, g.id",
+        )?;
+        let it = s.query_map([thread_id], |r| r.get(0))?;
+        it.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    tx.execute(
+        "UPDATE threads SET labels=?1 WHERE id=?2",
+        params![json(&labels)?, thread_id],
     )?;
     Ok(())
 }
@@ -967,6 +1036,7 @@ struct UndoRow {
     account_id: Id,
     thread_id: Id,
     message_id: Option<Id>,
+    tag_id: Option<Id>,
     mailbox: Option<String>,
     unread: Option<bool>,
     starred: Option<bool>,
@@ -996,6 +1066,38 @@ impl Store {
             let Some(account_id) = account_id else {
                 continue;
             };
+            // Tags are thread-level, local-only and queue no remote op. A no-op (already labelled
+            // or already unlabelled) records nothing, so undo cannot touch the pre-existing state.
+            if let Action::Label { tag } | Action::Unlabel { tag } = action {
+                let Some(tag_id) = tag_id_by_name(&tx, tag)? else {
+                    bail!("unknown tag {tag:?}");
+                };
+                let labelled: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM thread_tags WHERE thread_id=?1 AND tag_id=?2)",
+                    params![thread_id, tag_id],
+                    |r| r.get(0),
+                )?;
+                let on = matches!(action, Action::Label { .. });
+                if on != labelled {
+                    if on {
+                        tx.execute(
+                            "INSERT INTO thread_tags(thread_id, tag_id) VALUES (?1,?2)",
+                            params![thread_id, tag_id],
+                        )?;
+                    } else {
+                        tx.execute(
+                            "DELETE FROM thread_tags WHERE thread_id=?1 AND tag_id=?2",
+                            params![thread_id, tag_id],
+                        )?;
+                    }
+                    tx.execute(
+                        "INSERT INTO undo_log(token, account_id, thread_id, tag_id) VALUES (?1,?2,?3,?4)",
+                        params![token, account_id, thread_id, if on { tag_id } else { -tag_id }],
+                    )?;
+                    refresh_labels(&tx, thread_id)?;
+                }
+                continue;
+            }
             // Moving into a folder the message's account does not own is a caller bug: reject it
             // before anything local changes. Dropping `tx` rolls back the whole action.
             if let Action::Move { folder } = action {
@@ -1074,7 +1176,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let rows: Vec<UndoRow> = {
             let mut s = tx.prepare(
-                "SELECT account_id, thread_id, message_id, mailbox, unread, starred, folder,
+                "SELECT account_id, thread_id, message_id, tag_id, mailbox, unread, starred, folder,
                         snoozed_until, remind_after, op_id, inverse FROM undo_log WHERE token=?1",
             )?;
             let it = s.query_map([token], |r| {
@@ -1082,20 +1184,38 @@ impl Store {
                     account_id: r.get(0)?,
                     thread_id: r.get(1)?,
                     message_id: r.get(2)?,
-                    mailbox: r.get(3)?,
-                    unread: r.get(4)?,
-                    starred: r.get(5)?,
-                    folder: r.get(6)?,
-                    snoozed_until: r.get(7)?,
-                    remind_after: r.get(8)?,
-                    op_id: r.get(9)?,
-                    inverse: r.get(10)?,
+                    tag_id: r.get(3)?,
+                    mailbox: r.get(4)?,
+                    unread: r.get(5)?,
+                    starred: r.get(6)?,
+                    folder: r.get(7)?,
+                    snoozed_until: r.get(8)?,
+                    remind_after: r.get(9)?,
+                    op_id: r.get(10)?,
+                    inverse: r.get(11)?,
                 })
             })?;
             it.collect::<rusqlite::Result<Vec<_>>>()?
         };
         let mut touched: HashSet<Id> = HashSet::new();
         for r in rows {
+            if let Some(tag_id) = r.tag_id {
+                if tag_id > 0 {
+                    tx.execute(
+                        "DELETE FROM thread_tags WHERE thread_id=?1 AND tag_id=?2",
+                        params![r.thread_id, tag_id],
+                    )?;
+                } else {
+                    // The tag may have been deleted since; then the restored membership is moot.
+                    tx.execute(
+                        "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+                         SELECT ?1, id FROM tags WHERE id=?2",
+                        params![r.thread_id, -tag_id],
+                    )?;
+                }
+                touched.insert(r.thread_id);
+                continue;
+            }
             match r.message_id {
                 Some(mid) => {
                     tx.execute(
@@ -1283,6 +1403,16 @@ fn plan(action: &Action, m: &MsgState) -> Plan {
         ),
         _ => nothing,
     }
+}
+
+fn tag_id_by_name(tx: &Transaction, name: &str) -> Result<Option<Id>> {
+    Ok(tx
+        .query_row(
+            "SELECT id FROM tags WHERE name=?1 COLLATE NOCASE",
+            [name.trim()],
+            |r| r.get(0),
+        )
+        .optional()?)
 }
 
 fn message_states(tx: &Transaction, thread_id: Id) -> Result<Vec<MsgState>> {
@@ -1528,6 +1658,126 @@ impl Store {
         Ok(())
     }
 
+    pub fn tags(&self) -> Result<Vec<Tag>> {
+        let mut s = self
+            .conn
+            .prepare("SELECT id, name, color, position FROM tags ORDER BY position, id")?;
+        let it = s.query_map([], |r| {
+            Ok(Tag {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                color: r.get(2)?,
+                position: r.get(3)?,
+            })
+        })?;
+        Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Replaces the whole list. List order is the display order; ids <= 0 create, omitted tags are
+    /// deleted (cascading out of every thread). Validation happens before any write.
+    pub fn set_tags(&self, tags: Vec<Tag>) -> Result<()> {
+        let mut desired: Vec<(Option<Id>, String, String)> = Vec::with_capacity(tags.len());
+        let mut seen: HashSet<String> = HashSet::new();
+        for t in tags {
+            let name = t.name.trim().to_string();
+            if name.is_empty() {
+                bail!("tag name is empty");
+            }
+            if name.contains(',') {
+                bail!("tag name {name:?} must not contain a comma");
+            }
+            if !seen.insert(name.to_ascii_lowercase()) {
+                bail!("duplicate tag name {name:?}");
+            }
+            if !valid_tag_color(&t.color) {
+                bail!("tag colour {:?} is not #rrggbb", t.color);
+            }
+            desired.push(((t.id > 0).then_some(t.id), name, t.color));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let existing: HashMap<Id, (String, String, i64)> = {
+            let mut s = tx.prepare("SELECT id, name, color, position FROM tags")?;
+            let it = s.query_map([], |r| {
+                Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+            })?;
+            it.collect::<rusqlite::Result<HashMap<_, _>>>()?
+        };
+        for (id, _, _) in &desired {
+            if let Some(id) = id
+                && !existing.contains_key(id)
+            {
+                bail!("unknown tag id {id}");
+            }
+        }
+        let kept: HashSet<Id> = desired.iter().filter_map(|(id, _, _)| *id).collect();
+        let mut changed_tags: HashSet<Id> = existing
+            .keys()
+            .filter(|id| !kept.contains(id))
+            .copied()
+            .collect();
+        let mut renames: HashMap<String, String> = HashMap::new();
+        for (i, (id, name, color)) in desired.iter().enumerate() {
+            let Some(id) = *id else { continue };
+            let (old_name, old_color, old_pos) = &existing[&id];
+            if old_name != name || old_color != color || *old_pos != i as i64 {
+                changed_tags.insert(id);
+            }
+            if old_name != name {
+                renames.insert(old_name.to_ascii_lowercase(), name.clone());
+            }
+        }
+        // Threads that could see a label change: members of a deleted, renamed or reordered tag.
+        let affected: Vec<Id> = if changed_tags.is_empty() {
+            Vec::new()
+        } else {
+            let holes = vec!["?"; changed_tags.len()].join(",");
+            let mut s = tx.prepare(&format!(
+                "SELECT DISTINCT thread_id FROM thread_tags WHERE tag_id IN ({holes})"
+            ))?;
+            let it = s.query_map(params_from_iter(changed_tags.iter()), |r| r.get(0))?;
+            it.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+
+        if kept.is_empty() {
+            tx.execute("DELETE FROM tags", [])?;
+        } else {
+            let holes = vec!["?"; kept.len()].join(",");
+            tx.execute(
+                &format!("DELETE FROM tags WHERE id NOT IN ({holes})"),
+                params_from_iter(kept.iter()),
+            )?;
+            // Renaming straight from one live name to another can collide (e.g. a swap), so move
+            // the retained rows aside first; a control suffix cannot collide with a validated name.
+            tx.execute(
+                &format!("UPDATE tags SET name = name || char(1) WHERE id IN ({holes})"),
+                params_from_iter(kept.iter()),
+            )?;
+        }
+        for (i, (id, name, color)) in desired.iter().enumerate() {
+            match id {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE tags SET name=?1, color=?2, position=?3 WHERE id=?4",
+                        params![name, color, i as i64, id],
+                    )?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO tags(name, color, position) VALUES (?1,?2,?3)",
+                        params![name, color, i as i64],
+                    )?;
+                }
+            }
+        }
+        rewrite_split_labels(&tx, &renames)?;
+        for thread_id in affected {
+            refresh_labels(&tx, thread_id)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn settings(&self) -> Result<Settings> {
         let s: Option<String> = self
             .conn
@@ -1631,6 +1881,7 @@ fn apply_token(
         None if neg => p.not_match.push(term(value)),
         None => free.push((term(value), quoted)),
         Some(f @ ("from" | "to")) if !value.is_empty() => p.people(f == "from", value, neg),
+        Some("label") => p.label(value, neg),
         Some("subject") => {
             let t = format!("subject:{}", term(value));
             if neg {
@@ -1696,6 +1947,29 @@ impl Parsed {
         self.params.extend(params);
     }
 
+    fn label(&mut self, value: &str, neg: bool) {
+        let names: Vec<&str> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .collect();
+        if names.is_empty() {
+            // Nothing but separators can never match, and must not widen the search.
+            self.conds.push("1=0".into());
+            return;
+        }
+        // Comma is OR inside one operator, matching the people fields. The name index is used
+        // through thread_tags' primary key from the thread side, so this stays a correlated lookup.
+        let groups = vec!["g.name = ? COLLATE NOCASE"; names.len()].join(" OR ");
+        let ex = format!(
+            "EXISTS (SELECT 1 FROM thread_tags tt JOIN tags g ON g.id=tt.tag_id
+                     WHERE tt.thread_id=t.id AND ({groups}))"
+        );
+        self.conds.push(if neg { format!("NOT {ex}") } else { ex });
+        self.params
+            .extend(names.into_iter().map(|n| Value::Text(n.to_string())));
+    }
+
     fn flag(&mut self, value: &str, neg: bool) {
         let on = !neg;
         let cond = match value {
@@ -1724,6 +1998,104 @@ fn glob_pat(s: &str) -> String {
         .collect();
     out.push('*');
     out
+}
+
+/// Rewrites `label:` tokens whose value names a renamed tag, leaving every other token alone.
+/// `renames` is keyed by the lowercased old name so case-insensitive matches become the new name.
+fn rewrite_split_labels(tx: &Transaction, renames: &HashMap<String, String>) -> Result<()> {
+    if renames.is_empty() {
+        return Ok(());
+    }
+    let splits: Vec<(Id, String)> = {
+        let mut s = tx.prepare("SELECT id, query FROM splits")?;
+        let it = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        it.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, query) in splits {
+        let rewritten = rewrite_label_tokens(&query, renames);
+        if rewritten != query {
+            tx.execute(
+                "UPDATE splits SET query=?1 WHERE id=?2",
+                params![rewritten, id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_label_tokens(query: &str, renames: &HashMap<String, String>) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for token in query_tokens(query) {
+        let (neg, rest) = match token.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, token),
+        };
+        let Some(value) = rest
+            .get(..6)
+            .filter(|p| p.eq_ignore_ascii_case("label:"))
+            .map(|_| &rest[6..])
+        else {
+            out.push(token.to_string());
+            continue;
+        };
+        // parse_query drops every quote, so `"A","B"` and `"A,B"` mean the same; mirror that.
+        let inner = value.replace('"', "");
+        let mut changed = false;
+        let parts: Vec<&str> = inner
+            .split(',')
+            .map(|part| match renames.get(&part.trim().to_ascii_lowercase()) {
+                Some(new) => {
+                    changed = true;
+                    new.as_str()
+                }
+                None => part,
+            })
+            .collect();
+        if !changed {
+            out.push(token.to_string());
+            continue;
+        }
+        let joined = parts.join(",");
+        let value = if joined.chars().any(char::is_whitespace) {
+            format!("\"{joined}\"")
+        } else {
+            joined
+        };
+        out.push(format!("{}label:{value}", if neg { "-" } else { "" }));
+    }
+    out.join(" ")
+}
+
+/// Whitespace-separated tokens, keeping quoted sections (and their quotes) intact.
+fn query_tokens(query: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut in_quote = false;
+    for (i, c) in query.char_indices() {
+        match c {
+            '"' => {
+                in_quote = !in_quote;
+                start.get_or_insert(i);
+            }
+            c if c.is_whitespace() && !in_quote => {
+                if let Some(st) = start.take() {
+                    out.push(&query[st..i]);
+                }
+            }
+            _ => {
+                start.get_or_insert(i);
+            }
+        }
+    }
+    if let Some(st) = start {
+        out.push(&query[st..]);
+    }
+    out
+}
+
+fn valid_tag_color(c: &str) -> bool {
+    let b = c.as_bytes();
+    b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
 }
 
 fn valid_date(s: &str) -> bool {

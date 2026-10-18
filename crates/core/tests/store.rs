@@ -157,6 +157,33 @@ fn now() -> Ms {
         .as_millis() as Ms
 }
 
+fn tag_id(s: &Store, name: &str) -> Id {
+    s.tags()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.name.eq_ignore_ascii_case(name))
+        .unwrap()
+        .id
+}
+
+fn thread_id(s: &Store, subject: &str) -> Id {
+    s.threads(&view(Mailbox::All), 0, 200)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.subject == subject)
+        .unwrap()
+        .id
+}
+
+fn labels_of(s: &Store, id: Id) -> Vec<String> {
+    s.threads(&view(Mailbox::All), 0, 200)
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == id)
+        .unwrap()
+        .labels
+}
+
 /// Always in the future, so `pending_ops` returns everything queued.
 const DUE: Ms = i64::MAX / 4;
 
@@ -609,6 +636,491 @@ fn customised_splits_are_not_migrated() {
             vec!["VIP", "Other"],
             "a rename means the user owns it"
         );
+        Ok::<(), anyhow::Error>(())
+    })();
+    cleanup(&path);
+    result.unwrap();
+}
+
+#[test]
+fn starter_tags_are_seeded_in_order() {
+    let s = Store::memory().unwrap();
+    let tags = s.tags().unwrap();
+    let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec![
+            "Newsletter",
+            "To Reply",
+            "Marketing",
+            "Calendar",
+            "Notification",
+            "Cold Email",
+            "Team",
+            "Urgent"
+        ]
+    );
+    assert_eq!(
+        tags.iter().map(|t| t.position).collect::<Vec<_>>(),
+        (0..8).collect::<Vec<_>>()
+    );
+    let colors: std::collections::HashSet<&str> =
+        tags.iter().map(|t| t.color.as_str()).collect();
+    assert_eq!(colors.len(), tags.len(), "each starter tag has its own colour");
+    assert!(tags.iter().all(|t| {
+        let b = t.color.as_bytes();
+        b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
+    }));
+    assert!(
+        s.splits().unwrap().iter().all(|sp| !sp.query.contains("label:")),
+        "starter tags are not tabs"
+    );
+}
+
+#[test]
+fn a_database_from_before_tags_migrates_and_seeds_tags() {
+    let path = temp_db("tag-migrate");
+    let result = (|| {
+        let s = Store::open(&path)?;
+        let a = s.add_account(Provider::Proton, "me@x.com", "Me")?;
+        s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])?;
+        drop(s);
+        {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.execute_batch(
+                "DROP TABLE IF EXISTS thread_tags; DROP TABLE IF EXISTS tags; PRAGMA user_version=3;",
+            )?;
+        }
+        let s = Store::open(&path)?;
+        let names: Vec<String> = s.tags()?.into_iter().map(|t| t.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "Newsletter",
+                "To Reply",
+                "Marketing",
+                "Calendar",
+                "Notification",
+                "Cold Email",
+                "Team",
+                "Urgent"
+            ]
+        );
+        let rows = s.threads(&view(Mailbox::Inbox), 0, 50)?;
+        assert_eq!(rows.len(), 1, "existing mail survives the migration");
+        assert!(rows[0].labels.is_empty());
+        Ok::<(), anyhow::Error>(())
+    })();
+    cleanup(&path);
+    result.unwrap();
+}
+
+#[test]
+fn label_and_unlabel_update_summary_labels_in_position_order() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+
+    // Apply Urgent (position 7) before Newsletter (position 0); the cache is by tag position.
+    s.act(&[tid], &Action::Label {
+        tag: "Urgent".into(),
+    })
+    .unwrap();
+    s.act(&[tid], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Newsletter", "Urgent"]);
+
+    s.act(&[tid], &Action::Unlabel {
+        tag: "newsletter".into(),
+    })
+    .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Urgent"], "names match case-insensitively");
+    s.act(&[tid], &Action::Unlabel {
+        tag: "Urgent".into(),
+    })
+    .unwrap();
+    assert!(labels_of(&s, tid).is_empty());
+}
+
+#[test]
+fn undo_restores_prior_tag_membership_and_ignores_no_ops() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    let newsletter = tag_id(&s, "Newsletter");
+    let urgent = tag_id(&s, "Urgent");
+
+    let label = s
+        .act(&[tid], &Action::Label {
+            tag: "Newsletter".into(),
+        })
+        .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
+
+    // Labelling an already-labelled thread is a no-op; undoing it must keep the old membership.
+    let again = s
+        .act(&[tid], &Action::Label {
+            tag: "newsletter".into(),
+        })
+        .unwrap();
+    s.undo(again).unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
+    s.undo(label).unwrap();
+    assert!(labels_of(&s, tid).is_empty());
+
+    let urgent_token = s
+        .act(&[tid], &Action::Label {
+            tag: "Urgent".into(),
+        })
+        .unwrap();
+    s.undo(urgent_token).unwrap();
+    assert!(labels_of(&s, tid).is_empty());
+
+    // Unlabel has the same no-op rule, in the other direction.
+    s.act(&[tid], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    let noop_unlabel = s
+        .act(&[tid], &Action::Unlabel {
+            tag: "Urgent".into(),
+        })
+        .unwrap();
+    s.undo(noop_unlabel).unwrap();
+    assert_eq!(
+        labels_of(&s, tid),
+        vec!["Newsletter"],
+        "undo must not add a tag the action never removed"
+    );
+    let unlabel = s
+        .act(&[tid], &Action::Unlabel {
+            tag: "Newsletter".into(),
+        })
+        .unwrap();
+    s.undo(unlabel).unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
+    assert!(
+        s.pending_ops(a.id, DUE, 10).unwrap().is_empty(),
+        "tags queue no remote op"
+    );
+    assert!(newsletter != urgent);
+}
+
+#[test]
+fn an_unknown_tag_is_an_error_and_changes_nothing() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("1", "a@a.com", "One", D0)),
+            up(msg("2", "b@b.com", "Two", D0 + 1)),
+        ],
+    )
+    .unwrap();
+    let one = thread_id(&s, "One");
+    let two = thread_id(&s, "Two");
+    assert!(
+        s.act(
+            &[one, two],
+            &Action::Label {
+                tag: "Nope".into()
+            }
+        )
+        .is_err()
+    );
+    assert!(labels_of(&s, one).is_empty());
+    assert!(labels_of(&s, two).is_empty());
+    assert!(
+        s.act(
+            &[one],
+            &Action::Unlabel {
+                tag: "Nope".into()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn label_search_supports_case_comma_or_negation_and_multiword_names() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("1", "a@a.com", "One", D0)),
+            up(msg("2", "b@b.com", "Two", D0 + 1)),
+            up(msg("3", "c@c.com", "Three", D0 + 2)),
+        ],
+    )
+    .unwrap();
+    let one = thread_id(&s, "One");
+    let two = thread_id(&s, "Two");
+    let three = thread_id(&s, "Three");
+    for (tid, tag) in [
+        (one, "Newsletter"),
+        (one, "Urgent"),
+        (two, "Urgent"),
+        (three, "To Reply"),
+    ] {
+        s.act(&[tid], &Action::Label { tag: tag.into() })
+            .unwrap();
+    }
+
+    let subjects = |q: &str| {
+        let mut v: Vec<String> = s
+            .threads(&search(Mailbox::Inbox, q), 0, 50)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.subject)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(subjects("label:newsletter"), vec!["One"], "case-insensitive");
+    assert_eq!(
+        subjects("label:Newsletter,Urgent"),
+        vec!["One", "Two"],
+        "comma is OR"
+    );
+    assert_eq!(
+        subjects("label:\"To Reply\""),
+        vec!["Three"],
+        "quoted multi-word name"
+    );
+    assert_eq!(subjects("-label:Urgent"), vec!["Three"], "negation");
+    assert_eq!(
+        subjects("label:\"To Reply\",Newsletter"),
+        vec!["One", "Three"]
+    );
+    assert!(subjects("label:Missing").is_empty());
+}
+
+#[test]
+fn renaming_a_tag_updates_summaries_and_split_queries() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    s.act(&[tid], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    s.act(&[tid], &Action::Label {
+        tag: "To Reply".into(),
+    })
+    .unwrap();
+    s.set_splits(vec![
+        Split {
+            id: 0,
+            name: "Tagged".into(),
+            query: "label:\"To Reply\" from:a@a.com".into(),
+        },
+        Split {
+            id: 0,
+            name: "Not news".into(),
+            query: "-label:Newsletter".into(),
+        },
+        Split {
+            id: 0,
+            name: "Either".into(),
+            query: "label:\"To Reply\",Team".into(),
+        },
+    ])
+    .unwrap();
+
+    let newsletter = tag_id(&s, "Newsletter");
+    let mut tags = s.tags().unwrap();
+    for t in &mut tags {
+        match t.name.as_str() {
+            "Newsletter" => t.name = "Bulletin".into(),
+            "To Reply" => t.name = "Reply Later".into(),
+            _ => {}
+        }
+    }
+    s.set_tags(tags).unwrap();
+
+    assert_eq!(tag_id(&s, "Bulletin"), newsletter, "identity survives a rename");
+    assert_eq!(labels_of(&s, tid), vec!["Bulletin", "Reply Later"]);
+    let splits = s.splits().unwrap();
+    assert_eq!(splits[0].query, "label:\"Reply Later\" from:a@a.com");
+    assert_eq!(splits[1].query, "-label:Bulletin");
+    assert_eq!(splits[2].query, "label:\"Reply Later,Team\"");
+    assert_eq!(
+        s.threads(&search(Mailbox::Inbox, "label:\"Reply Later\""), 0, 50)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        s.threads(&search(Mailbox::Inbox, "label:Newsletter"), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn reordering_tags_reorders_the_summary_labels() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    s.act(&[tid], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    s.act(&[tid], &Action::Label {
+        tag: "Urgent".into(),
+    })
+    .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Newsletter", "Urgent"]);
+
+    let mut tags = s.tags().unwrap();
+    let at = tags.iter().position(|t| t.name == "Urgent").unwrap();
+    let urgent = tags.remove(at);
+    tags.insert(0, urgent);
+    s.set_tags(tags).unwrap();
+
+    assert_eq!(labels_of(&s, tid), vec!["Urgent", "Newsletter"]);
+    assert_eq!(s.tags().unwrap()[0].name, "Urgent");
+}
+
+#[test]
+fn deleting_a_tag_removes_it_from_threads() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+    s.act(&[tid], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    s.act(&[tid], &Action::Label {
+        tag: "Urgent".into(),
+    })
+    .unwrap();
+
+    let tags: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name != "Newsletter")
+        .collect();
+    s.set_tags(tags).unwrap();
+
+    assert_eq!(labels_of(&s, tid), vec!["Urgent"]);
+    assert!(s.tags().unwrap().iter().all(|t| t.name != "Newsletter"));
+    assert!(
+        s.threads(&search(Mailbox::Inbox, "label:Newsletter"), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn set_tags_validation_rejects_bad_input_atomically() {
+    let s = Store::memory().unwrap();
+    let before = s.tags().unwrap();
+    let tag = |name: &str, color: &str| Tag {
+        id: 0,
+        name: name.into(),
+        color: color.into(),
+        position: 0,
+    };
+    let bad = vec![
+        vec![tag("  ", "#112233")],
+        vec![tag("A,B", "#112233")],
+        vec![tag("Same", "#112233"), tag("same", "#445566")],
+        vec![tag("A", "red")],
+        vec![tag("A", "#12345")],
+        vec![tag("A", "#gggggg")],
+        vec![Tag {
+            id: 999,
+            name: "A".into(),
+            color: "#112233".into(),
+            position: 0,
+        }],
+    ];
+    for tags in bad {
+        assert!(s.set_tags(tags).is_err());
+        assert_eq!(s.tags().unwrap(), before, "nothing changed");
+    }
+}
+
+#[test]
+fn tags_survive_a_sync_update_and_a_thread_merge() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("a1", "alice@a.com", "Alpha", D0)),
+            up(msg("b1", "bob@b.com", "Beta", D0 + 1)),
+        ],
+    )
+    .unwrap();
+    let alpha = thread_id(&s, "Alpha");
+    let beta = thread_id(&s, "Beta");
+    s.act(&[alpha], &Action::Label {
+        tag: "Newsletter".into(),
+    })
+    .unwrap();
+    s.act(&[beta], &Action::Label {
+        tag: "Urgent".into(),
+    })
+    .unwrap();
+
+    // A later sync overwrites the message and re-aggregates its thread; membership is untouched.
+    s.apply_deltas(
+        a.id,
+        &[up(body(
+            msg("a1", "alice@a.com", "Alpha", D0 + 5),
+            "updated body",
+        ))],
+    )
+    .unwrap();
+    assert_eq!(labels_of(&s, alpha), vec!["Newsletter"]);
+
+    // A new message referencing both threads makes the lower id win and unions their tags.
+    let mut joining = msg("c1", "carol@c.com", "Re: Alpha", D0 + 2);
+    joining.references = vec!["<a1@x>".into(), "<b1@x>".into()];
+    s.apply_deltas(a.id, &[up(joining)]).unwrap();
+
+    let rows = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
+    assert_eq!(rows.len(), 1, "the two threads merged");
+    assert_eq!(rows[0].id, alpha);
+    assert_eq!(rows[0].labels, vec!["Newsletter", "Urgent"]);
+    assert_eq!(s.thread(alpha).unwrap().len(), 3);
+}
+
+#[test]
+fn removing_an_account_cascades_tag_memberships_but_keeps_tags() {
+    let path = temp_db("tag-cascade");
+    let result = (|| {
+        let s = Store::open(&path)?;
+        let a = s.add_account(Provider::Proton, "me@x.com", "Me")?;
+        s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])?;
+        let tid = thread_id(&s, "Hi");
+        s.act(&[tid], &Action::Label {
+            tag: "Newsletter".into(),
+        })?;
+        s.remove_account(a.id)?;
+        let conn = rusqlite::Connection::open(&path)?;
+        let memberships: i64 =
+            conn.query_row("SELECT COUNT(*) FROM thread_tags", [], |r| r.get(0))?;
+        let tags: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
+        assert_eq!(memberships, 0);
+        assert_eq!(tags, 8, "tags are global, not account-owned");
         Ok::<(), anyhow::Error>(())
     })();
     cleanup(&path);

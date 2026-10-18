@@ -756,6 +756,14 @@ impl Mail for Engine {
         self.inner.write(|s| s.set_splits(splits))
     }
 
+    fn tags(&self) -> Result<Vec<Tag>> {
+        self.inner.read(Store::tags)
+    }
+
+    fn set_tags(&self, tags: Vec<Tag>) -> Result<()> {
+        self.inner.write(|s| s.set_tags(tags))
+    }
+
     fn settings(&self) -> Result<Settings> {
         self.inner.read(Store::settings)
     }
