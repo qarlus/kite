@@ -76,7 +76,7 @@ fn an_empty_starred_view_explains_what_belongs_there(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn the_compact_window_keeps_search_and_commands_separate(cx: &mut TestAppContext) {
+fn the_compact_window_keeps_search_and_shortcuts_separate(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (window, _) = common::open_window(
         cx,
@@ -89,9 +89,9 @@ fn the_compact_window_keeps_search_and_commands_separate(cx: &mut TestAppContext
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         let search = window.find("search").bounds();
-        let commands = window.find("palette-hint").bounds();
+        let shortcuts = window.find("shortcut-help").bounds();
         assert!(search.size.width > gpui_kit::px(60.));
-        assert!(commands.origin.x >= search.right());
+        assert!(shortcuts.origin.x >= search.right());
         let row = window.find(("row", 0usize)).bounds();
         let timestamp = window.find(("row-time", 0usize)).bounds();
         assert!(
@@ -102,9 +102,9 @@ fn the_compact_window_keeps_search_and_commands_separate(cx: &mut TestAppContext
             row.right() <= gpui_kit::px(720.),
             "rows fit the compact window"
         );
-        window.click("palette-hint", cx);
+        window.click("shortcut-help", cx);
         window.render_frame(cx);
-        assert!(window.try_find("palette").is_some());
+        assert!(window.try_find("help").is_some());
     })
     .unwrap();
 }
