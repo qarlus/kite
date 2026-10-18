@@ -184,6 +184,19 @@ impl Fixture {
         }
     }
 
+    /// Replaces the latest message's sender, so reply has a display name to quote.
+    pub fn set_message_from(&self, thread: Id, from: Addr) {
+        if let Some(message) = self
+            .messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+        {
+            message.from = from;
+        }
+    }
+
     pub fn next_id(&self) -> Id {
         self.threads
             .lock()

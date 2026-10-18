@@ -1,15 +1,16 @@
 //! Compose: a floating panel for new mail, reply, reply-all and forward.
 //! Phase 1 keeps the draft in memory; closing the panel without sending keeps it.
 use crate::app::Kite;
-use crate::theme::{self, RADIUS, RADIUS_SM, SHADOW, Theme};
+use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Addr, Draft, Id, Message};
+use kite_core::model::{Addr, Draft, Id, Message, Ms};
 use std::collections::HashSet;
+use std::time::Duration;
 
 /// A draft the user is editing. Input state lives in the entities so an Escape
 /// can hide the panel without losing a single keystroke.
@@ -22,6 +23,9 @@ pub struct Compose {
     /// The message being replied to (`None` for new mail and forward).
     pub reply_to: Option<Id>,
     pub show_cc: bool,
+    bcc: Vec<Addr>,
+    send_at: Option<Ms>,
+    remind_at: Option<Ms>,
     title: &'static str,
 }
 
@@ -31,9 +35,12 @@ struct Parts {
     title: &'static str,
     to: Vec<Addr>,
     cc: Vec<Addr>,
+    bcc: Vec<Addr>,
     subject: String,
     body: String,
     reply_to: Option<Id>,
+    send_at: Option<Ms>,
+    remind_at: Option<Ms>,
 }
 
 impl Compose {
@@ -66,6 +73,9 @@ impl Compose {
             account_id: parts.account_id,
             reply_to: parts.reply_to,
             show_cc: !parts.cc.is_empty(),
+            bcc: parts.bcc,
+            send_at: parts.send_at,
+            remind_at: parts.remind_at,
             title: parts.title,
         }
     }
@@ -79,9 +89,12 @@ impl Compose {
                 title: "New message",
                 to: draft.to,
                 cc: draft.cc,
+                bcc: draft.bcc,
                 subject: draft.subject,
                 body: draft.body,
                 reply_to: draft.reply_to,
+                send_at: draft.send_at,
+                remind_at: draft.remind_at,
             },
         )
     }
@@ -91,13 +104,20 @@ impl Compose {
             account_id: self.account_id,
             to: parse_addrs(&self.to.read(cx).value()),
             cc: parse_addrs(&self.cc.read(cx).value()),
-            bcc: Vec::new(),
+            bcc: self.bcc.clone(),
             subject: self.subject.read(cx).value().trim().to_string(),
             body: self.body.read(cx).value().to_string(),
             reply_to: self.reply_to,
-            send_at: None,
-            remind_at: None,
+            send_at: self.send_at,
+            remind_at: self.remind_at,
         }
+    }
+
+    fn is_empty(&self, cx: &App) -> bool {
+        self.to.read(cx).value().trim().is_empty()
+            && self.cc.read(cx).value().trim().is_empty()
+            && self.subject.read(cx).value().trim().is_empty()
+            && self.body.read(cx).value().trim().is_empty()
     }
 }
 
@@ -127,6 +147,13 @@ impl Kite {
             .unwrap_or_default()
     }
 
+    fn has_draft(&self, cx: &App) -> bool {
+        match &self.compose {
+            Some(compose) => !compose.is_empty(cx),
+            None => false,
+        }
+    }
+
     pub(crate) fn open_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.compose.is_none() {
             let account_id = self
@@ -142,9 +169,12 @@ impl Kite {
                     title: "New message",
                     to: Vec::new(),
                     cc: Vec::new(),
+                    bcc: Vec::new(),
                     subject: String::new(),
                     body: String::new(),
                     reply_to: None,
+                    send_at: None,
+                    remind_at: None,
                 },
             ));
         }
@@ -160,6 +190,14 @@ impl Kite {
         all: bool,
         forward: bool,
     ) {
+        // A hidden compose still holds the user's draft: never replace it.
+        if self.has_draft(cx) {
+            self.compose_open = true;
+            self.focus_compose(window, cx, false);
+            self.toast("Draft kept", cx);
+            cx.notify();
+            return;
+        }
         let Some((account_id, message)) = self.reply_target() else {
             self.toast("Open a message first", cx);
             return;
@@ -180,8 +218,7 @@ impl Kite {
         let (to, cc) = if forward {
             (Vec::new(), Vec::new())
         } else if all {
-            let recipients = reply_all(&message, &own);
-            (recipients, Vec::new())
+            reply_all(&message, &own)
         } else {
             (vec![message.from.clone()], Vec::new())
         };
@@ -194,9 +231,12 @@ impl Kite {
                 title,
                 to,
                 cc,
+                bcc: Vec::new(),
                 subject: prefixed(&message.subject, prefix),
                 body: quote(&message),
                 reply_to,
+                send_at: None,
+                remind_at: None,
             },
         ));
         self.compose_open = true;
@@ -211,6 +251,9 @@ impl Kite {
     }
 
     pub(crate) fn send_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.compose_open {
+            return;
+        }
         let Some(compose) = &self.compose else {
             return;
         };
@@ -219,24 +262,63 @@ impl Kite {
             self.toast("Add a recipient", cx);
             return;
         }
+        if let Some(invalid) = draft
+            .to
+            .iter()
+            .chain(&draft.cc)
+            .map(|addr| addr.email.trim())
+            .find(|&email| !valid_email(email))
+        {
+            self.toast(format!("Invalid address: {invalid}"), cx);
+            return;
+        }
         match self.mail.send(draft) {
             Ok(id) => {
-                self.sent = Some(id);
+                self.record_sent(id);
                 self.compose = None;
                 self.compose_open = false;
                 window.focus(&self.focus, cx);
                 self.toast("Sending…", cx);
+                // The send is undoable only for the configured window.
+                let delay = Duration::from_secs(self.settings.undo_send_secs as u64);
+                let timer = cx.background_executor().timer(delay);
+                cx.spawn(async move |this, cx| {
+                    timer.await;
+                    this.update(cx, |this, cx| {
+                        if this.sent == Some(id) {
+                            this.sent = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
             }
             Err(error) => self.toast(format!("Could not send: {error}"), cx),
         }
     }
 
-    /// Reopens the draft returned by `cancel_send`.
-    pub(crate) fn reopen_sent(&mut self, window: &mut Window, draft: Draft, cx: &mut Context<Self>) {
+    /// Reopens the draft returned by `cancel_send`, or keeps an existing draft.
+    /// Returns false when a non-empty draft was already there, so the caller does
+    /// not overwrite the "Draft kept" toast.
+    pub(crate) fn reopen_sent(
+        &mut self,
+        window: &mut Window,
+        draft: Draft,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.has_draft(cx) {
+            self.compose_open = true;
+            self.focus_compose(window, cx, false);
+            self.toast("Draft kept", cx);
+            cx.notify();
+            return false;
+        }
         self.compose = Some(Compose::from_draft(window, cx, draft));
         self.compose_open = true;
         self.focus_compose(window, cx, false);
         cx.notify();
+        true
     }
 
     /// The latest message of the open thread, or of the selected row.
@@ -271,7 +353,7 @@ impl Kite {
 
     pub fn render_compose(
         &mut self,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.compose_open {
@@ -285,6 +367,10 @@ impl Kite {
         let body = compose.body.clone();
         let show_cc = compose.show_cc;
         let title = compose.title;
+        // DESIGN: a reply within a thread takes the full content pane; new mail
+        // and forwards float bottom-right at 560×480.
+        let is_reply = compose.reply_to.is_some();
+        let reply_left = px(crate::sidebar::width(window));
         Some(
             div()
                 .id("compose")
@@ -292,19 +378,24 @@ impl Kite {
                 .aria_label(title)
                 .key_context("KiteCompose")
                 .absolute()
-                .bottom(px(18.))
-                .right(px(18.))
-                .w(px(560.))
-                .h(px(480.))
+                .when(is_reply, |d| {
+                    d.top(px(BAR_H)).left(reply_left).right_0().bottom_0()
+                })
+                .when(!is_reply, |d| {
+                    d.bottom(px(18.))
+                        .right(px(18.))
+                        .w(px(560.))
+                        .h(px(480.))
+                        .rounded(px(RADIUS))
+                        .shadow(vec![
+                            BoxShadow::new(px(0.), px(20.), SHADOW.into()).blur_radius(px(60.)),
+                        ])
+                })
                 .flex()
                 .flex_col()
-                .rounded(px(RADIUS))
                 .bg(t.bg2)
                 .border_1()
                 .border_color(t.line)
-                .shadow(vec![
-                    BoxShadow::new(px(0.), px(20.), SHADOW.into()).blur_radius(px(60.)),
-                ])
                 .child(
                     div()
                         .flex()
@@ -480,63 +571,117 @@ fn field_row(
         .into_any_element()
 }
 
-/// `Name <email>, other@example.com`, as the fields hold it.
+/// `"Doe, Jane" <jane@example.com>, other@example.com`, as the fields hold it.
 fn format_addrs(addrs: &[Addr]) -> String {
-    addrs
-        .iter()
-        .map(|addr| {
-            if addr.name.trim().is_empty() {
-                addr.email.clone()
-            } else {
-                format!("{} <{}>", addr.name.trim(), addr.email.trim())
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ")
+    addrs.iter().map(format_addr).collect::<Vec<_>>().join(", ")
 }
 
-/// Accepts comma or semicolon separated `Name <email>` and bare addresses.
+fn format_addr(addr: &Addr) -> String {
+    let name = addr.name.trim();
+    let email = addr.email.trim();
+    if name.is_empty() {
+        email.to_string()
+    } else if name_needs_quotes(name) {
+        let escaped = name.replace('\\', "\\\\").replace('"', "\\\"");
+        format!("\"{escaped}\" <{email}>")
+    } else {
+        format!("{name} <{email}>")
+    }
+}
+
+fn name_needs_quotes(name: &str) -> bool {
+    name.chars()
+        .any(|c| matches!(c, ',' | ';' | '<' | '>' | '"' | '@' | '\\' | '(' | ')' | ':'))
+}
+
+/// Accepts comma or semicolon separated `Name <email>` and bare addresses,
+/// splitting only outside quotes and angle brackets.
 fn parse_addrs(value: &str) -> Vec<Addr> {
-    value
-        .split([',', ';'])
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| {
-            if let Some(open) = part.rfind('<')
-                && let Some(close) = part[open..].find('>')
-            {
-                let email = part[open + 1..open + close].trim();
-                let name = part[..open].trim().trim_matches('"').trim();
-                return Addr {
-                    name: name.into(),
-                    email: email.into(),
-                };
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut in_angle = false;
+    for c in value.chars() {
+        match c {
+            '"' => {
+                in_quotes = !in_quotes;
+                current.push(c);
             }
-            Addr {
-                name: String::new(),
-                email: part.into(),
+            '<' if !in_quotes => {
+                in_angle = true;
+                current.push(c);
             }
-        })
-        .collect()
+            '>' if !in_quotes => {
+                in_angle = false;
+                current.push(c);
+            }
+            ',' | ';' if !in_quotes && !in_angle => {
+                push_addr(&mut out, &current);
+                current.clear();
+            }
+            _ => current.push(c),
+        }
+    }
+    push_addr(&mut out, &current);
+    out
 }
 
-/// The sender plus every To/Cc address except our own, deduped by address.
-fn reply_all(message: &Message, own: &str) -> Vec<Addr> {
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for addr in std::iter::once(&message.from)
-        .chain(message.to.iter())
-        .chain(message.cc.iter())
+fn push_addr(out: &mut Vec<Addr>, part: &str) {
+    let part = part.trim();
+    if part.is_empty() {
+        return;
+    }
+    if let Some(open) = part.rfind('<')
+        && let Some(close) = part[open..].find('>')
     {
+        let email = part[open + 1..open + close].trim();
+        let name = unquote_name(&part[..open]);
+        out.push(Addr {
+            name,
+            email: email.into(),
+        });
+    } else {
+        out.push(Addr {
+            name: String::new(),
+            email: part.into(),
+        });
+    }
+}
+
+fn unquote_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.len() >= 2 && name.starts_with('"') && name.ends_with('"') {
+        name[1..name.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\")
+    } else {
+        name.to_string()
+    }
+}
+
+/// Reply-all keeps the original Cc recipients in Cc: the sender and original To
+/// go to To, the original Cc stays in Cc, deduped by address and minus ourselves.
+fn reply_all(message: &Message, own: &str) -> (Vec<Addr>, Vec<Addr>) {
+    let mut seen = HashSet::new();
+    let mut to = Vec::new();
+    let mut cc = Vec::new();
+    let mut push = |addr: &Addr, out: &mut Vec<Addr>| {
         let email = addr.email.trim();
         if email.is_empty() || email.eq_ignore_ascii_case(own) {
-            continue;
+            return;
         }
         if seen.insert(email.to_ascii_lowercase()) {
             out.push(addr.clone());
         }
+    };
+    push(&message.from, &mut to);
+    for addr in &message.to {
+        push(addr, &mut to);
     }
-    out
+    for addr in &message.cc {
+        push(addr, &mut cc);
+    }
+    (to, cc)
 }
 
 /// Adds a prefix once, so replies and forwards never stack their own marker.
@@ -561,11 +706,7 @@ fn quote(message: &Message) -> String {
         .single()
         .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
         .unwrap_or_default();
-    let from = if message.from.name.trim().is_empty() {
-        message.from.email.clone()
-    } else {
-        format!("{} <{}>", message.from.name.trim(), message.from.email.trim())
-    };
+    let from = format_addr(&message.from);
     let quoted = message
         .text
         .lines()
@@ -573,4 +714,20 @@ fn quote(message: &Message) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     format!("\n\nOn {date}, {from} wrote:\n{quoted}")
+}
+
+/// A plausible `local@domain` shape for sending; not a full RFC 5322 validator.
+fn valid_email(email: &str) -> bool {
+    let email = email.trim();
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && !email.contains(char::is_whitespace)
+        && !local.contains('@')
+        && !domain.contains('@')
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
 }

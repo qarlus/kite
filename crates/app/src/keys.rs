@@ -36,6 +36,7 @@ pub mod cmd {
     pub const FORWARD: u8 = 53;
     pub const SEND: u8 = 54;
     pub const COMPOSE_CLOSE: u8 = 55;
+    pub const SHOW_CC: u8 = 56;
 }
 
 pub struct Cmd {
@@ -102,6 +103,7 @@ pub static COMMANDS: &[Cmd] = &[
         "KiteCompose",
         cmd::COMPOSE_CLOSE,
     ),
+    c("Show Cc", &["secondary-shift-c"], "KiteCompose", cmd::SHOW_CC),
     c("Next split", &["tab"], "Kite", cmd::NEXT_SPLIT),
     c("Previous split", &["shift-tab"], "Kite", cmd::PREV_SPLIT),
     c("Undo", &["z"], "Kite", cmd::UNDO),

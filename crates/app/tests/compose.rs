@@ -106,9 +106,13 @@ fn a_replies_to_all_without_self_or_duplicates(cx: &mut TestAppContext) {
         vec![
             addr("Sender 1", "sender1@example.com"),
             addr("Bob", "bob@example.com"),
-            addr("Carol", "carol@example.com"),
         ],
-        "sender first, then To and Cc, with self and duplicates removed"
+        "sender first, then original To, with self and duplicates removed"
+    );
+    assert_eq!(
+        drafts[0].cc,
+        vec![addr("Carol", "carol@example.com")],
+        "original Cc recipients stay in Cc"
     );
 }
 
@@ -225,4 +229,102 @@ fn typing_in_the_body_does_not_run_list_shortcuts(cx: &mut TestAppContext) {
         assert_eq!(kite.open_id(), None, "j did not open a thread");
         assert!(fixture.actions().is_empty(), "nothing reached the engine");
     });
+}
+
+#[gpui_kit::test]
+fn reply_keeps_a_hidden_draft_instead_of_replacing_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-body", cx);
+        window.input("Half written", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), "r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert!(kite.compose_open(), "the draft reopens");
+        assert_eq!(kite.compose_body(cx), "Half written", "the draft survives r");
+        assert_eq!(kite.compose_subject(cx), "", "the reply did not replace the draft");
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Draft kept"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn z_undoes_the_latest_action_not_the_send(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Hi", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert_eq!(fixture.drafts().len(), 1, "the mail was sent");
+    cx.simulate_keystrokes(window.into(), "e");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 1, "e archived the selected thread");
+    });
+    cx.simulate_keystrokes(window.into(), "z");
+    assert!(
+        fixture.cancelled().is_empty(),
+        "z must not cancel the send when the archive is more recent"
+    );
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 2, "z undid the archive");
+    });
+}
+
+#[gpui_kit::test]
+fn reply_quotes_a_display_name_with_a_comma(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_from(1, addr("Doe, Jane", "jane@example.com"));
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), "r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(
+            kite.compose_to(cx),
+            "\"Doe, Jane\" <jane@example.com>",
+            "a comma in the display name is quoted so it stays one recipient"
+        );
+    });
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let drafts = fixture.drafts();
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].to, vec![addr("Doe, Jane", "jane@example.com")]);
+}
+
+#[gpui_kit::test]
+fn invalid_address_is_rejected_with_an_error_toast(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("not-an-email", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert_eq!(fixture.drafts().len(), 0, "no draft is sent");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Invalid address: not-an-email"));
+    })
+    .unwrap();
 }

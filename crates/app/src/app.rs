@@ -116,6 +116,9 @@ pub struct Kite {
     pub(crate) compose_open: bool,
     /// The outbox id of the mail just sent, so Undo can cancel it.
     pub(crate) sent: Option<Id>,
+    pub(crate) sent_stamp: u64,
+    pub(crate) undo_stamp: u64,
+    pub(crate) undo_gen: u64,
     pub(crate) undo: Option<i64>,
     pub(crate) toast: Option<Toast>,
     pub(crate) overlay: Overlay,
@@ -216,6 +219,9 @@ impl Kite {
             compose: None,
             compose_open: false,
             sent: None,
+            sent_stamp: 0,
+            undo_stamp: 0,
+            undo_gen: 0,
             undo: None,
             toast: None,
             overlay: Overlay::None,
@@ -385,6 +391,20 @@ impl Kite {
         .detach();
     }
 
+    /// Stamps and stores an undoable mail action, so Undo picks the latest one.
+    pub(crate) fn record_undo(&mut self, token: i64) {
+        self.undo_gen += 1;
+        self.undo_stamp = self.undo_gen;
+        self.undo = Some(token);
+    }
+
+    /// Stamps and stores a sent outbox id for the undo-send window.
+    pub(crate) fn record_sent(&mut self, id: Id) {
+        self.undo_gen += 1;
+        self.sent_stamp = self.undo_gen;
+        self.sent = Some(id);
+    }
+
     // ---- commands -------------------------------------------------------------
 
     pub(crate) fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -437,7 +457,7 @@ impl Kite {
                 r.unread = false;
             }
             if let Ok(token) = self.mail.act(&[row.id], &MailAction::Read) {
-                self.undo = Some(token);
+                self.record_undo(token);
             }
         }
         self.prefetch(cx);
@@ -509,7 +529,7 @@ impl Kite {
         // Paint the new state first; only then tell the engine.
         cx.notify();
         match self.mail.act(&ids, &action) {
-            Ok(token) => self.undo = Some(token),
+            Ok(token) => self.record_undo(token),
             Err(error) => {
                 self.reload();
                 self.toast(format!("Could not change mail: {error}"), cx);
@@ -642,6 +662,12 @@ impl Kite {
             cmd::FORWARD => self.compose_reply(window, cx, false, true),
             cmd::COMPOSE_CLOSE => self.close_compose(window, cx),
             cmd::SEND => self.send_compose(window, cx),
+            cmd::SHOW_CC => {
+                if let Some(compose) = &mut self.compose {
+                    compose.show_cc = true;
+                }
+                cx.notify();
+            }
             cmd::DONE => {
                 self.act(MailAction::Archive, true, "Marked done", cx);
                 self.pulse = Some((id, self.seq));
@@ -682,14 +708,22 @@ impl Kite {
             cmd::NEXT_SPLIT => self.cycle_split(1, cx),
             cmd::PREV_SPLIT => self.cycle_split(-1, cx),
             cmd::UNDO => {
-                if let Some(id) = self.sent.take() {
-                    match self.mail.cancel_send(id) {
-                        Ok(Some(draft)) => {
-                            self.reopen_sent(window, draft, cx);
-                            self.toast("Send cancelled", cx);
+                let cancel_send = match (self.sent, self.undo) {
+                    (Some(_), Some(_)) => self.sent_stamp > self.undo_stamp,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+                if cancel_send {
+                    if let Some(id) = self.sent.take() {
+                        match self.mail.cancel_send(id) {
+                            Ok(Some(draft)) => {
+                                if self.reopen_sent(window, draft, cx) {
+                                    self.toast("Send cancelled", cx);
+                                }
+                            }
+                            Ok(None) => self.toast("Already sent", cx),
+                            Err(error) => self.toast(format!("Could not cancel: {error}"), cx),
                         }
-                        Ok(None) => self.toast("Already sent", cx),
-                        Err(error) => self.toast(format!("Could not cancel: {error}"), cx),
                     }
                 } else if let Some(token) = self.undo.take() {
                     self.mail.undo(token).ok();
