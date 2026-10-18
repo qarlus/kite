@@ -4,19 +4,24 @@ use common::{Fixture, mount, open_window, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, ScrollDelta, TestAppContext, point, px};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct TempFile(PathBuf);
 impl TempFile {
+    /// Unique per instance: tests in one binary run in parallel, and a clock-based
+    /// name alone can collide, letting one test's drop delete another's file.
     fn new() -> Self {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         Self(std::env::temp_dir().join(format!(
-                "kite-ui-{}-{}.json",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )))
+            "kite-ui-{}-{}-{}.json",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )))
     }
 }
 impl Drop for TempFile {
@@ -195,7 +200,11 @@ async fn an_unreadable_import_keeps_the_current_theme_and_shows_a_visible_error(
     .await;
     cx.update_window(window.into(), |_, window, _| {
         let error = window.find("settings-error");
-        assert!(error.label().unwrap().contains("4.5:1"));
+        let label = error.label().unwrap_or_default();
+        assert!(
+            label.contains("4.5:1"),
+            "unexpected import error: {label:?}"
+        );
         assert!(error.bounds().bottom() <= px(800.));
         assert!(window.try_find("theme-custom").is_none());
         assert_eq!(window.find("theme-dark").selected(), Some(true));

@@ -20,6 +20,12 @@ fn main() {
     let empty = args.iter().any(|arg| arg == "--empty");
     let no_accounts = args.iter().any(|arg| arg == "--no-accounts");
     let focus_search = args.iter().any(|arg| arg == "--focus-search");
+    // `--split N` opens the Nth seeded split, for reviewing the category lenses.
+    let split = args
+        .iter()
+        .position(|arg| arg == "--split")
+        .and_then(|ix| args.get(ix + 1))
+        .and_then(|value| value.parse::<usize>().ok());
     let done = args.iter().any(|arg| arg == "--done");
     gpui_kit::application()
         .with_assets(kite::Assets)
@@ -81,6 +87,9 @@ fn main() {
                         }
                         if focus_search {
                             view.run(kite::keys::cmd::SEARCH, window, cx);
+                        }
+                        for _ in 0..split.unwrap_or(0) {
+                            view.run(kite::keys::cmd::NEXT_SPLIT, window, cx);
                         }
                         if done {
                             view.run(kite::keys::cmd::DONE, window, cx);

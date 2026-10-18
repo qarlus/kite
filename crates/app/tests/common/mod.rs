@@ -14,7 +14,14 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const SPLITS: [Id; 2] = [1, 2];
+pub const SPLITS: [Id; 4] = [1, 2, 3, 4];
+/// The seeded split set, in tab order: the plain inbox lens, then the categories.
+pub const SPLIT_NAMES: [&str; 4] = ["Inbox", "Social", "Newsletters", "GitHub"];
+/// Comma inside `from:` means OR, matching the engine's term syntax.
+pub const SOCIAL_QUERY: &str =
+    "from:facebook.com,instagram.com,linkedin.com,x.com,youtube.com,tiktok.com";
+pub const NEWSLETTER_QUERY: &str = "is:newsletter";
+pub const GITHUB_QUERY: &str = "from:github.com";
 /// The HTML body served for even-numbered threads.
 pub const HTML: &str = "<p>Hello there.</p><p>Second paragraph with enough text to lay out.</p>";
 
@@ -38,6 +45,8 @@ pub struct Fixture {
     /// Every `threads` query, in order.
     pub queries: Mutex<Vec<(View, u32)>>,
     pub opened: Mutex<Vec<Id>>,
+    /// Threads the seeded `is:newsletter` split matches.
+    pub newsletters: Mutex<Vec<Id>>,
     snapshots: Mutex<HashMap<i64, Snapshot>>,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
@@ -114,6 +123,7 @@ impl Fixture {
             undos: Mutex::new(Vec::new()),
             queries: Mutex::new(Vec::new()),
             opened: Mutex::new(Vec::new()),
+            newsletters: Mutex::new(Vec::new()),
             snapshots: Mutex::new(HashMap::new()),
             senders: Mutex::new(Vec::new()),
             next_token: AtomicI64::new(1),
@@ -240,6 +250,7 @@ impl Fixture {
         ];
         let mut rows = fixture.threads.lock().unwrap();
         let mut messages = fixture.messages.lock().unwrap();
+        let mut newsletters = Vec::new();
         for (ix, (sender, subject, snippet)) in samples.into_iter().enumerate() {
             let row = &mut rows[ix];
             row.account_id = if ix % 2 == 0 { 1 } else { 2 };
@@ -249,9 +260,23 @@ impl Fixture {
             row.unread = ix < 3;
             row.starred = ix == 4;
             row.date = chrono::Local::now().timestamp_millis() - ix as i64 * 1_800_000;
+            // A few senders carry an address in a category the seeded splits look
+            // for, so the tabs narrow the list the way the engine's queries would.
+            let address = match sender {
+                "GitHub" => Some("noreply@github.com"),
+                "Maya Patel" => Some("maya@instagram.com"),
+                "Sofia Reyes" => Some("sofia@instagram.com"),
+                _ => None,
+            };
+            if matches!(sender, "Figma" | "Nora Williams") {
+                newsletters.push(row.id);
+            }
             if let Some(thread) = messages.get_mut(&row.id) {
                 for message in thread {
                     message.from.name = sender.into();
+                    if let Some(address) = address {
+                        message.from.email = address.into();
+                    }
                     message.to = vec![Addr {
                         name: "Karl".into(),
                         email: if row.account_id == 1 {
@@ -284,7 +309,46 @@ impl Fixture {
         }
         drop(rows);
         drop(messages);
+        *fixture.newsletters.lock().unwrap() = newsletters;
         fixture
+    }
+
+    /// The query a seeded split stands for, as the engine would resolve it.
+    fn split_query(&self, id: Id) -> Option<String> {
+        self.splits()
+            .ok()?
+            .into_iter()
+            .find(|split| split.id == id)
+            .map(|split| split.query)
+    }
+
+    /// The fixture's slice of the query language: `from:` term lists (comma = OR)
+    /// and `is:newsletter`. Enough for the seeded splits and the search tests.
+    fn matches(&self, query: &str, t: &ThreadSummary) -> bool {
+        query.split_whitespace().all(|term| {
+            if let Some(domains) = term.strip_prefix("from:") {
+                let from = self.sender_address(t.id).to_lowercase();
+                domains
+                    .split(',')
+                    .any(|domain| !domain.is_empty() && from.contains(&domain.to_lowercase()))
+            } else if term == "is:newsletter" {
+                self.newsletters.lock().unwrap().contains(&t.id)
+            } else {
+                let term = term.to_lowercase();
+                t.subject.to_lowercase().contains(&term)
+                    || t.participants.to_lowercase().contains(&term)
+            }
+        })
+    }
+
+    fn sender_address(&self, thread: Id) -> String {
+        self.messages
+            .lock()
+            .unwrap()
+            .get(&thread)
+            .and_then(|messages| messages.first())
+            .map(|message| message.from.email.clone())
+            .unwrap_or_default()
     }
 
     /// Adds a thread and tells the UI the store changed.
@@ -448,8 +512,12 @@ impl Mail for Fixture {
     fn threads(&self, view: &View, offset: u32, limit: u32) -> anyhow::Result<Vec<ThreadSummary>> {
         self.queries.lock().unwrap().push((view.clone(), offset));
         let all = self.threads.lock().unwrap();
-        let important = view.split == Some(SPLITS[0]) || view.split.is_none();
-        let query = view.query.as_deref().map(str::to_lowercase);
+        // The engine resolves a split into its query; so does the fixture.
+        let query = view
+            .query
+            .clone()
+            .or_else(|| view.split.and_then(|id| self.split_query(id)))
+            .unwrap_or_default();
         let rows: Vec<ThreadSummary> = all
             .iter()
             .filter(|t| view.account_id.is_none_or(|id| id == t.account_id))
@@ -471,13 +539,7 @@ impl Mail for Fixture {
                     wanted => mailbox == wanted && folder.is_none(),
                 }
             })
-            .filter(|t| important || !t.important)
-            .filter(|t| {
-                query.as_ref().is_none_or(|q| {
-                    t.subject.to_lowercase().contains(q)
-                        || t.participants.to_lowercase().contains(q)
-                })
-            })
+            .filter(|t| query.trim().is_empty() || self.matches(&query, t))
             .cloned()
             .collect();
         Ok(rows
@@ -581,13 +643,23 @@ impl Mail for Fixture {
         Ok(vec![
             Split {
                 id: SPLITS[0],
-                name: "Important".into(),
+                name: SPLIT_NAMES[0].into(),
                 query: String::new(),
             },
             Split {
                 id: SPLITS[1],
-                name: "Other".into(),
-                query: "important:false".into(),
+                name: SPLIT_NAMES[1].into(),
+                query: SOCIAL_QUERY.into(),
+            },
+            Split {
+                id: SPLITS[2],
+                name: SPLIT_NAMES[2].into(),
+                query: NEWSLETTER_QUERY.into(),
+            },
+            Split {
+                id: SPLITS[3],
+                name: SPLIT_NAMES[3].into(),
+                query: GITHUB_QUERY.into(),
             },
         ])
     }
