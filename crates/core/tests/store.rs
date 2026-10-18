@@ -1,4 +1,5 @@
 //! Integration tests for the local store, against real SQLite.
+#[cfg(not(debug_assertions))]
 use std::time::{Duration, Instant};
 
 use kite_core::model::*;
@@ -143,6 +144,7 @@ fn cleanup(path: &std::path::Path) {
     let _ = std::fs::remove_file(format!("{s}-shm"));
 }
 
+#[cfg(not(debug_assertions))]
 fn median(mut v: Vec<Duration>) -> Duration {
     v.sort();
     v[v.len() / 2]
@@ -693,6 +695,90 @@ fn archive_queues_an_op_and_undo_restores_or_inverts() {
 }
 
 #[test]
+fn undo_re_resolves_the_remote_id_at_undo_time() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let travel = s.create_folder(a.id, "Travel").unwrap();
+    s.apply_deltas(a.id, &[up(msg("INBOX/1", "a@a.com", "One", D0))])
+        .unwrap();
+    let inbox = |s: &Store| s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
+    let tid = inbox(&s)[0].id;
+
+    // The archive reaches the provider, which moves the message and hands back a new remote id.
+    let token = s.act(&[tid], &Action::Archive).unwrap();
+    let (op_id, _) = s.pending_ops(a.id, DUE, 10).unwrap()[0].clone();
+    s.op_done(op_id, Some("Archive/7".into())).unwrap();
+
+    // Undo must address the inverse at where the message lives now: "INBOX/1" is gone from the
+    // server, so re-queueing it verbatim would fail and back off forever.
+    s.undo(token).unwrap();
+    assert_eq!(inbox(&s).len(), 1, "undone locally");
+    let inverse = s.pending_ops(a.id, DUE, 10).unwrap();
+    assert_eq!(inverse.len(), 1);
+    assert!(
+        matches!(
+            &inverse[0].1,
+            Op::Move { remote_id, to: Mailbox::Inbox } if remote_id == "Archive/7"
+        ),
+        "inverse targets the current remote id, got {:?}",
+        inverse[0].1
+    );
+
+    // The server re-reports the message at its real location. The pending inverse still pins the
+    // local placement, then the provider executes it and the local row agrees with the server.
+    s.apply_deltas(
+        a.id,
+        &[up(in_mailbox(
+            msg("Archive/7", "a@a.com", "One", D0),
+            Mailbox::Archive,
+        ))],
+    )
+    .unwrap();
+    assert_eq!(
+        inbox(&s).len(),
+        1,
+        "the pending inverse pins the local placement"
+    );
+    let (op_id, _) = s.pending_ops(a.id, DUE, 10).unwrap()[0].clone();
+    s.op_done(op_id, Some("INBOX/9".into())).unwrap();
+    s.apply_deltas(a.id, &[up(msg("INBOX/9", "a@a.com", "One", D0))])
+        .unwrap();
+    assert_eq!(inbox(&s).len(), 1);
+    assert!(
+        s.threads(&view(Mailbox::Archive), 0, 50)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(s.pending_ops(a.id, DUE, 10).unwrap().is_empty());
+
+    // The same for a folder move, whose inverse is an `Op::MoveToFolder`.
+    let token = s
+        .act(
+            &[tid],
+            &Action::Move {
+                folder: travel.id.clone(),
+            },
+        )
+        .unwrap();
+    let (op_id, forward) = s.pending_ops(a.id, DUE, 10).unwrap()[0].clone();
+    assert!(
+        matches!(&forward, Op::MoveToFolder { remote_id, folder } if remote_id == "INBOX/9" && folder == &travel.id)
+    );
+    s.op_done(op_id, Some("Folders/Travel/3".into())).unwrap();
+    s.undo(token).unwrap();
+    let inverse = s.pending_ops(a.id, DUE, 10).unwrap();
+    assert!(
+        matches!(
+            &inverse[0].1,
+            Op::MoveToFolder { remote_id, folder } if remote_id == "Folders/Travel/3" && folder == "INBOX"
+        ),
+        "folder-move inverse targets the current remote id, got {:?}",
+        inverse[0].1
+    );
+    assert_eq!(inbox(&s).len(), 1, "undone locally");
+}
+
+#[test]
 fn sync_does_not_undo_a_local_change_that_is_still_queued() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
@@ -1194,16 +1280,13 @@ fn a_database_from_before_the_folder_catalog_still_opens() {
     result.unwrap();
 }
 
-#[test]
-fn perf_budgets() {
-    let s = Store::memory().unwrap();
-    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
-    const THREADS: usize = 10_000;
-    const PER_THREAD: usize = 5;
+const PER_THREAD: usize = 5;
 
+/// Seeds `threads * PER_THREAD` messages in batches of 200, shared by the release budget test and
+/// the small debug correctness test below.
+fn seed_threads(s: &Store, account: Id, threads: usize) {
     let mut batch: Vec<Delta> = Vec::with_capacity(200);
-    let start = Instant::now();
-    for i in 0..THREADS {
+    for i in 0..threads {
         for k in 0..PER_THREAD {
             let rid = if k == 0 {
                 format!("r{i}")
@@ -1233,14 +1316,26 @@ fn perf_budgets() {
             }
             batch.push(up(m));
             if batch.len() == 200 {
-                s.apply_deltas(a.id, &batch).unwrap();
+                s.apply_deltas(account, &batch).unwrap();
                 batch.clear();
             }
         }
     }
     if !batch.is_empty() {
-        s.apply_deltas(a.id, &batch).unwrap();
+        s.apply_deltas(account, &batch).unwrap();
     }
+}
+
+// Perf budgets (AGENTS.md) are asserted in release only; a debug build's timings are meaningless.
+#[cfg(not(debug_assertions))]
+#[test]
+fn perf_budgets() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    const THREADS: usize = 10_000;
+
+    let start = Instant::now();
+    seed_threads(&s, a.id, THREADS);
     assert_eq!(THREADS * PER_THREAD, 50_000);
     let insert = start.elapsed();
     assert!(
@@ -1294,4 +1389,29 @@ fn perf_budgets() {
     );
 
     println!("perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?}");
+}
+
+// The queries the budget test measures, on a tiny fixture so debug runs stay fast.
+#[cfg(debug_assertions)]
+#[test]
+fn budget_queries_still_return_rows_in_debug() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    seed_threads(&s, a.id, 40);
+
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 200).unwrap().len(), 40);
+    assert!(
+        !s.threads(&search(Mailbox::Inbox, "banana"), 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !s.threads(
+            &search(Mailbox::Inbox, "from:person7@example.com banana"),
+            0,
+            200
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
