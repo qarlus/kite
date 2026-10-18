@@ -37,6 +37,7 @@ Agents edit only their files. Shared manifests (`Cargo.toml`s) may only gain the
 | Contract + docs (orchestrator) | `model.rs`, `api.rs`, `sync/mod.rs`, `docs/*`, `AGENTS.md`, `.github/*` |
 | Store | `crates/core/src/store.rs`, `crates/core/tests/store.rs` |
 | IMAP | `crates/core/src/sync/imap.rs`, `crates/core/tests/imap.rs` |
+| Bridge discovery | `crates/core/src/bridge.rs`, `crates/core/tests/bridge.rs` |
 | Graph + auth | `crates/core/src/sync/graph.rs`, `crates/core/src/auth.rs`, `crates/core/tests/graph.rs` |
 | Engine | `crates/core/src/engine.rs`, `crates/core/src/ai.rs`, `crates/core/tests/engine.rs` |
 | UI shell | `crates/app/src/**` except `compose/`, `crates/app/tests/**` except `compose.rs` |
@@ -58,7 +59,9 @@ The engine is connected: production `main.rs` opens `kite_core::engine::Engine` 
 
 ## Appearance and preferences
 
-`preferences.rs` owns the settings page, native theme import and account setup UI. `theme.rs` resolves owned palette values; imported palettes never require leaked static allocations. `Settings` gains serde-defaulted typography, custom palette and shortcut-footer fields. `CustomTheme` holds a display name, light/dark base and validated colour-token map. No account credentials are added to Settings.
+`preferences/` owns the settings page: `mod.rs` is the shell (navigation rail, grouped-card helpers, save/apply) and each page owns one file and its own state — `appearance.rs` (themes, typography), `accounts.rs` (connected mailboxes, provider sign-in), `general.rs` (undo send, privacy, AI). A page can change without touching the shell, and page state is reached only through `preferences::<page>::State`. `theme.rs` resolves owned palette values; imported palettes never require leaked static allocations. `Settings` gains serde-defaulted typography, custom palette and shortcut-footer fields. `CustomTheme` holds a display name, light/dark base and validated colour-token map. No account credentials are added to Settings.
+
+Proton Bridge accounts are discovered rather than typed: `crates/core/src/bridge.rs` reads Bridge's own read-only vault (AES-256-GCM over msgpack, keyed by a master key in the OS keychain) to recover each account's primary address, generated Bridge password and the exact IMAP/SMTP ports Bridge chose, then returns `ProtonLogin` values through `Mail::discover_proton`. The vault key is used in memory for one call and never persisted. Discovery runs on the background executor; a failure falls back to the pre-filled manual form so setup is never blocked.
 
 The bottom switcher remains in the cached sidebar. The cached view is invalidated on account, folder, scope, theme or typography changes. Typography scales text and row height; the default 44px list density is unchanged. Every appearance change increments the HTML cache generation, so old background renders cannot replace newly styled mail. Provider account work is globally gated while a request is pending, even if Settings is closed and reopened.
 

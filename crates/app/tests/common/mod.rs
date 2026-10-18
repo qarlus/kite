@@ -33,6 +33,9 @@ pub struct Fixture {
     pub locations: Mutex<Locations>,
     pub folder_error: Mutex<Option<String>>,
     pub account_error: Mutex<Option<String>>,
+    /// What `discover_proton` returns; set by settings tests to fake a local Bridge.
+    pub discovered: Mutex<Vec<ProtonLogin>>,
+    pub discover_error: Mutex<Option<String>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
@@ -110,6 +113,8 @@ impl Fixture {
             locations: Mutex::new(HashMap::new()),
             folder_error: Mutex::new(None),
             account_error: Mutex::new(None),
+            discovered: Mutex::new(Vec::new()),
+            discover_error: Mutex::new(None),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
@@ -485,6 +490,13 @@ impl Mail for Fixture {
         };
         accounts.push(account.clone());
         Ok(account)
+    }
+
+    fn discover_proton(&self) -> anyhow::Result<Vec<ProtonLogin>> {
+        if let Some(error) = self.discover_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        Ok(self.discovered.lock().unwrap().clone())
     }
 
     fn add_microsoft(&self) -> anyhow::Result<Account> {
