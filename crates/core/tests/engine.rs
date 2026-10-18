@@ -478,9 +478,14 @@ fn a_backend_error_is_reported_and_the_loop_recovers() {
         .folder("INBOX")
         .push(SECOND, &[]);
     engine.sync_now();
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let threads = engine.threads(&inbox(account.id), 0, 50).expect("threads");
-    assert!(threads.iter().any(|t| t.subject == "Lunch?"));
+    // Each synced batch announces itself, so Changed events from the first sync may still be queued.
+    while !engine
+        .threads(&inbox(account.id), 0, 50)
+        .expect("threads")
+        .iter()
+        .any(|t| t.subject == "Lunch?")
+    {
+        events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+    }
     assert_eq!(engine.accounts().expect("accounts").len(), 1);
 }
