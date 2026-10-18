@@ -37,6 +37,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }
+# Proton Bridge vault: AES-256-GCM over msgpack.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+rmp-serde = "1"
+# Win32 credential enumeration for the Bridge vault key (Keyring cannot enumerate).
+windows = "0.62"
 
 [profile.dev]
 debug = "line-tables-only"
