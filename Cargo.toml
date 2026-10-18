@@ -52,3 +52,11 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Fast-building stand-in for release when iterating on perf budgets: thin LTO over
+# parallel codegen units builds several times faster than fat LTO with 1 unit.
+# Ship and measure the size budget with `release` only.
+[profile.perf]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
