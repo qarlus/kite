@@ -36,6 +36,11 @@ pub struct Fixture {
     /// What `discover_proton` returns; set by settings tests to fake a local Bridge.
     pub discovered: Mutex<Vec<ProtonLogin>>,
     pub discover_error: Mutex<Option<String>>,
+    /// Whether `start_proton_bridge` finds an install, and how many times it was asked.
+    pub bridge_installed: Mutex<bool>,
+    pub bridge_started: Mutex<usize>,
+    /// Accounts that become discoverable once Bridge has been started.
+    pub bridge_accounts: Mutex<Vec<ProtonLogin>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
@@ -117,6 +122,9 @@ impl Fixture {
             account_error: Mutex::new(None),
             discovered: Mutex::new(Vec::new()),
             discover_error: Mutex::new(None),
+            bridge_installed: Mutex::new(false),
+            bridge_started: Mutex::new(0),
+            bridge_accounts: Mutex::new(Vec::new()),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
@@ -500,6 +508,20 @@ impl Mail for Fixture {
             anyhow::bail!(error);
         }
         Ok(self.discovered.lock().unwrap().clone())
+    }
+
+    fn start_proton_bridge(&self) -> anyhow::Result<bool> {
+        *self.bridge_started.lock().unwrap() += 1;
+        if !*self.bridge_installed.lock().unwrap() {
+            return Ok(false);
+        }
+        // Bridge is up: its vault is readable again and its port answers.
+        *self.discover_error.lock().unwrap() = None;
+        let accounts = self.bridge_accounts.lock().unwrap().clone();
+        if !accounts.is_empty() {
+            *self.discovered.lock().unwrap() = accounts;
+        }
+        Ok(true)
     }
 
     fn add_microsoft(&self) -> anyhow::Result<Account> {

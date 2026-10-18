@@ -21,6 +21,8 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::Path;
+#[cfg(windows)]
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// `File.Version` of the vault layout this module understands.
@@ -235,6 +237,61 @@ fn probe(port: u16) -> Result<()> {
             "Proton Bridge is not running (nothing accepts connections on {addr}: {e})"
         )),
     }
+}
+
+/// Starts Proton Bridge when it is installed, so a signed-in Bridge can be brought up without
+/// the user leaving Kite. Returns `false` when no install is found.
+///
+/// Bridge owns the Proton sign-in (SRP, 2FA, security keys); when it opens locked, its own
+/// window asks for the account password and Kite only waits for the IMAP port to answer.
+#[cfg(windows)]
+pub fn launch() -> Result<bool> {
+    use std::os::windows::process::CommandExt as _;
+    /// Bridge outlives Kite and must not inherit its console or process group.
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    let Some(exe) = bridge_exe() else {
+        return Ok(false);
+    };
+    Command::new(&exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP)
+        .spawn()
+        .with_context(|| format!("could not start {}", exe.display()))?;
+    Ok(true)
+}
+
+/// Starting a program is a Windows-installer concern; elsewhere discovery still works when the
+/// user starts Bridge themselves.
+#[cfg(not(windows))]
+pub fn launch() -> Result<bool> {
+    Ok(false)
+}
+
+/// The default Proton Bridge install, in the order Windows installers use.
+#[cfg(windows)]
+fn bridge_exe() -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for (key, prefix) in [
+        ("ProgramFiles", None),
+        ("ProgramFiles(x86)", None),
+        ("LOCALAPPDATA", Some("Programs")),
+    ] {
+        let Some(base) = std::env::var_os(key) else {
+            continue;
+        };
+        let mut path = std::path::PathBuf::from(base);
+        if let Some(prefix) = prefix {
+            path.push(prefix);
+        }
+        path.push("Proton AG");
+        path.push("Proton Mail Bridge");
+        path.push("proton-bridge.exe");
+        candidates.push(path);
+    }
+    candidates.into_iter().find(|path| path.is_file())
 }
 
 #[cfg(windows)]

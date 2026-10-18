@@ -1,8 +1,10 @@
 //! Connections: Proton Bridge discovery, Outlook sign-in and manual Bridge credentials.
 //!
-//! Opening this page looks for Bridge and creates any account it finds, so the everyday
-//! path is zero clicks. The manual form is only a fallback when Bridge is missing or locked.
-use super::{card, heading, row, button};
+//! Opening this page looks for Bridge, starts it when it is installed but closed, and creates
+//! every account it finds — so the everyday path is zero clicks. Bridge keeps the Proton
+//! sign-in (SRP, 2FA, security keys); when it opens locked, Kite waits and tells the user to
+//! finish there. The manual form is only a fallback.
+use super::{button, card, heading, row};
 use crate::app::Kite;
 use crate::theme::{RADIUS_SM, Theme};
 use gpui_kit::assets::IconName;
@@ -12,14 +14,21 @@ use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::ProtonLogin;
+use std::time::Duration;
+
+/// How long to wait for a started Bridge to answer, in 500 ms steps (10 s).
+const POLL_INTERVAL: Duration = Duration::from_millis(500);
+const POLL_ATTEMPTS: usize = 20;
 
 pub struct State {
     pub email: Entity<InputState>,
     pub password: Entity<InputState>,
     /// The manual Proton form is open.
     pub proton: bool,
-    /// `discover_proton` is running off the UI thread.
+    /// Discovery or a Bridge start is running off the UI thread.
     pub detecting: bool,
+    /// Bridge was started but never answered, so it is waiting for a Proton sign-in.
+    pub needs_signin: bool,
     /// Every account Bridge reported, connected or not.
     pub found: Vec<ProtonLogin>,
     /// Discovered accounts still waiting to be created, oldest first.
@@ -38,11 +47,23 @@ impl State {
             password,
             proton: false,
             detecting: false,
+            needs_signin: false,
             found: Vec::new(),
             queue: Vec::new(),
             searched: false,
         }
     }
+}
+
+/// What one look-for-Bridge pass produced.
+enum Outcome {
+    Found(Vec<ProtonLogin>),
+    /// Bridge is not installed, so there is nothing to start.
+    NoBridge,
+    /// Bridge is running but still locked, waiting for the user to sign in to Proton.
+    SignIn,
+    /// Bridge is present but its vault could not be read.
+    Failed(String),
 }
 
 /// The one accent action on the page. Everything else stays quiet.
@@ -82,8 +103,8 @@ fn spinner(t: Theme) -> Spinner {
 }
 
 impl Kite {
-    /// Looks for Bridge accounts off the UI thread and creates the ones not connected yet.
-    /// A failure or an empty result reveals the manual form so setup is never blocked.
+    /// Looks for Bridge off the UI thread, starting it when installed but closed, then creates
+    /// every account it has that Kite is not already holding.
     pub(crate) fn find_proton_bridge(&mut self, cx: &mut Context<Self>) {
         if self.account_busy {
             return;
@@ -97,17 +118,47 @@ impl Kite {
             }
             page.connections.detecting = true;
             page.connections.searched = false;
+            page.connections.needs_signin = false;
             page.connections.found.clear();
             page.connections.queue.clear();
             page.error = None;
             page.notice = None;
             (page.request, self.mail.clone())
         };
-        let task = cx
-            .background_executor()
-            .spawn(async move { mail.discover_proton() });
+
+        let executor = cx.background_executor().clone();
+        let wait = executor.clone();
+        let task = executor.spawn(async move {
+            // 1. Bridge may already be up with a readable vault.
+            let first = mail.discover_proton();
+            let first_error = match first {
+                Ok(accounts) if !accounts.is_empty() => return Outcome::Found(accounts),
+                Ok(_) => None,
+                Err(error) => Some(error.to_string()),
+            };
+            // 2. Start it when it is installed.
+            if !mail.start_proton_bridge().unwrap_or(false) {
+                return match first_error {
+                    Some(error) => Outcome::Failed(error),
+                    None => Outcome::NoBridge,
+                };
+            }
+            // 3. Wait for the port. A locked Bridge opens its own sign-in window meanwhile.
+            for attempt in 0..POLL_ATTEMPTS {
+                if attempt > 0 {
+                    wait.timer(POLL_INTERVAL).await;
+                }
+                if let Ok(accounts) = mail.discover_proton()
+                    && !accounts.is_empty()
+                {
+                    return Outcome::Found(accounts);
+                }
+            }
+            Outcome::SignIn
+        });
+
         cx.spawn(async move |this, cx| {
-            let result = task.await;
+            let outcome = task.await;
             this.update(cx, |this, cx| {
                 let active = this
                     .preferences
@@ -116,40 +167,30 @@ impl Kite {
                 if let Some(page) = &mut this.preferences {
                     page.connections.detecting = false;
                 }
-                if active {
-                    match result {
-                        Ok(found) => {
-                            let connected: Vec<String> =
-                                this.accounts.iter().map(|a| a.email.clone()).collect();
-                            if let Some(page) = &mut this.preferences {
-                                page.connections.searched = true;
-                                page.connections.found = found;
-                                page.connections.queue = page
-                                    .connections
-                                    .found
-                                    .iter()
-                                    .filter(|login| !connected.contains(&login.email))
-                                    .cloned()
-                                    .collect();
-                                // No Bridge at all: offer the manual form straight away.
-                                if page.connections.found.is_empty() {
-                                    page.connections.proton = true;
-                                }
-                            }
-                            let next = this
-                                .preferences
-                                .as_ref()
-                                .and_then(|page| page.connections.queue.first().cloned());
-                            if let Some(login) = next {
-                                this.connect_login(Some(login), cx);
-                            }
+                if !active {
+                    return;
+                }
+                match outcome {
+                    Outcome::Found(found) => this.accept_discovered(found, cx),
+                    Outcome::NoBridge => {
+                        if let Some(page) = &mut this.preferences {
+                            page.connections.searched = true;
+                            page.connections.proton = false;
                         }
-                        Err(error) => {
-                            if let Some(page) = &mut this.preferences {
-                                page.connections.proton = true;
-                                page.error =
-                                    Some(format!("Could not look for Proton Bridge: {error}"));
-                            }
+                    }
+                    Outcome::SignIn => {
+                        if let Some(page) = &mut this.preferences {
+                            page.connections.searched = true;
+                            page.connections.needs_signin = true;
+                            page.connections.proton = false;
+                        }
+                    }
+                    Outcome::Failed(error) => {
+                        if let Some(page) = &mut this.preferences {
+                            page.connections.searched = true;
+                            page.connections.proton = true;
+                            page.error =
+                                Some(format!("Could not look for Proton Bridge: {error}"));
                         }
                     }
                 }
@@ -159,6 +200,31 @@ impl Kite {
         })
         .detach();
         cx.notify();
+    }
+
+    /// Queues every discovered account Kite is not already holding and starts creating them.
+    fn accept_discovered(&mut self, found: Vec<ProtonLogin>, cx: &mut Context<Self>) {
+        let connected: Vec<String> = self.accounts.iter().map(|a| a.email.clone()).collect();
+        let next = {
+            let Some(page) = &mut self.preferences else {
+                return;
+            };
+            page.connections.searched = true;
+            page.connections.needs_signin = false;
+            page.connections.proton = false;
+            page.connections.found = found;
+            page.connections.queue = page
+                .connections
+                .found
+                .iter()
+                .filter(|login| !connected.contains(&login.email))
+                .cloned()
+                .collect();
+            page.connections.queue.first().cloned()
+        };
+        if let Some(login) = next {
+            self.connect_login(Some(login), cx);
+        }
     }
 
     fn connect_account(&mut self, proton: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -286,9 +352,11 @@ fn bridge_status(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
     let connections = &page.connections;
     let searching = connections.detecting || page.accounts.busy;
     let description = if connections.detecting {
-        "Looking for Proton Bridge…".to_string()
+        "Looking for Proton Bridge, starting it if needed…".to_string()
     } else if page.accounts.busy {
         "Creating your account from Bridge…".to_string()
+    } else if connections.needs_signin {
+        "Proton Bridge is open and waiting for you to sign in to Proton. Finish signing in there, then look again.".to_string()
     } else if !connections.found.is_empty() {
         format!(
             "Connected {} from Bridge — nothing to type.",
@@ -300,7 +368,7 @@ fn bridge_status(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
                 .join(", ")
         )
     } else if connections.searched {
-        "No local Proton Bridge found. Open Bridge and look again, or connect below.".to_string()
+        "No local Proton Bridge found. Install Bridge, or connect Outlook below.".to_string()
     } else {
         "Uses the accounts Proton Bridge already set up on this computer.".to_string()
     };
@@ -336,7 +404,7 @@ fn bridge_status(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
                         } else {
                             t.ok
                         })
-                        .child(description),
+                        .child(description.clone()),
                 ),
         )
         .when(!searching, |d| {

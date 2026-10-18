@@ -16,6 +16,13 @@ pub trait Mail: Send + Sync + 'static {
         crate::bridge::discover()
     }
 
+    /// Starts Proton Bridge when it is installed, returning whether an install was launched.
+    /// Blocking; callers must run it off the UI thread. Bridge keeps the Proton sign-in itself,
+    /// so a locked Bridge still needs the user in its own window.
+    fn start_proton_bridge(&self) -> Result<bool> {
+        crate::bridge::launch()
+    }
+
     /// Locally known custom folders, with provider identities scoped to their accounts.
     fn folders(&self) -> Result<Vec<Folder>> {
         Ok(Vec::new())
