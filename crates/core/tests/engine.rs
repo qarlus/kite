@@ -147,10 +147,12 @@ fn sse_server(chunks: &[&str]) -> String {
         let header =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         let _ = sock.write_all(header.as_bytes());
-        for payload in &payloads {
-            let _ = sock.write_all(payload.as_bytes());
+        // Dribble the body out a byte at a time so multi-byte characters straddle network reads.
+        for byte in payloads.concat().bytes() {
+            let _ = sock.write_all(&[byte]);
+            let _ = sock.flush();
+            std::thread::sleep(std::time::Duration::from_micros(300));
         }
-        let _ = sock.flush();
     });
     address
 }
@@ -408,7 +410,7 @@ fn ai_streams_sse_chunks_in_order() {
     let address = sse_server(&[
         r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
         r#"{"choices":[{"delta":{"content":"lo, "}}]}"#,
-        r#"{"choices":[{"delta":{"content":"world"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"wörld 🙂"}}]}"#,
         "[DONE]",
     ]);
     let dir = temp_dir();
@@ -445,7 +447,7 @@ fn ai_streams_sse_chunks_in_order() {
             other => panic!("unexpected event {other:?}"),
         }
     }
-    assert_eq!(deltas, vec!["Hel", "lo, ", "world"]);
+    assert_eq!(deltas, vec!["Hel", "lo, ", "wörld 🙂"]);
 }
 
 #[test]
