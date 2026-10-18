@@ -30,6 +30,13 @@ pub mod cmd {
     pub const ACCOUNT_SWITCHER: u8 = 32;
     pub const MANAGE_ACCOUNTS: u8 = 33;
     pub const ACCOUNT: u8 = 40;
+    pub const COMPOSE: u8 = 50;
+    pub const REPLY: u8 = 51;
+    pub const REPLY_ALL: u8 = 52;
+    pub const FORWARD: u8 = 53;
+    pub const SEND: u8 = 54;
+    pub const COMPOSE_CLOSE: u8 = 55;
+    pub const SHOW_CC: u8 = 56;
 }
 
 pub struct Cmd {
@@ -85,6 +92,18 @@ pub static COMMANDS: &[Cmd] = &[
     c("Select", &["x"], "KiteList", cmd::SELECT),
     c("Search", &["/"], "KiteList", cmd::SEARCH),
     c("Command palette", &["secondary-k"], "Kite", cmd::PALETTE),
+    c("Compose", &["c"], "Kite", cmd::COMPOSE),
+    c("Reply", &["r"], "Kite", cmd::REPLY),
+    c("Reply all", &["a"], "Kite", cmd::REPLY_ALL),
+    c("Forward", &["f"], "Kite", cmd::FORWARD),
+    c("Send", &["secondary-enter"], "KiteCompose", cmd::SEND),
+    c(
+        "Close compose",
+        &["escape"],
+        "KiteCompose",
+        cmd::COMPOSE_CLOSE,
+    ),
+    c("Show Cc", &["secondary-shift-c"], "KiteCompose", cmd::SHOW_CC),
     c("Next split", &["tab"], "Kite", cmd::NEXT_SPLIT),
     c("Previous split", &["shift-tab"], "Kite", cmd::PREV_SPLIT),
     c("Undo", &["z"], "Kite", cmd::UNDO),
@@ -149,6 +168,16 @@ pub fn bind(cx: &mut App) {
                     },
                 ),
             ));
+            // Compose fields focus an Input, which binds Enter, Escape and
+            // friends at a deeper context. Re-bind at that depth so the field
+            // keys win; later bindings win a tie.
+            if command.ctx == "KiteCompose" {
+                bindings.push(KeyBinding::new(
+                    key,
+                    Act { cmd: command.id },
+                    Some("KiteCompose > Input"),
+                ));
+            }
             // Reading actions must not match while the titlebar search input has focus.
             if matches!(
                 command.id,
