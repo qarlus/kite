@@ -1118,9 +1118,20 @@ impl Store {
                 if queued.is_some() {
                     tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
                 } else if let Some(inv) = r.inverse {
+                    // A move that already reached the server changed remote_id (op_done). The
+                    // stored inverse still names the old one, so re-address it at where the
+                    // message actually lives now, or it would fail and retry forever.
+                    let mut op: Op = serde_json::from_str(&inv)?;
+                    let current = match r.message_id {
+                        Some(mid) => current_remote_id(&tx, mid)?,
+                        None => None,
+                    };
+                    if let Some(rid) = current {
+                        op = with_remote_id(op, &rid);
+                    }
                     tx.execute(
                         "INSERT INTO pending_ops(account_id, message_id, op, inverse, at) VALUES (?1,?2,?3,NULL,?4)",
-                        params![r.account_id, r.message_id, inv, now_ms()],
+                        params![r.account_id, r.message_id, json(&op)?, now_ms()],
                     )?;
                 }
             }
@@ -1146,6 +1157,39 @@ type Plan = (
     Option<Op>,
     Option<Op>,
 );
+
+/// Replaces the remote id an op is addressed to. A move changes it (op_done receives the new
+/// one), so an inverse captured when the action was taken can name an id the server no longer has.
+fn with_remote_id(op: Op, remote_id: &str) -> Op {
+    match op {
+        Op::Move { to, .. } => Op::Move {
+            remote_id: remote_id.into(),
+            to,
+        },
+        Op::MoveToFolder { folder, .. } => Op::MoveToFolder {
+            remote_id: remote_id.into(),
+            folder,
+        },
+        Op::Flags {
+            unread, starred, ..
+        } => Op::Flags {
+            remote_id: remote_id.into(),
+            unread,
+            starred,
+        },
+        Op::Send { mime } => Op::Send { mime },
+    }
+}
+
+fn current_remote_id(tx: &Transaction, message_id: Id) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT remote_id FROM messages WHERE id=?1",
+            [message_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
 
 fn move_op(remote_id: &str, to: Mailbox) -> Op {
     Op::Move {
