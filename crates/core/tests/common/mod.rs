@@ -593,6 +593,26 @@ Content-Type: text/plain; charset=utf-8\r\n\
 \r\n\
 lunch today?\r\n";
 
+pub const BULK_UNSUB: &[u8] = b"From: Newsletter <news@stack.example>\r\n\
+To: karl@example.com\r\n\
+Subject: Weekly digest\r\n\
+Date: Thu, 08 May 2025 10:00:00 +0000\r\n\
+Message-ID: <weekly@stack.example>\r\n\
+List-Unsubscribe: <mailto:unsub@stack.example>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+weekly digest\r\n";
+
+pub const BULK_LISTID: &[u8] = b"From: Dev list <list@example.org>\r\n\
+To: karl@example.com\r\n\
+Subject: Mailing list post\r\n\
+Date: Fri, 09 May 2025 10:00:00 +0000\r\n\
+Message-ID: <listmsg@example.org>\r\n\
+List-Id: <dev.example.org>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+list message\r\n";
+
 pub fn upserts(deltas: &[Delta]) -> Vec<&RemoteMsg> {
     deltas
         .iter()

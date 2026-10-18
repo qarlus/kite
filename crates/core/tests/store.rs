@@ -36,8 +36,14 @@ fn msg(remote_id: &str, from: &str, subject: &str, date: Ms) -> RemoteMsg {
         unread: false,
         starred: false,
         important: None,
+        list_unsubscribe: false,
         attachments: Vec::new(),
     }
+}
+
+fn bulk(mut m: RemoteMsg) -> RemoteMsg {
+    m.list_unsubscribe = true;
+    m
 }
 
 fn body(mut m: RemoteMsg, text: &str) -> RemoteMsg {
@@ -400,26 +406,33 @@ fn search_grammar_selects_the_right_threads_and_is_injection_proof() {
 }
 
 #[test]
-fn splits_partition_the_inbox() {
+fn default_splits_are_the_new_categories() {
     let s = Store::memory().unwrap();
     let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
     let splits = s.splits().unwrap();
-    assert_eq!(splits.len(), 2, "Important/Other are seeded on first open");
-    assert_eq!(splits[0].name, "Important");
-    assert_eq!(splits[1].name, "Other");
+    let names: Vec<&str> = splits.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, vec!["Inbox", "Social", "Newsletters", "GitHub"]);
+    assert_eq!(splits[0].query, "", "Inbox filters nothing on purpose");
+    assert_eq!(
+        splits[1].query,
+        "from:linkedin.com,x.com,twitter.com,facebook.com,instagram.com,threads.net,bsky.app,mastodon.social"
+    );
+    assert_eq!(splits[2].query, "is:newsletter");
+    assert_eq!(splits[3].query, "from:github.com");
 
     s.apply_deltas(
         a.id,
         &[
-            up(flagged(msg("1", "a@a.com", "Important one", D0), true)),
-            up(flagged(msg("2", "b@b.com", "Important two", D0 + 1), true)),
-            up(flagged(msg("3", "c@c.com", "Boring", D0 + 2), false)),
-            up(flagged(msg("4", "d@d.com", "Also boring", D0 + 3), false)),
+            up(msg("1", "ada@linkedin.com", "Connect", D0)),
+            up(bulk(msg("2", "news@stack.com", "Weekly", D0 + 1))),
+            up(msg("3", "bob@github.com", "PR merged", D0 + 2)),
+            up(msg("4", "carol@corp.com", "Lunch", D0 + 3)),
         ],
     )
     .unwrap();
 
-    let imp = s
+    let plain = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
+    let inbox_split = s
         .threads(
             &View {
                 split: Some(splits[0].id),
@@ -429,29 +442,175 @@ fn splits_partition_the_inbox() {
             50,
         )
         .unwrap();
-    let other = s
-        .threads(
-            &View {
-                split: Some(splits[1].id),
-                ..view(Mailbox::Inbox)
-            },
-            0,
-            50,
-        )
-        .unwrap();
-    let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
-
-    assert_eq!(imp.len(), 2);
-    assert_eq!(other.len(), 2);
+    let ids = |v: &[ThreadSummary]| {
+        let mut ids: Vec<Id> = v.iter().map(|t| t.id).collect();
+        ids.sort();
+        ids
+    };
     assert_eq!(
-        imp.len() + other.len(),
-        inbox.len(),
-        "Important ∪ Other = Inbox"
+        ids(&plain),
+        ids(&inbox_split),
+        "Inbox is a real no-op split"
     );
-    let ids: Vec<Id> = imp.iter().chain(other.iter()).map(|t| t.id).collect();
-    let unique: std::collections::HashSet<Id> = ids.iter().copied().collect();
-    assert_eq!(unique.len(), 4, "the splits are disjoint");
-    assert!(imp.iter().all(|t| t.important) && other.iter().all(|t| !t.important));
+    assert_eq!(plain.len(), 4);
+}
+
+#[test]
+fn category_splits_are_lenses_not_a_partition() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let splits = s.splits().unwrap();
+    let by_name = |name: &str| splits.iter().find(|s| s.name == name).unwrap().id;
+
+    // A GitHub newsletter belongs to Inbox, Newsletters and GitHub at once.
+    s.apply_deltas(
+        a.id,
+        &[
+            up(bulk(msg("1", "noreply@github.com", "Release notes", D0))),
+            up(msg("2", "ada@linkedin.com", "Connect", D0 + 1)),
+            up(bulk(msg("3", "news@stack.com", "Weekly", D0 + 2))),
+            up(msg("4", "carol@corp.com", "Lunch", D0 + 3)),
+        ],
+    )
+    .unwrap();
+
+    let subjects = |split: &str| {
+        let mut v: Vec<String> = s
+            .threads(
+                &View {
+                    split: Some(by_name(split)),
+                    ..view(Mailbox::Inbox)
+                },
+                0,
+                50,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|t| t.subject)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 50).unwrap().len(), 4);
+    assert_eq!(subjects("Social"), vec!["Connect"]);
+    assert_eq!(subjects("Newsletters"), vec!["Release notes", "Weekly"]);
+    assert_eq!(subjects("GitHub"), vec!["Release notes"]);
+}
+
+#[test]
+fn newsletter_flag_selects_bulk_threads_and_negation_the_rest() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(bulk(msg("1", "news@stack.com", "Weekly", D0))),
+            up(msg("2", "ada@corp.com", "Lunch", D0 + 1)),
+            up(msg("3", "bob@corp.com", "Deploy", D0 + 2)),
+        ],
+    )
+    .unwrap();
+    let subjects = |q: &str| {
+        let mut v: Vec<String> = s
+            .threads(&search(Mailbox::Inbox, q), 0, 50)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.subject)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(subjects("is:newsletter"), vec!["Weekly"]);
+    assert_eq!(subjects("-is:newsletter"), vec!["Deploy", "Lunch"]);
+}
+
+#[test]
+fn comma_separated_people_terms_or_while_separate_terms_and() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("1", "ada@a.com", "From A", D0)),
+            up(msg("2", "bob@b.com", "From B", D0 + 1)),
+            up(msg("3", "carol@c.com", "From C", D0 + 2)),
+        ],
+    )
+    .unwrap();
+    let subjects = |q: &str| {
+        let mut v: Vec<String> = s
+            .threads(&search(Mailbox::Inbox, q), 0, 50)
+            .unwrap()
+            .into_iter()
+            .map(|t| t.subject)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(subjects("from:a.com,b.com"), vec!["From A", "From B"]);
+    assert_eq!(subjects("to:a.com,b.com"), Vec::<String>::new());
+    assert_eq!(
+        subjects("from:a.com from:b.com"),
+        Vec::<String>::new(),
+        "separate from: terms still AND over one thread"
+    );
+    assert_eq!(subjects("from:a.com"), vec!["From A"]);
+    // A comma never survives into a pattern.
+    assert_eq!(subjects("from:,"), Vec::<String>::new());
+}
+
+#[test]
+fn legacy_seeded_splits_migrate_to_the_new_defaults() {
+    let path = temp_db("split-defaults");
+    let result = (|| {
+        let s = Store::open(&path)?;
+        let a = s.add_account(Provider::Proton, "me@x.com", "Me")?;
+        s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])?;
+        drop(s);
+        // The database shipped before this change: the two legacy seeds, nothing else.
+        {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.execute_batch(
+                "DELETE FROM splits;
+                 INSERT INTO splits(id, name, query, position) VALUES (1, 'Important', 'is:important', 0);
+                 INSERT INTO splits(id, name, query, position) VALUES (2, 'Other', '-is:important', 1);",
+            )?;
+        }
+        let s = Store::open(&path)?;
+        let names: Vec<String> = s.splits()?.into_iter().map(|s| s.name).collect();
+        assert_eq!(names, vec!["Inbox", "Social", "Newsletters", "GitHub"]);
+        assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 50)?.len(), 1);
+        Ok::<(), anyhow::Error>(())
+    })();
+    cleanup(&path);
+    result.unwrap();
+}
+
+#[test]
+fn customised_splits_are_not_migrated() {
+    let path = temp_db("split-custom");
+    let result = (|| {
+        let s = Store::open(&path)?;
+        drop(s);
+        {
+            let conn = rusqlite::Connection::open(&path)?;
+            conn.execute_batch(
+                "DELETE FROM splits;
+                 INSERT INTO splits(id, name, query, position) VALUES (1, 'VIP', 'is:important', 0);
+                 INSERT INTO splits(id, name, query, position) VALUES (2, 'Other', '-is:important', 1);",
+            )?;
+        }
+        let s = Store::open(&path)?;
+        let names: Vec<String> = s.splits()?.into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec!["VIP", "Other"],
+            "a rename means the user owns it"
+        );
+        Ok::<(), anyhow::Error>(())
+    })();
+    cleanup(&path);
+    result.unwrap();
 }
 
 #[test]

@@ -115,8 +115,16 @@ CREATE TRIGGER messages_au AFTER UPDATE OF subject, from_email, to_json, cc_json
   VALUES (new.id, new.subject, new.from_email, new.to_json || ' ' || new.cc_json, new.text);
 END;
 
-INSERT INTO splits(id, name, query, position) VALUES (1, 'Important', 'is:important', 0);
-INSERT INTO splits(id, name, query, position) VALUES (2, 'Other', '-is:important', 1);
+"#;
+
+/// The split tabs a fresh store starts with, and what a still-unmodified legacy store migrates to.
+/// `Inbox` has an empty query on purpose: it is a real row (so the UI tab strip renders it) that
+/// filters nothing. The category lenses are not exclusive, so a conversation may appear in several.
+const DEFAULT_SPLITS: &str = r#"
+INSERT INTO splits(id, name, query, position) VALUES (1, 'Inbox', '', 0);
+INSERT INTO splits(id, name, query, position) VALUES (2, 'Social', 'from:linkedin.com,x.com,twitter.com,facebook.com,instagram.com,threads.net,bsky.app,mastodon.social', 1);
+INSERT INTO splits(id, name, query, position) VALUES (3, 'Newsletters', 'is:newsletter', 2);
+INSERT INTO splits(id, name, query, position) VALUES (4, 'GitHub', 'from:github.com', 3);
 "#;
 
 /// Schema v2 adds the custom folder catalog and the index that makes a `View::folder` lookup one
@@ -130,6 +138,12 @@ CREATE TABLE IF NOT EXISTS folders (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS folders_account_name ON folders(account_id, name COLLATE NOCASE);
 CREATE INDEX IF NOT EXISTS messages_folder ON messages(folder);
+"#;
+
+/// Schema v3 adds the partial index behind the `is:newsletter` flag. The column itself is added in
+/// `init` with an existence check because `ALTER TABLE ADD COLUMN` is not idempotent.
+const SCHEMA_V3: &str = r#"
+CREATE INDEX IF NOT EXISTS messages_bulk ON messages(thread_id) WHERE list_unsubscribe=1;
 "#;
 
 /// Fields the engine needs to build reply MIME. `references` already ends with `message_id_header`.
@@ -164,6 +178,7 @@ impl Store {
         if version < 1 {
             let tx = conn.unchecked_transaction()?;
             tx.execute_batch(SCHEMA_V1)?;
+            tx.execute_batch(DEFAULT_SPLITS)?;
             tx.execute_batch("PRAGMA user_version=1")?;
             tx.commit()?;
         }
@@ -173,8 +188,48 @@ impl Store {
             tx.execute_batch("PRAGMA user_version=2")?;
             tx.commit()?;
         }
+        if version < 3 {
+            let tx = conn.unchecked_transaction()?;
+            // A database opened once and then rolled back by hand can already carry the column.
+            let has_flag: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('messages') WHERE name='list_unsubscribe')",
+                [],
+                |r| r.get(0),
+            )?;
+            if !has_flag {
+                tx.execute_batch(
+                    "ALTER TABLE messages ADD COLUMN list_unsubscribe INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            tx.execute_batch(SCHEMA_V3)?;
+            tx.execute_batch("PRAGMA user_version=3")?;
+            tx.commit()?;
+        }
+        migrate_split_defaults(&conn)?;
         Ok(Store { conn })
     }
+}
+
+/// Databases created before the split redesign hold the two legacy seeds (`Important`/`Other`).
+/// Rewrite them to the current defaults only while they are still exactly those two unmodified
+/// rows; any rename, added split or changed query means the user owns their splits, so leave them.
+fn migrate_split_defaults(conn: &Connection) -> Result<()> {
+    let (total, legacy): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE
+             (id=1 AND name='Important' AND query='is:important')
+          OR (id=2 AND name='Other' AND query='-is:important'))
+         FROM splits",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if total != 2 || legacy != 2 {
+        return Ok(());
+    }
+    let tx = conn.unchecked_transaction()?;
+    tx.execute("DELETE FROM splits", [])?;
+    tx.execute_batch(DEFAULT_SPLITS)?;
+    tx.commit()?;
+    Ok(())
 }
 
 // ----------------------------------------------------------------- accounts
@@ -421,11 +476,12 @@ fn upsert_message(
                    refs=?6, from_name=?7, from_email=?8, to_json=?9, cc_json=?10, date=?11, subject=?12,
                    norm_subject=?13, text=?14, html=?15,
                    unread=CASE WHEN ?22 THEN unread ELSE ?16 END, starred=CASE WHEN ?22 THEN starred ELSE ?17 END,
-                   important=?18, important_src=?19, from_self=?20 WHERE id=?21",
+                   important=?18, important_src=?19, from_self=?20, list_unsubscribe=?23 WHERE id=?21",
                 params![m.folder, mailbox, m.thread_hint, m.message_id, m.in_reply_to, refs_json, from_name,
                         from_email, to_json, cc_json, m.date, m.subject, ns, m.text, m.html, m.unread,
                         m.starred, important, src, from_self, id,
-                        tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?],
+                        tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?,
+                        m.list_unsubscribe],
             )?;
             return thread_id_of(tx, id);
         }
@@ -434,11 +490,11 @@ fn upsert_message(
             tx.execute(
                 "INSERT INTO messages(account_id, thread_id, remote_id, folder, mailbox, thread_hint,
                    message_id, in_reply_to, refs, from_name, from_email, to_json, cc_json, date, subject,
-                   norm_subject, text, html, unread, starred, important, important_src, from_self)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)",
+                   norm_subject, text, html, unread, starred, important, important_src, from_self, list_unsubscribe)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 params![account_id, thread_id, m.remote_id, m.folder, mailbox, m.thread_hint, m.message_id,
                         m.in_reply_to, refs_json, from_name, from_email, to_json, cc_json, m.date, m.subject,
-                        ns, m.text, m.html, m.unread, m.starred, important, src, from_self],
+                        ns, m.text, m.html, m.unread, m.starred, important, src, from_self, m.list_unsubscribe],
             )?;
             tx.last_insert_rowid()
         }
@@ -1571,16 +1627,29 @@ impl Parsed {
         } else {
             "p.kind IN ('to','cc')"
         };
+        // A comma-separated value is a set: OR within this one term, while separate tokens still
+        // AND. Splitting before `glob_pat` keeps the comma out of the pattern.
+        let mut groups: Vec<&str> = Vec::new();
+        let mut params: Vec<Value> = Vec::new();
+        for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            groups.push("(p.email GLOB ? OR p.domain GLOB ? OR lower(p.name) GLOB ?)");
+            let pat = glob_pat(part);
+            for _ in 0..3 {
+                params.push(Value::Text(pat.clone()));
+            }
+        }
+        if groups.is_empty() {
+            // Nothing but separators: this term can never match, and must not widen the search.
+            self.conds.push("1=0".into());
+            return;
+        }
         let ex = format!(
             "EXISTS (SELECT 1 FROM messages m JOIN message_people p ON p.message_id=m.id
-                     WHERE m.thread_id=t.id AND {kind}
-                       AND (p.email GLOB ? OR p.domain GLOB ? OR lower(p.name) GLOB ?))"
+                     WHERE m.thread_id=t.id AND {kind} AND ({}))",
+            groups.join(" OR ")
         );
         self.conds.push(if neg { format!("NOT {ex}") } else { ex });
-        let pat = glob_pat(value);
-        for _ in 0..3 {
-            self.params.push(Value::Text(pat.clone()));
-        }
+        self.params.extend(params);
     }
 
     fn flag(&mut self, value: &str, neg: bool) {
@@ -1591,6 +1660,11 @@ impl Parsed {
             "starred" => format!("t.starred={}", usize::from(on)),
             "important" => format!("t.important={}", usize::from(on)),
             "snoozed" => format!("t.snoozed_until IS {}NULL", if on { "NOT " } else { "" }),
+            // One correlated, partial-indexed lookup over the thread's messages; no N+1.
+            "newsletter" => format!(
+                "{}EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.list_unsubscribe=1)",
+                if on { "" } else { "NOT " }
+            ),
             _ => return,
         };
         self.conds.push(cond);

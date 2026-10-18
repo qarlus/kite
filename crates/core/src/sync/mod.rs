@@ -46,6 +46,8 @@ pub struct RemoteMsg {
     pub starred: bool,
     /// Provider importance signal (Graph inferenceClassification). None = let the store decide.
     pub important: Option<bool>,
+    /// Bulk-mail signal: the message carried List-Unsubscribe or List-Id.
+    pub list_unsubscribe: bool,
     pub attachments: Vec<RemoteAttachment>,
 }
 

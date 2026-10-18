@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const SELECT: &str = "id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,inferenceClassification,hasAttachments,body,bodyPreview,parentFolderId";
+const SELECT: &str = "id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,inferenceClassification,hasAttachments,body,bodyPreview,parentFolderId,internetMessageHeaders";
 const PREFER: &str = "odata.maxpagesize=100, outlook.body-content-type=\"html\"";
 /// Well-known folders synced per account, and the mailbox each maps to.
 const FOLDERS: [(&str, Mailbox); 6] = [
@@ -379,8 +379,19 @@ fn delta_for(
             Some("other") => Some(false),
             _ => None,
         },
+        list_unsubscribe: has_bulk_header(&item["internetMessageHeaders"]),
         attachments: attachments.get(id).cloned().unwrap_or_default(),
     })))
+}
+
+/// `internetMessageHeaders` is an array of `{name, value}`. Bulk mail announces itself with
+/// `List-Unsubscribe` or `List-Id`; both are selected above (Graph only returns them on `$select`).
+fn has_bulk_header(headers: &Value) -> bool {
+    headers.as_array().into_iter().flatten().any(|h| {
+        matches!(h["name"].as_str(), Some(n)
+            if n.eq_ignore_ascii_case("List-Unsubscribe") || n.eq_ignore_ascii_case("List-Id"))
+            && h["value"].as_str().is_some_and(|v| !v.trim().is_empty())
+    })
 }
 
 fn addr(v: &Value) -> Addr {
