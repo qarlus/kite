@@ -8,6 +8,7 @@
 │ list.rs  uniform_list virtualised thread list         │        │ store.rs   SQLite + FTS5: source of truth            │
 │ thread.rs conversation view (html.rs via Blitz)       │ Event  │ sync/imap.rs  Proton Bridge IMAP/SMTP                │
 │ palette.rs, search, snooze, toasts, compose/, …       │ ◄───── │ sync/graph.rs Microsoft Graph + calendar             │
+                                                                 │ sync/proton/  native Proton API (SRP, PGP, events)   │
 │ theme.rs tokens   html.rs Blitz → RenderImage         │        │ auth.rs    OAuth PKCE loopback + OS keychain         │
 └───────────────────────────────────────────────────────┘        │ ai.rs      OpenAI-compatible streaming chat          │
                                                                  └──────────────────────────────────────────────────────┘
@@ -24,7 +25,7 @@
 - **Snooze**: local only. The engine wakes threads at `snoozed_until`, moving them back to inbox and marking them unread. `remind_at` on a sent draft resurfaces the thread only if no reply arrived.
 - **Threading**: Graph uses `conversationId`. IMAP uses `References`/`In-Reply-To`/`Message-ID` union, falling back to normalized subject + participants within 30 days.
 - **HTML mail**: Blitz parses, styles (Stylo), lays out (Taffy) and paints (Vello CPU) each body into a BGRA `RenderImage`. It has no JS engine and no net provider, so remote images are blocked unless a sender is allowed. Renders are cached per (message, width, theme, scale) and re-rendered on resize after the drag settles. Clicks go through `Rendered::link_at` and open in the system browser. Known gap: no text selection inside HTML bodies yet. `c` (copy) copies the text part.
-- **Secrets** (Bridge password, MS refresh token, AI key) live only in the OS keychain (`keyring`). They never go into SQLite or logs.
+- **Secrets** (Bridge password, MS refresh token, Proton session + key passphrase, AI key) live only in the OS keychain (`keyring`). They never go into SQLite or logs.
 
 ## Contract files (orchestrator-owned)
 `crates/core/src/model.rs` (types), `crates/core/src/api.rs` (`Mail`), `crates/core/src/sync/mod.rs` (backend boundary: `RemoteMsg`, `Delta`, `Op`).
@@ -39,15 +40,26 @@ Agents edit only their files. Shared manifests (`Cargo.toml`s) may only gain the
 | IMAP | `crates/core/src/sync/imap.rs`, `crates/core/tests/imap.rs` |
 | Bridge discovery | `crates/core/src/bridge.rs`, `crates/core/tests/bridge.rs` |
 | Graph + auth | `crates/core/src/sync/graph.rs`, `crates/core/src/auth.rs`, `crates/core/tests/graph.rs` |
+| Native Proton | `crates/core/src/sync/proton/**`, `crates/core/tests/proton.rs`, `crates/core/tests/common/proton_fake.rs` |
 | Engine | `crates/core/src/engine.rs`, `crates/core/src/ai.rs`, `crates/core/tests/engine.rs` |
 | UI shell | `crates/app/src/**` except `compose/`, `crates/app/tests/**` except `compose.rs` |
 | Compose | `crates/app/src/compose/**`, `crates/app/tests/compose.rs` |
 
 ## Performance notes
-- The list is GPUI `uniform_list` (fixed 44 px rows, only visible rows are laid out). The view keeps a window of `ThreadSummary` rows and fetches the next 200 rows when the scroll gets within 50 rows of the end.
+- The list is GPUI `uniform_list` (fixed 88 px three-line rows, only visible rows are laid out; the day gutter is painted per row, never as separate header rows). The view keeps a window of `ThreadSummary` rows and fetches the next 200 rows when the scroll gets within 50 rows of the end.
 - `threads()` is a single indexed SQL query over a denormalized `threads` table, with no N+1.
 - On thread open, the UI prefetches `thread()` for the neighbouring threads and renders their HTML on a background thread, so `j`/`k` in thread view are instant.
 - Blitz work (parse, style, layout, raster) runs on `cx.background_executor()`. Only the finished `RenderImage` crosses back to the UI thread.
+
+## Native Proton backend
+
+`sync/proton/` talks to Proton's HTTP API directly, so free accounts work without Bridge. It follows the same `sync(cursor)` / `apply(&Op)` / `attachment()` shape as `imap.rs` and `graph.rs` and is a `Backend` variant in the engine. It was ported from Proton's MIT-licensed `go-proton-api` and `go-srp`; Bridge (GPLv3) was read for behaviour only.
+- `srp.rs`: Proton's SRP-6a variant, with bcrypt password hashing (salt + `"proton"`), the 256-byte `expandHash`, and little-endian group elements. Its proofs are checked byte for byte against go-srp's published `TestSRPauth` vector.
+- `api.rs`: the HTTP client. It decides success or failure from the `Code` field, since the HTTP status is not enough. It handles 2FA, the mailbox password and human verification (code 9001, retried with the `x-pm-human-verification-*` headers), and token refresh.
+- `crypto.rs`: unlocks keys with a passphrase derived from the mailbox password and the key salt, decrypts bodies and attachments, and builds send packages. Proton recipients get the session key sealed to their key; external recipients get cleartext.
+- `mod.rs`: maps Proton labels to Kite mailboxes. A message carries a set of label ids rather than living in a folder. The first sync walks every system label's metadata, and after that the `/core/v4/events` id is the cursor. Bodies stay lazy, as with IMAP.
+- **Sign-in:** `Mail::proton_sign_in` and `proton_sign_in_step` keep the half-finished login in the engine between steps, and return `ProtonAuth::{Done, TwoFactor, MailboxPassword, HumanVerification}`.
+- **Dependencies:** `pgp` (rpgp), `bcrypt`, `num-bigint-dig` and `rand`, all with default features off. rpgp accounts for most of the ~2 MB binary growth, which is why the size budget is 24 MB.
 
 ## Sidebar and custom folder contract
 

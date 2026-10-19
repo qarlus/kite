@@ -42,7 +42,7 @@ Type scale (px): 12 meta · 13 list · 14 body · 15 thread body · 24 thread su
 - **Toasts** (gpui-component notifications, restyled) appear bottom-centre, pill shaped, e.g. "Marked done · **z** to undo". They auto-dismiss after 4 s.
 - **Calendar sidebar** is 280px on the right, with an hour grid for today and event blocks tinted with `accent` at 18%.
 - **Empty folders:** use the exact mailbox background, never a separate gradient. A quiet mailbox icon, 24px heading and one line of context sit in the centre; Inbox Zero remains specific to an empty inbox.
-- Empty non-inbox views name the relevant mailbox instead of claiming Inbox Zero. With no accounts, show “Welcome to Kite”, an invitation to connect Proton Bridge or Outlook, and an Add an account action; do not imply mail has synced.
+- Empty non-inbox views name the relevant mailbox instead of claiming Inbox Zero. With no accounts, show “Welcome to Kite”, an invitation to connect Proton or Outlook, and an Add an account action; do not imply mail has synced.
 
 ## Icons (Lucide, animated)
 - Lucide icons come from gpui-kit's bundled set (`gpui_kit::component` `Icon`/`IconName`, or our own `AssetSource` for icons outside the default 101). Sizes are 16px (list/toolbar) and 18px (compose/thread actions), coloured with `currentColor`-equivalent theme tokens. Tooltips and palette rows always pair an icon with its `<kbd>` hint.
