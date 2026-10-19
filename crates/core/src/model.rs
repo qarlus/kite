@@ -195,6 +195,9 @@ pub struct Settings {
     /// User shortcut overrides: command slug -> keystrokes (GPUI syntax). Absent = default keys;
     /// an empty list unbinds the command.
     pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
+    /// `true`: list and reading pane side by side. `false`: an opened conversation takes the
+    /// full width (Superhuman style).
+    pub reading_pane: bool,
 }
 
 impl Default for Settings {
@@ -213,6 +216,7 @@ impl Default for Settings {
             ms_client_id: String::new(),
             input_mode: "keyboard".into(),
             shortcuts: Default::default(),
+            reading_pane: true,
         }
     }
 }
