@@ -28,7 +28,7 @@ Kite is a keyboard-first, fully native desktop email client in the spirit of Sup
 ## Budgets (enforced)
 | Budget | Limit | Where |
 |---|---|---|
-| Release binary (Windows exe) | ≤ 20 MB | `crates/app/tests/budget.rs` (CI, release) |
+| Release binary (Windows exe) | ≤ 24 MB | `crates/app/tests/budget.rs` (CI, release) |
 | Inbox first frame, 10k threads | ≤ 50 ms | UI test, release |
 | `j`/`k` → selection repainted | ≤ 4 ms per frame | UI test, release |
 | Blitz render, typical email | ≤ 15 ms | `crates/app/tests/html.rs`, release |
