@@ -383,9 +383,17 @@ impl Proton {
     }
 
     async fn cleanup_drafts(&mut self) -> Result<()> {
-        if !self.cleanup.is_empty() {
-            self.api.delete_messages(&self.cleanup).await?;
-            self.cleanup.clear();
+        if self.cleanup.is_empty() {
+            return Ok(());
+        }
+        match self.api.delete_messages(&self.cleanup).await {
+            // A permanent rejection means the draft is already gone or can never be
+            // deleted; retrying it would block the account forever.
+            Err(error) if permanent_send(&error) => self.cleanup.clear(),
+            result => {
+                result?;
+                self.cleanup.clear();
+            }
         }
         Ok(())
     }

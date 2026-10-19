@@ -291,7 +291,7 @@ async fn run(weak: Weak<Inner>, wake: Receiver<bool>) {
         let delay = next_sync
             .values()
             .chain(backoff.values().map(|(_, at, _)| at))
-            .filter_map(|at| (*at > auth::now_ms()).then_some((*at - auth::now_ms()).max(1) as u64))
+            .map(|at| at.saturating_sub(auth::now_ms()).max(1) as u64)
             .min()
             .map(Duration::from_millis)
             .unwrap_or(poll)
