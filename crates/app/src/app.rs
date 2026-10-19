@@ -746,6 +746,10 @@ impl Kite {
             return;
         }
         match id {
+            cmd::REFRESH => {
+                self.mail.sync_now();
+                self.toast("Refresh requested", cx);
+            }
             cmd::NEXT => self.next(1, cx),
             cmd::PREV => self.next(-1, cx),
             cmd::OPEN if !self.rows.is_empty() => self.open_thread(cx),
@@ -1617,24 +1621,51 @@ impl Kite {
                     )
                     .child(
                         div()
-                            .id("compose-new")
-                            .test_support()
-                            .aria_label("New message")
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .size(px(30.))
+                            .gap_1()
                             .flex_shrink_0()
-                            .rounded(px(RADIUS_SM))
-                            .cursor_pointer()
-                            .text_color(t.fg2)
-                            .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| {
-                                    this.run(cmd::COMPOSE, window, cx)
-                                }),
+                            .child(
+                                div()
+                                    .id("refresh-mail")
+                                    .test_support()
+                                    .aria_label(format!(
+                                        "Refresh mail, {}",
+                                        keys::hint_for(&self.settings, cmd::REFRESH)
+                                    ))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(30.))
+                                    .flex_shrink_0()
+                                    .rounded(px(RADIUS_SM))
+                                    .cursor_pointer()
+                                    .text_color(t.fg2)
+                                    .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.run(cmd::REFRESH, window, cx)
+                                    }))
+                                    .child(Icon::new(IconName::RefreshCw).with_size(px(16.))),
                             )
-                            .child(Icon::new(IconName::SquarePen).with_size(px(16.))),
+                            .child(
+                                div()
+                                    .id("compose-new")
+                                    .test_support()
+                                    .aria_label("New message")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(30.))
+                                    .flex_shrink_0()
+                                    .rounded(px(RADIUS_SM))
+                                    .cursor_pointer()
+                                    .text_color(t.fg2)
+                                    .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.run(cmd::COMPOSE, window, cx)
+                                    }))
+                                    .child(Icon::new(IconName::SquarePen).with_size(px(16.))),
+                            ),
                     ),
             )
             .child(

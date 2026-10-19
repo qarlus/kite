@@ -1,13 +1,14 @@
 //! The production `Mail`: local SQLite reads, optimistic local writes, and one background thread
 //! running a tokio runtime that drains pending ops, syncs accounts, wakes snoozes and sends the
 //! outbox. Engine -> UI traffic goes over the `Event` channel; the UI never sees tokio or SQLite.
+use rand::Rng;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_channel::{Receiver, Sender};
@@ -19,7 +20,7 @@ use crate::model::*;
 use crate::store::Store;
 use crate::sync::graph::Graph;
 use crate::sync::imap::{Imap, ImapConfig};
-use crate::sync::proton::{Credentials as ProtonSession, Proton, SignIn, Step as ProtonStep};
+use crate::sync::proton::{self, Credentials as ProtonSession, Proton, SignIn, Step as ProtonStep};
 use crate::sync::{Delta, Op};
 
 const DEFAULT_GRAPH: &str = "https://graph.microsoft.com/v1.0";
@@ -131,7 +132,8 @@ pub(crate) struct Inner {
     senders: Mutex<Vec<Sender<Event>>>,
     /// The native Proton sign-in between calls, so the UI only has to answer one step.
     sign_in: Mutex<Option<SignIn>>,
-    wake: Sender<()>,
+    wake: Sender<bool>,
+    last_refresh: Mutex<Option<Instant>>,
     secrets: Secrets,
     opts: Options,
     /// Every `Event::Error`, so a failure that only flashed by as a toast can be read later.
@@ -200,6 +202,7 @@ impl Engine {
             writer: Mutex::new(writer),
             senders: Mutex::new(Vec::new()),
             sign_in: Mutex::new(None),
+            last_refresh: Mutex::new(None),
             wake,
             secrets,
             opts,
@@ -219,11 +222,12 @@ impl Engine {
                     rt.block_on(run(weak, wake_rx));
                 }
             });
+        let _ = inner.wake.try_send(false);
         Ok(Arc::new(Engine { inner }))
     }
 
     fn wake(&self) {
-        let _ = self.inner.wake.try_send(());
+        let _ = self.inner.wake.try_send(false);
     }
 
     /// Emits `Changed` for every account after a local mutation that queues no remote op (labels,
@@ -275,47 +279,44 @@ impl Engine {
 
 // ------------------------------------------------------------------- the loop
 
-async fn run(weak: Weak<Inner>, wake: Receiver<()>) {
+async fn run(weak: Weak<Inner>, wake: Receiver<bool>) {
     let poll = match weak.upgrade() {
         Some(inner) => inner.opts.poll,
         None => return,
     };
     let mut backends: HashMap<Id, Backend> = HashMap::new();
-    let mut backoff: HashMap<Id, (u32, Ms)> = HashMap::new();
+    let mut backoff: HashMap<Id, (u32, Ms, bool)> = HashMap::new();
+    let mut next_sync: HashMap<Id, Ms> = HashMap::new();
     loop {
-        let mut forced = drain(&wake);
-        if !forced {
-            tokio::select! {
-                _ = tokio::time::sleep(poll) => {}
-                result = wake.recv() => {
-                    if result.is_err() {
-                        return;
-                    }
-                    // A wake always overrides a per-account backoff (sync_now, act, send, undo).
-                    forced = true;
-                    while wake.try_recv().is_ok() {}
-                }
+        let delay = next_sync
+            .values()
+            .chain(backoff.values().map(|(_, at, _)| at))
+            .filter_map(|at| (*at > auth::now_ms()).then_some((*at - auth::now_ms()).max(1) as u64))
+            .min()
+            .map(Duration::from_millis)
+            .unwrap_or(poll)
+            .min(poll);
+        let mut forced = false;
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => {}
+            result = wake.recv() => {
+                let Ok(refresh) = result else { return; };
+                forced = refresh;
+                while let Ok(refresh) = wake.try_recv() { forced |= refresh; }
             }
         }
         let Some(inner) = weak.upgrade() else {
             return;
         };
-        tick(&inner, &mut backends, &mut backoff, forced).await;
+        tick(&inner, &mut backends, &mut backoff, &mut next_sync, forced).await;
     }
-}
-
-fn drain(wake: &Receiver<()>) -> bool {
-    let mut any = false;
-    while wake.try_recv().is_ok() {
-        any = true;
-    }
-    any
 }
 
 async fn tick(
     inner: &Inner,
     backends: &mut HashMap<Id, Backend>,
-    backoff: &mut HashMap<Id, (u32, Ms)>,
+    backoff: &mut HashMap<Id, (u32, Ms, bool)>,
+    next_sync: &mut HashMap<Id, Ms>,
     forced: bool,
 ) {
     let now = auth::now_ms();
@@ -326,28 +327,44 @@ async fn tick(
     let live: Vec<Id> = accounts.iter().map(|a| a.id).collect();
     backends.retain(|id, _| live.contains(id));
     backoff.retain(|id, _| live.contains(id));
+    next_sync.retain(|id, _| live.contains(id));
 
     let mut changed: Vec<Id> = Vec::new();
     for account in &accounts {
-        if !forced
-            && backoff
-                .get(&account.id)
-                .is_some_and(|(_, next)| now < *next)
+        if backoff
+            .get(&account.id)
+            .is_some_and(|(_, next, _)| now < *next)
         {
             continue;
         }
-        match sync_account(inner, account, backends).await {
+        let sync = forced
+            || backoff.contains_key(&account.id)
+            || next_sync.get(&account.id).is_none_or(|at| now >= *at);
+        match sync_account(inner, account, backends, sync).await {
             Ok(any) => {
                 backoff.remove(&account.id);
+                if sync {
+                    let native = matches!(backends.get(&account.id), Some(Backend::Proton { .. }));
+                    let delay = if native && inner.opts.poll == Duration::from_secs(30) {
+                        25_000 + rand::thread_rng().gen_range(0..=15_000)
+                    } else {
+                        inner.opts.poll.as_millis().min(i64::MAX as u128) as i64
+                    };
+                    next_sync.insert(account.id, auth::now_ms() + delay);
+                }
                 if any {
                     changed.push(account.id);
                 }
             }
             Err(e) => {
-                let entry = backoff.entry(account.id).or_insert((0, 0));
+                let entry = backoff.entry(account.id).or_insert((0, 0, false));
                 let attempts = entry.0 + 1;
                 let wait = (1_000i64 << attempts.min(9)).min(600_000);
-                *entry = (attempts, now + wait);
+                *entry = (
+                    attempts,
+                    (auth::now_ms() + wait).max(proton::retry_at(&e).unwrap_or(0)),
+                    proton::retry_at(&e).is_some(),
+                );
                 inner.emit(Event::Error(format!("{}: {e:#}", account.email)));
             }
         }
@@ -357,7 +374,7 @@ async fn tick(
         Ok(ids) => changed.extend(ids),
         Err(e) => inner.emit(Event::Error(format!("{e:#}"))),
     }
-    if let Err(e) = send_due(inner, &accounts, backends, &mut changed).await {
+    if let Err(e) = send_due(inner, &accounts, backends, backoff, next_sync, &mut changed).await {
         inner.emit(Event::Error(format!("{e:#}")));
     }
 
@@ -374,6 +391,7 @@ async fn sync_account(
     inner: &Inner,
     account: &Account,
     backends: &mut HashMap<Id, Backend>,
+    sync: bool,
 ) -> Result<bool> {
     if let Entry::Vacant(slot) = backends.entry(account.id) {
         slot.insert(backend_for(inner, account)?);
@@ -402,10 +420,22 @@ async fn sync_account(
         }
     }
 
+    if !sync {
+        return Ok(changed);
+    }
     let mut cursor = inner.write(|s| s.cursor(account.id))?;
     for _ in 0..SYNC_STEPS {
         let backend = backend_mut(backends, account.id)?;
-        let (deltas, next) = backend.sync(cursor.clone()).await?;
+        if let Backend::Proton { client, .. } = backend {
+            client.set_known(inner.read(|s| s.remote_ids(account.id))?);
+        }
+        let result = backend.sync(cursor.clone()).await;
+        if let Backend::Proton { client, .. } = backend {
+            for warning in client.take_warnings() {
+                inner.emit(Event::Error(warning));
+            }
+        }
+        let (deltas, next) = result?;
         persist_tokens(inner, account.id, backend)?;
         if !deltas.is_empty() {
             for chunk in deltas.chunks(APPLY_CHUNK) {
@@ -418,8 +448,12 @@ async fn sync_account(
         // returns flag deltas on every call, so "got deltas" alone would loop every tick.
         let advanced = cursor.as_deref() != Some(next.as_str());
         inner.write(|s| s.set_cursor(account.id, &next))?;
+        let pending_walk = matches!(backend, Backend::Proton { .. }) && Proton::has_more(&next);
         cursor = Some(next);
-        if deltas.is_empty() || !advanced {
+        if !advanced
+            || (matches!(backend, Backend::Proton { .. }) && !pending_walk)
+            || (deltas.is_empty() && !pending_walk)
+        {
             break;
         }
     }
@@ -427,10 +461,10 @@ async fn sync_account(
     // Proton's custom labels are folders and exist before Kite ever created one, so the
     // sidebar catalog is refreshed from the API (cached after the first call).
     let backend = backend_mut(backends, account.id)?;
-    if let Ok(folders) = backend.folders().await {
-        for (id, name) in folders {
-            inner.write(|s| s.ensure_folder(account.id, &id, &name))?;
-        }
+    for (id, name) in backend.folders().await? {
+        let existed = inner.read(|s| s.folder_exists(account.id, &id))?;
+        inner.write(|s| s.ensure_folder(account.id, &id, &name))?;
+        changed |= !existed;
     }
     Ok(changed)
 }
@@ -439,11 +473,19 @@ async fn send_due(
     inner: &Inner,
     accounts: &[Account],
     backends: &mut HashMap<Id, Backend>,
+    backoff: &mut HashMap<Id, (u32, Ms, bool)>,
+    next_sync: &mut HashMap<Id, Ms>,
     changed: &mut Vec<Id>,
 ) -> Result<()> {
     let due = inner.write(|s| s.outbox_due(auth::now_ms()))?;
     let mut queued = false;
     for (outbox_id, draft) in due {
+        if backoff
+            .get(&draft.account_id)
+            .is_some_and(|(_, at, throttled)| *throttled && auth::now_ms() < *at)
+        {
+            continue;
+        }
         let Some(account) = accounts.iter().find(|a| a.id == draft.account_id) else {
             inner.write(|s| s.outbox_sent(outbox_id))?;
             continue;
@@ -451,8 +493,7 @@ async fn send_due(
         let mime = match build_mime(inner, account, &draft, &message_id(&account.email)) {
             Ok(mime) => mime,
             Err(e) => {
-                inner.emit(Event::Error(format!("could not build message: {e:#}")));
-                inner.write(|s| s.outbox_failed(outbox_id, auth::now_ms()))?;
+                failed_send(inner, outbox_id, &draft, &e, true, changed)?;
                 continue;
             }
         };
@@ -472,6 +513,9 @@ async fn send_due(
                 }
                 inner.write(|s| s.outbox_sent(outbox_id))?;
                 queued = true;
+                if !matches!(backend, Backend::Proton { .. }) {
+                    next_sync.remove(&account.id);
+                }
                 // The provider copy of a saved draft is stale now that it has been sent; delete it
                 // on the next pass rather than leaving a duplicate in Drafts.
                 if let Some(id) = draft.id
@@ -489,15 +533,55 @@ async fn send_due(
                 }
             }
             Err(e) => {
-                inner.emit(Event::Error(format!("send failed: {e:#}")));
-                // Keep it queued: a transient failure must not lose the mail.
-                inner.write(|s| s.outbox_failed(outbox_id, auth::now_ms()))?;
+                if let Some(at) = proton::retry_at(&e) {
+                    backoff.insert(account.id, (0, at, true));
+                }
+                failed_send(
+                    inner,
+                    outbox_id,
+                    &draft,
+                    &e,
+                    proton::permanent_send(&e),
+                    changed,
+                )?;
             }
         }
     }
     if queued {
         // Sync the sent copy and drain draft deletions without waiting out the poll interval.
-        let _ = inner.wake.try_send(());
+        let _ = inner.wake.try_send(false);
+    }
+    Ok(())
+}
+
+fn failed_send(
+    inner: &Inner,
+    id: Id,
+    draft: &Draft,
+    error: &anyhow::Error,
+    permanent: bool,
+    changed: &mut Vec<Id>,
+) -> Result<()> {
+    let (stopped, first) =
+        inner.write(|s| s.outbox_failed(id, auth::now_ms(), permanent, proton::retry_at(error)))?;
+    if stopped {
+        if draft.id.is_none() {
+            let account = inner
+                .read(Store::accounts)?
+                .into_iter()
+                .find(|a| a.id == draft.account_id)
+                .context("account was removed")?;
+            inner.write(|s| s.save_draft(draft, &message_id(&account.email)))?;
+        }
+        inner.write(|s| s.outbox_cancel(id))?;
+        changed.push(draft.account_id);
+        inner.emit(Event::Error(format!(
+            "Send stopped; message saved in Drafts: {error:#}"
+        )));
+    } else if first {
+        inner.emit(Event::Error(format!(
+            "send failed; queued for retry: {error:#}"
+        )));
     }
     Ok(())
 }
@@ -1159,7 +1243,12 @@ impl Mail for Engine {
     }
 
     fn sync_now(&self) {
-        self.wake();
+        let mut last = lock(&self.inner.last_refresh);
+        if last.is_some_and(|at| at.elapsed() < Duration::from_secs(10)) {
+            return;
+        }
+        *last = Some(Instant::now());
+        let _ = self.inner.wake.try_send(true);
     }
 
     fn events(&self) -> Receiver<Event> {

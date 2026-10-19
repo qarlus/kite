@@ -32,7 +32,8 @@ gpui_kit::assets::icon_assets!(
         Keyboard,
         MailOpen,
         X,
-        SquarePen
+        SquarePen,
+        RefreshCw
     ]
 );
 

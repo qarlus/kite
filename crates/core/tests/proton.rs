@@ -951,3 +951,589 @@ fn independent_sends_in_one_proton_conversation_stay_separate_but_composed_repli
     assert_eq!(engine.thread(original).expect("retained chain").len(), 3);
     assert_eq!(server.world().sends.len(), 4);
 }
+
+// Seed a real stored account before opening, so startup itself must wake the engine.
+fn native_engine(
+    world: World,
+    poll: Duration,
+) -> (
+    tokio::runtime::Runtime,
+    fake::Server,
+    Arc<Engine>,
+    Account,
+    PathBuf,
+) {
+    use kite_core::sync::proton::{SignIn, Step};
+    let rt = runtime();
+    let server = rt.block_on(fake::serve(world));
+    let login = server.login();
+    let signed = rt.block_on(async {
+        let mut sign = SignIn::new(&server.url, "Other", &login.email, &login.password);
+        assert!(matches!(sign.start().await.unwrap(), Step::Done));
+        sign.take().unwrap()
+    });
+    let dir = temp_dir();
+    let store = kite_core::store::Store::open(&dir.join("kite.db")).unwrap();
+    let account = store
+        .add_account(Provider::Proton, &signed.email, &signed.name)
+        .unwrap();
+    drop(store);
+    let secrets = HashMap::from([(
+        format!("proton:{}", account.id),
+        serde_json::to_string(&signed.credentials).unwrap(),
+    )]);
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(secrets)),
+        Options {
+            proton_api_url: Some(server.url.clone()),
+            poll,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (rt, server, engine, account, dir)
+}
+
+fn stored_cursor(dir: &Path, account: Id) -> serde_json::Value {
+    let db = rusqlite::Connection::open_with_flags(
+        dir.join("kite.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let raw: Option<String> = db
+        .query_row("SELECT cursor FROM accounts WHERE id=?1", [account], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    raw.and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default()
+}
+
+fn wait_live(dir: &Path, account: Id) {
+    eventually(|| (stored_cursor(dir, account)["label"] == 4).then_some(()));
+}
+
+#[test]
+fn startup_syncs_existing_accounts_before_the_first_poll() {
+    let mut world = World::new();
+    world.add_message(
+        "At open",
+        ("Alice", "alice@proton.me"),
+        "ready",
+        &["0", "5"],
+    );
+    let (_rt, _server, engine, account, dir) = native_engine(world, Duration::from_secs(300));
+    wait_live(&dir, account.id);
+    assert_eq!(
+        engine.threads(&inbox(account.id), 0, 10).unwrap()[0].subject,
+        "At open"
+    );
+}
+
+#[test]
+fn live_creates_use_fetched_metadata_and_announce_new_inbox_mail() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let events = engine.events();
+    {
+        let mut world = server.world();
+        world.sparse_events = true;
+        world.add_message(
+            "Arrived while open",
+            ("Alice", "alice@proton.me"),
+            "new body",
+            &["0", "5"],
+        );
+    }
+    let row = eventually(|| {
+        engine
+            .threads(&inbox(account.id), 0, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+    });
+    assert_eq!(row.subject, "Arrived while open");
+    assert_eq!(engine.thread(row.id).unwrap()[0].text, "new body");
+    eventually(|| {
+        events
+            .try_recv()
+            .ok()
+            .filter(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)))
+    });
+}
+
+#[test]
+fn missing_signed_and_undecryptable_bodies_do_not_wedge_the_event_cursor() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let (missing, last) = {
+        let mut world = server.world();
+        let missing = world.add_message("Deleted during fetch", ("A", "a@x"), "gone", &["0", "5"]);
+        world.faults.insert(
+            format!("/api/mail/v4/messages/{missing}"),
+            (404, 2001, "Message not found".into(), None),
+        );
+        let signed = world.add_message("Signed cleartext", ("B", "b@x"), "body", &["0", "5"]);
+        world.message(&signed).body =
+            "-----BEGIN PGP SIGNED MESSAGE-----\nHash: SHA256\n\nReadable signed text".into();
+        let bad = world.add_message("Damaged encryption", ("C", "c@x"), "body", &["0", "5"]);
+        world.message(&bad).body = "-----BEGIN PGP MESSAGE-----\nbroken".into();
+        let last = world.add_message("Later mail", ("D", "d@x"), "delivered", &["0", "5"]);
+        (missing, world.push_event(&last, 2))
+    };
+    eventually(|| (stored_cursor(&dir, account.id)["event"] == last).then_some(()));
+    let rows = engine.threads(&inbox(account.id), 0, 20).unwrap();
+    assert_eq!(rows.len(), 3);
+    let signed = rows
+        .iter()
+        .find(|r| r.subject == "Signed cleartext")
+        .unwrap();
+    assert!(
+        engine.thread(signed.id).unwrap()[0]
+            .text
+            .contains("Readable signed text")
+    );
+    let bad = rows
+        .iter()
+        .find(|r| r.subject == "Damaged encryption")
+        .unwrap();
+    assert!(
+        engine.thread(bad.id).unwrap()[0]
+            .text
+            .contains("-----BEGIN PGP MESSAGE-----")
+    );
+    let last = server.world().push_event(&missing, 2);
+    eventually(|| (stored_cursor(&dir, account.id)["event"] == last).then_some(()));
+    let log = std::fs::read_to_string(dir.join("errors.log")).unwrap();
+    assert_eq!(
+        log.matches(&format!("Proton message {missing}:")).count(),
+        1
+    );
+    server
+        .world()
+        .add_message("Next batch", ("E", "e@x"), "also delivered", &["0", "5"]);
+    eventually(|| (engine.threads(&inbox(account.id), 0, 20).unwrap().len() == 4).then_some(()));
+}
+
+#[test]
+fn refresh_reconciles_metadata_and_deletions_without_downloading_stored_bodies() {
+    let mut world = World::new();
+    let kept = world.add_message("Keep body", ("A", "a@x"), "cached body", &["0", "5"]);
+    let gone = world.add_message("Gone", ("B", "b@x"), "old", &["0", "5"]);
+    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let body_path = format!("/api/mail/v4/messages/{kept}");
+    let before = server
+        .world()
+        .requests
+        .iter()
+        .filter(|(p, _)| p == &body_path)
+        .count();
+    {
+        let mut world = server.world();
+        world.message(&kept).label_ids = vec!["6".into(), "5".into()];
+        world.messages.retain(|m| m.id != gone);
+        world.event_refresh = 1;
+        world.push_event("", 0);
+    }
+    eventually(|| {
+        (engine
+            .threads(&inbox(account.id), 0, 10)
+            .unwrap()
+            .is_empty()
+            && engine
+                .threads(&mailbox(account.id, Mailbox::All), 0, 10)
+                .unwrap()
+                .len()
+                == 1)
+            .then_some(())
+    });
+    let row = engine
+        .threads(&mailbox(account.id, Mailbox::Archive), 0, 10)
+        .unwrap()
+        .remove(0);
+    assert_eq!(engine.thread(row.id).unwrap()[0].text, "cached body");
+    assert_eq!(
+        server
+            .world()
+            .requests
+            .iter()
+            .filter(|(p, _)| p == &body_path)
+            .count(),
+        before
+    );
+}
+
+#[test]
+fn label_events_discover_folders_created_on_the_web() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    eventually(|| {
+        server
+            .world()
+            .requests
+            .iter()
+            .any(|(p, _)| p.ends_with("/labels"))
+            .then_some(())
+    });
+    let events = engine.events();
+    {
+        let mut world = server.world();
+        world.labels.push(("web-folder".into(), "From web".into()));
+        world.label_event = true;
+        world.push_event("", 0);
+    }
+    eventually(|| {
+        engine
+            .folders()
+            .unwrap()
+            .into_iter()
+            .find(|f| f.name == "From web")
+    });
+    eventually(|| {
+        events
+            .try_recv()
+            .ok()
+            .filter(|e| matches!(e, Event::Changed(_)))
+    });
+}
+
+#[test]
+fn forced_sync_is_limited_to_one_request_per_ten_seconds() {
+    let (_rt, server, engine, account, dir) = native_engine(World::new(), Duration::from_secs(300));
+    wait_live(&dir, account.id);
+    server
+        .world()
+        .add_message("First refresh", ("A", "a@x"), "one", &["0", "5"]);
+    engine.sync_now();
+    eventually(|| {
+        (!engine
+            .threads(&inbox(account.id), 0, 10)
+            .unwrap()
+            .is_empty())
+        .then_some(())
+    });
+    let count = server.world().requests.len();
+    server
+        .world()
+        .add_message("Wait for refresh", ("B", "b@x"), "two", &["0", "5"]);
+    for _ in 0..20 {
+        engine.sync_now();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(server.world().requests.len(), count);
+    assert_eq!(engine.threads(&inbox(account.id), 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn permanent_send_rejection_stops_and_restores_a_draft_without_leaking_remote_drafts() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    server.world().send_rejection = true;
+    let events = engine.events();
+    let mut settings = engine.settings().unwrap();
+    settings.undo_send_secs = 0;
+    engine.set_settings(settings).unwrap();
+    engine
+        .send(Draft {
+            id: None,
+            account_id: account.id,
+            to: vec![Addr {
+                name: "A".into(),
+                email: "a@example.com".into(),
+            }],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Recover this".into(),
+            body: "precious text".into(),
+            reply_to: None,
+            send_at: None,
+            remind_at: None,
+        })
+        .unwrap();
+    let row = eventually(|| {
+        engine
+            .threads(&mailbox(account.id, Mailbox::Drafts), 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.subject == "Recover this")
+    });
+    assert_eq!(engine.draft(row.id).unwrap().unwrap().body, "precious text");
+    eventually(|| (server.world().messages.is_empty()).then_some(()));
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(server.world().send_attempts, 1);
+    assert_eq!(
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|e| matches!(e, Event::Error(message) if message.contains("Send stopped")))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn retry_after_blocks_refresh_and_local_wakes_until_the_provider_deadline() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let path = format!(
+        "/api/core/v4/events/{}",
+        stored_cursor(&dir, account.id)["event"].as_str().unwrap()
+    );
+    server
+        .world()
+        .faults
+        .insert(path.clone(), (429, 0, "Slow down".into(), Some("2".into())));
+    eventually(|| {
+        std::fs::read_to_string(dir.join("errors.log"))
+            .ok()
+            .filter(|s| s.contains("Slow down"))
+    });
+    let throttled_at = server
+        .world()
+        .requests
+        .iter()
+        .rev()
+        .find(|(p, _)| p == &path)
+        .unwrap()
+        .1;
+    let count = server.world().requests.len();
+    server.world().faults.clear();
+    server
+        .world()
+        .add_message("After throttle", ("A", "a@x"), "eventually", &["0", "5"]);
+    for _ in 0..20 {
+        engine.sync_now();
+        engine.act(&[], &Action::Read).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(server.world().requests.len(), count);
+    eventually(|| {
+        (!engine
+            .threads(&inbox(account.id), 0, 10)
+            .unwrap()
+            .is_empty())
+        .then_some(())
+    });
+    let world = server.world();
+    let resumed_at = world.requests[count].1;
+    assert!(resumed_at.duration_since(throttled_at) >= Duration::from_secs(2));
+}
+
+#[test]
+fn unrelated_event_errors_back_off_without_resetting_or_redownloading_the_mailbox() {
+    let mut world = World::new();
+    world.add_message("Stored", ("A", "a@x"), "body", &["0", "5"]);
+    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let cursor = stored_cursor(&dir, account.id);
+    let path = format!("/api/core/v4/events/{}", cursor["event"].as_str().unwrap());
+    let before = server
+        .world()
+        .requests
+        .iter()
+        .filter(|(p, _)| p.ends_with("/events/latest"))
+        .count();
+    server
+        .world()
+        .faults
+        .insert(path, (400, 2001, "Invalid parameter".into(), None));
+    eventually(|| {
+        std::fs::read_to_string(dir.join("errors.log"))
+            .ok()
+            .filter(|s| s.contains("Invalid parameter"))
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(stored_cursor(&dir, account.id), cursor);
+    assert_eq!(
+        server
+            .world()
+            .requests
+            .iter()
+            .filter(|(p, _)| p.ends_with("/events/latest"))
+            .count(),
+        before
+    );
+    assert_eq!(
+        engine.threads(&inbox(account.id), 0, 10).unwrap()[0].subject,
+        "Stored"
+    );
+}
+
+#[test]
+fn an_expired_event_id_reconciles_using_stored_bodies() {
+    let mut world = World::new();
+    let kept = world.add_message("Stored", ("A", "a@x"), "cached", &["0", "5"]);
+    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let path = format!(
+        "/api/core/v4/events/{}",
+        stored_cursor(&dir, account.id)["event"].as_str().unwrap()
+    );
+    let body_path = format!("/api/mail/v4/messages/{kept}");
+    let before = server
+        .world()
+        .requests
+        .iter()
+        .filter(|(p, _)| p == &body_path)
+        .count();
+    {
+        let mut world = server.world();
+        world.message(&kept).label_ids = vec!["6".into(), "5".into()];
+        world.push_event("", 0);
+        world.faults.insert(
+            path,
+            (400, 2001, "Event ID is unknown or expired".into(), None),
+        );
+    }
+    let row = eventually(|| {
+        engine
+            .threads(&mailbox(account.id, Mailbox::Archive), 0, 10)
+            .unwrap()
+            .into_iter()
+            .next()
+    });
+    assert_eq!(engine.thread(row.id).unwrap()[0].text, "cached");
+    assert_eq!(
+        server
+            .world()
+            .requests
+            .iter()
+            .filter(|(p, _)| p == &body_path)
+            .count(),
+        before
+    );
+}
+
+#[test]
+fn package_build_failure_deletes_the_created_send_draft() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    server.world().faults.insert(
+        "/api/mail/v4/settings".into(),
+        (400, 2001, "Cannot build packages".into(), None),
+    );
+    let mut settings = engine.settings().unwrap();
+    settings.undo_send_secs = 0;
+    engine.set_settings(settings).unwrap();
+    engine
+        .send(Draft {
+            id: None,
+            account_id: account.id,
+            to: vec![Addr {
+                name: "A".into(),
+                email: "a@example.com".into(),
+            }],
+            cc: vec![],
+            bcc: vec![],
+            subject: "Recover packages".into(),
+            body: "keep me".into(),
+            reply_to: None,
+            send_at: None,
+            remind_at: None,
+        })
+        .unwrap();
+    eventually(|| {
+        engine
+            .threads(&mailbox(account.id, Mailbox::Drafts), 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.subject == "Recover packages")
+    });
+    let world = server.world();
+    assert_eq!(world.drafts.len(), 1);
+    assert_eq!(world.deleted.len(), 1);
+    assert!(world.messages.is_empty());
+    assert_eq!(world.send_attempts, 0);
+}
+
+#[test]
+fn service_unavailable_honours_an_http_date_retry_deadline() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let path = format!(
+        "/api/core/v4/events/{}",
+        stored_cursor(&dir, account.id)["event"].as_str().unwrap()
+    );
+    let deadline = chrono::Utc::now() + chrono::Duration::seconds(3);
+    let retry = deadline.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+    server
+        .world()
+        .faults
+        .insert(path, (503, 0, "Unavailable".into(), Some(retry)));
+    eventually(|| {
+        std::fs::read_to_string(dir.join("errors.log"))
+            .ok()
+            .filter(|s| s.contains("Unavailable"))
+    });
+    let count = server.world().requests.len();
+    server.world().faults.clear();
+    server
+        .world()
+        .add_message("After maintenance", ("A", "a@x"), "back", &["0", "5"]);
+    engine.sync_now();
+    eventually(|| {
+        (!engine
+            .threads(&inbox(account.id), 0, 10)
+            .unwrap()
+            .is_empty())
+        .then_some(())
+    });
+    let world = server.world();
+    let resumed = world.requests[count].1;
+    let blocked = world.requests[count - 1].1;
+    assert!(resumed.duration_since(blocked) >= Duration::from_secs(2));
+}
+
+#[test]
+fn the_eighth_transient_send_failure_returns_the_message_to_drafts() {
+    let (_rt, server, engine, account, dir) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    server.world().faults.insert(
+        "/api/mail/v4/settings".into(),
+        (500, 0, "Temporary failure".into(), None),
+    );
+    let draft = Draft {
+        id: None,
+        account_id: account.id,
+        to: vec![Addr {
+            name: "A".into(),
+            email: "a@example.com".into(),
+        }],
+        cc: vec![],
+        bcc: vec![],
+        subject: "Attempts exhausted".into(),
+        body: "safe to edit".into(),
+        reply_to: None,
+        send_at: None,
+        remind_at: None,
+    };
+    // Resume a persisted outbox row after seven transient failures, without waiting minutes.
+    let db = rusqlite::Connection::open(dir.join("kite.db")).unwrap();
+    db.execute(
+        "INSERT INTO outbox(account_id, draft, at, attempts) VALUES (?1, ?2, 0, 7)",
+        rusqlite::params![account.id, serde_json::to_string(&draft).unwrap()],
+    )
+    .unwrap();
+    let row = eventually(|| {
+        engine
+            .threads(&mailbox(account.id, Mailbox::Drafts), 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.subject == "Attempts exhausted")
+    });
+    assert_eq!(engine.draft(row.id).unwrap().unwrap().body, "safe to edit");
+    let count: i64 = db
+        .query_row("SELECT count(*) FROM outbox", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(server.world().messages.is_empty());
+    assert_eq!(server.world().drafts.len(), 1);
+}

@@ -60,6 +60,7 @@ pub struct Fixture {
     pub attachments_opened: Mutex<Vec<Id>>,
     /// URLs the UI asked the engine to fetch as remote images, in order.
     pub images_fetched: Mutex<Vec<String>>,
+    pub refreshes: AtomicI64,
     /// The bytes `fetch_image` answers with; a 1x1 PNG unless a test replaces it.
     pub image_bytes: Mutex<Vec<u8>>,
     /// Every `ai` request the UI made, with the prompt it sent.
@@ -160,6 +161,7 @@ impl Fixture {
             attachments_opened: Mutex::new(Vec::new()),
             images_fetched: Mutex::new(Vec::new()),
             image_bytes: Mutex::new(PNG.to_vec()),
+            refreshes: AtomicI64::new(0),
             ai_requests: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
@@ -1043,7 +1045,9 @@ impl Mail for Fixture {
         Ok(())
     }
 
-    fn sync_now(&self) {}
+    fn sync_now(&self) {
+        self.refreshes.fetch_add(1, Ordering::Relaxed);
+    }
 
     fn events(&self) -> async_channel::Receiver<Event> {
         let (tx, rx) = async_channel::unbounded();

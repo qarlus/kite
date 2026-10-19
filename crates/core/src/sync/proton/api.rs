@@ -4,8 +4,10 @@
 //! on success and `{"Code": <n>, "Error": "…", "Details": {…}}` with a 4xx/5xx status
 //! on failure, so `code` is the only reliable discriminator.
 use anyhow::{Context, Result, bail};
+use rand::Rng;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::sync::{Arc, Mutex};
 
 /// Human verification (a captcha) must be solved in a browser before this call succeeds.
 pub const CODE_HUMAN_VERIFICATION: i64 = 9001;
@@ -29,6 +31,8 @@ pub struct Challenge {
 pub struct ApiError {
     #[serde(skip)]
     pub status: u16,
+    #[serde(skip)]
+    pub retry_at: Option<i64>,
     #[serde(rename = "Code", default)]
     pub code: i64,
     #[serde(rename = "Error", default)]
@@ -79,6 +83,7 @@ pub struct Api {
     pub access: String,
     pub refresh: String,
     pub server_time: Option<u32>,
+    cooldown: Arc<Mutex<Option<ApiError>>>,
 }
 
 impl Api {
@@ -95,6 +100,7 @@ impl Api {
             access: String::new(),
             refresh: String::new(),
             server_time: None,
+            cooldown: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -165,6 +171,15 @@ impl Api {
         headers: &[(&str, &str)],
         bearer: Option<&str>,
     ) -> Result<Value> {
+        if let Some(error) = self
+            .cooldown
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            && error.retry_at.is_some_and(|at| crate::auth::now_ms() < at)
+        {
+            return Err(error.clone().into());
+        }
         let mut request = self
             .http
             .request(method, self.url(path))
@@ -190,6 +205,26 @@ impl Api {
             self.server_time = Some(time);
         }
         let status = response.status().as_u16();
+        let retry_at = matches!(status, 429 | 503).then(|| {
+            let now = crate::auth::now_ms();
+            let delay = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|h| h.to_str().ok())
+                .and_then(|h| {
+                    h.parse::<u64>()
+                        .ok()
+                        .map(|s| s.saturating_mul(1000).min(i64::MAX as u64) as i64)
+                        .or_else(|| {
+                            chrono::DateTime::parse_from_rfc2822(h)
+                                .ok()
+                                .map(|d| d.timestamp_millis().saturating_sub(now).max(0))
+                        })
+                })
+                .unwrap_or(10_000);
+            now.saturating_add(delay)
+                .saturating_add(rand::thread_rng().gen_range(0..=10_000))
+        });
         let text = response.text().await.unwrap_or_default();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if (200..300).contains(&status) && !is_error_code(&value) {
@@ -197,11 +232,25 @@ impl Api {
         }
         let mut error: ApiError = serde_json::from_value(value).unwrap_or(ApiError {
             status,
+            retry_at: None,
             code: 0,
             message: String::new(),
             details: Value::Null,
         });
         error.status = status;
+        error.retry_at = retry_at;
+        if retry_at.is_some() {
+            let mut cooldown = self
+                .cooldown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if cooldown
+                .as_ref()
+                .is_none_or(|previous| previous.retry_at < error.retry_at)
+            {
+                *cooldown = Some(error.clone());
+            }
+        }
         if error.message.is_empty() {
             error.message = text.chars().take(200).collect();
         }
@@ -322,7 +371,7 @@ impl Api {
                 &[("X-HTTP-Method-Override", "GET")],
             )
             .await?;
-        Ok(serde_json::from_value(value["Messages"].clone()).unwrap_or_default())
+        serde_json::from_value(value["Messages"].clone()).context("Proton message metadata")
     }
 
     pub async fn message(&mut self, id: &str) -> Result<Message> {
@@ -459,7 +508,7 @@ impl Api {
     /// The account's labels, folders included (`GET /core/v4/labels`).
     pub async fn labels(&mut self) -> Result<Vec<Label>> {
         let value = self
-            .call(reqwest::Method::GET, "/core/v4/labels", None)
+            .call(reqwest::Method::GET, "/core/v4/labels?Type=3", None)
             .await?;
         Ok(serde_json::from_value(value["Labels"].clone()).unwrap_or_default())
     }
@@ -720,6 +769,10 @@ pub struct Event {
     pub event_id: String,
     #[serde(default)]
     pub messages: Vec<MessageEvent>,
+    #[serde(default)]
+    pub refresh: u32,
+    #[serde(default)]
+    pub labels: Vec<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -730,9 +783,6 @@ pub struct MessageEvent {
     /// 0 delete, 1 create, 2 update, 3 update flags.
     #[serde(default)]
     pub action: i64,
-    /// A delete carries only the id, so the metadata is absent (or null).
-    #[serde(default)]
-    pub message: Option<Meta>,
 }
 
 pub const EVENT_DELETE: i64 = 0;

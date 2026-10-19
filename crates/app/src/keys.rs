@@ -32,6 +32,7 @@ pub mod cmd {
     pub const SETTINGS: u8 = 31;
     pub const ACCOUNT_SWITCHER: u8 = 32;
     pub const MANAGE_ACCOUNTS: u8 = 33;
+    pub const REFRESH: u8 = 34;
     pub const ACCOUNT: u8 = 40;
     pub const COMPOSE: u8 = 50;
     pub const REPLY: u8 = 51;
@@ -110,6 +111,14 @@ const fn c(
 }
 
 pub static COMMANDS: &[Cmd] = &[
+    c(
+        "refresh",
+        "Refresh mail",
+        &["secondary-r"],
+        "Kite",
+        Group::App,
+        cmd::REFRESH,
+    ),
     c(
         "manage_accounts",
         "Manage accounts",

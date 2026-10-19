@@ -1054,3 +1054,89 @@ async fn graph_headers_separate_independent_sends_and_unite_only_linked_replies(
             .all(|r| r.labels.is_empty())
     );
 }
+
+#[tokio::test]
+async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying() {
+    use kite_core::api::Mail;
+    use kite_core::engine::{Engine, Options, Secrets};
+    use kite_core::model::{Draft, Provider, Settings, View};
+    use kite_core::store::Store;
+    use std::time::{Duration, Instant};
+    let fake = Fake::start(|call, _| match call.path.as_str() {
+        "/me/mailFolders" => Reply::json(200, json!({"value":[]})),
+        "/me/sendMail" => Reply::json(400, json!({"error":{"message":"Invalid recipient"}})),
+        _ => Reply::empty(404),
+    })
+    .await;
+    let dir = std::env::temp_dir().join(format!("kite-graph-rejected-send-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    store
+        .set_settings(Settings {
+            ms_client_id: "client".into(),
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    drop(store);
+    let tokens = Tokens {
+        access: "access".into(),
+        refresh: "refresh".into(),
+        expires_at: auth::now_ms() + 3_600_000,
+    };
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::from([(
+            format!("ms:{}", account.id),
+            serde_json::to_string(&tokens).unwrap(),
+        )]))),
+        Options {
+            graph_base_url: Some(fake.base.clone()),
+            graph_authority: Some(fake.base.clone()),
+            poll: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: "Bad recipient".into(),
+                email: "bad@example.com".into(),
+            }],
+            subject: "Fix recipient".into(),
+            body: "recover this".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let view = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Drafts,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let row = loop {
+        if let Some(row) = engine
+            .threads(&view, 0, 10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.subject == "Fix recipient")
+        {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "permanent rejection must return to Drafts immediately"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(engine.draft(row.id).unwrap().unwrap().body, "recover this");
+    assert_eq!(fake.path("/me/sendMail").len(), 1);
+    drop(engine);
+}

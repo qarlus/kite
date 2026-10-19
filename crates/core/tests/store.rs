@@ -2342,7 +2342,7 @@ fn a_failed_send_waits_in_the_outbox_before_retrying() {
         .unwrap();
     assert_eq!(s.outbox_due(now()).unwrap().len(), 1);
 
-    s.outbox_failed(outbox, now()).unwrap();
+    assert!(!s.outbox_failed(outbox, now(), false, None).unwrap().0);
     assert!(
         s.outbox_due(now()).unwrap().is_empty(),
         "a failure backs off instead of retrying every tick"
@@ -2693,4 +2693,24 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
     );
     drop(connection);
     cleanup(&path);
+}
+
+#[test]
+fn outbox_retries_back_off_in_minutes_and_stop_after_eight_attempts() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let id = s
+        .outbox_add(&draft_to(account.id, "Recoverable", "keep this"), D0)
+        .unwrap();
+    let mut at = D0;
+    for attempt in 0..7 {
+        assert!(!s.outbox_failed(id, at, false, None).unwrap().0);
+        let delay = 5_000 * (1i64 << attempt);
+        assert!(s.outbox_due(at + delay - 1).unwrap().is_empty());
+        assert_eq!(s.outbox_due(at + delay).unwrap()[0].0, id);
+        at += delay;
+    }
+    assert!(s.outbox_failed(id, at, false, None).unwrap().0);
+    assert_eq!(s.outbox_cancel(id).unwrap().unwrap().body, "keep this");
+    assert!(s.outbox_due(i64::MAX).unwrap().is_empty());
 }

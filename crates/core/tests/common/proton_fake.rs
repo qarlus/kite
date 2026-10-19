@@ -330,6 +330,13 @@ pub struct World {
     pub deleted: Vec<String>,
     pub read_requests: Vec<String>,
     pub pause_events: bool,
+    pub faults: HashMap<String, (u16, i64, String, Option<String>)>,
+    pub requests: Vec<(String, std::time::Instant)>,
+    pub sparse_events: bool,
+    pub event_refresh: u32,
+    pub label_event: bool,
+    pub send_rejection: bool,
+    pub send_attempts: usize,
     pub clock_skew_secs: i64,
     pub access: String,
     pub refresh: String,
@@ -368,6 +375,13 @@ impl World {
             deleted: Vec::new(),
             read_requests: Vec::new(),
             pause_events: false,
+            faults: HashMap::new(),
+            requests: Vec::new(),
+            sparse_events: false,
+            event_refresh: 0,
+            label_event: false,
+            send_rejection: false,
+            send_attempts: 0,
             clock_skew_secs: 0,
             access: "access-1".into(),
             refresh: "refresh-1".into(),
@@ -629,16 +643,31 @@ async fn handle(mut sock: tokio::net::TcpStream, world: Arc<Mutex<World>>) {
         headers,
         body,
     };
-    let (status, payload, date) = {
+    let (status, payload, date, retry) = {
         let mut world = world.lock().expect("world");
-        let (status, payload) = route(&mut world, &request);
+        world
+            .requests
+            .push((request.path.clone(), std::time::Instant::now()));
+        let fault = world.faults.get(&request.path).cloned();
+        let (status, payload) = match &fault {
+            Some((status, code, message, _)) => error(*status, *code, message),
+            None => route(&mut world, &request),
+        };
         let date = (chrono::Utc::now() + chrono::Duration::seconds(world.clock_skew_secs))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
-        (status, payload, date)
+        (
+            status,
+            payload,
+            date,
+            fault.and_then(|(_, _, _, retry)| retry),
+        )
     };
+    let retry = retry
+        .map(|r| format!("Retry-After: {r}\r\n"))
+        .unwrap_or_default();
     let head = format!(
-        "HTTP/1.1 {status} X\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} X\r\nDate: {date}\r\n{retry}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     let _ = sock.write_all(head.as_bytes()).await;
@@ -793,6 +822,9 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 )
                 .collect::<Vec<_>>(),
         })),
+        ("GET", "/api/core/v4/labels") if !request.query.split('&').any(|q| q == "Type=3") => {
+            error(400, 2000, "The Type is required")
+        }
         ("GET", "/api/core/v4/labels") => ok(json!({
             "Labels": world
                 .labels
@@ -949,7 +981,7 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                         Some(found) if *action != 0 => messages.push(json!({
                             "ID": msg_id,
                             "Action": action,
-                            "Message": meta_json(found),
+                            "Message": if world.sparse_events { json!({"ID": msg_id}) } else { meta_json(found) },
                         })),
                         _ => messages.push(json!({
                             "ID": msg_id,
@@ -967,6 +999,8 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 "EventID": last,
                 "Messages": messages,
                 "More": if more { 1 } else { 0 },
+                "Refresh": std::mem::take(&mut world.event_refresh),
+                "Labels": if std::mem::take(&mut world.label_event) { vec![json!({"ID":"web-folder","Action":1})] } else { vec![] },
             }))
         }
         ("GET", path) if path.starts_with("/api/mail/v4/attachments/") => {
@@ -1017,6 +1051,10 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
             // Like Proton: with "Sign external messages" on, an external (clear) copy must
             // declare its signature.
             let body = request.json();
+            world.send_attempts += 1;
+            if world.send_rejection {
+                return error(400, 2001, "Send rejected");
+            }
             let unsigned_clear =
                 body["Packages"]
                     .as_array()

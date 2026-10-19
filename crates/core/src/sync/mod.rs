@@ -56,6 +56,13 @@ pub struct RemoteMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Delta {
     Upsert(Box<RemoteMsg>),
+    Metadata {
+        remote_id: String,
+        folder: String,
+        mailbox: Mailbox,
+        unread: bool,
+        starred: bool,
+    },
     Flags {
         remote_id: String,
         unread: bool,

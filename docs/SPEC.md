@@ -11,7 +11,7 @@ Kite is a keyboard-first email client modelled on Superhuman. Every action has a
 
 Multiple accounts are supported. The icon rail on the left shows one avatar per account (initials, unread badge) and an all-inboxes icon for the combined view. Account switching uses `Ctrl/Cmd+1..9`; `Ctrl/Cmd+0` returns to the combined inbox. Split tabs and standard mailbox navigation preserve the selected account.
 
-The mailbox picker in the list header offers Inbox, Drafts, Sent, Starred, Snoozed, Archive, Spam, Trash and All mail, plus the account's custom folders. Custom folders belong to an account; the combined sidebar identifies their owner. New folder opens an account chooser and name field (`Ctrl/Cmd+Shift+N`). Creation runs off the UI thread, reports errors, and adds the folder only after the provider accepted it. Folders created in Kite are recorded locally and on the provider; folders created in another client are not discovered yet. `L` moves selected conversations into Inbox, Archive, Trash or a custom folder from their account. Mixed-account selections expose only the shared standard destinations. Moving is undoable. Creating a folder does not move any mail automatically.
+The mailbox picker in the list header offers Inbox, Drafts, Sent, Starred, Snoozed, Archive, Spam, Trash and All mail, plus the account's custom folders. Custom folders belong to an account; the combined sidebar identifies their owner. New folder opens an account chooser and name field (`Ctrl/Cmd+Shift+N`). Creation runs off the UI thread, reports errors, and adds the folder only after the provider accepted it. Folders created in Kite are recorded locally and on the provider; Proton folders created in another client are discovered on label events. `L` moves selected conversations into Inbox, Archive, Trash or a custom folder from their account. Mixed-account selections expose only the shared standard destinations. Moving is undoable. Creating a folder does not move any mail automatically.
 
 ## Core (Superhuman parity)
 - **Split inbox**: category tabs sit above the mailbox heading and are **filters**, not a partition: `Inbox` shows the whole mailbox, while `Social`, `Newsletters` and `GitHub` are non-exclusive lenses over it, so a conversation can appear in both `Inbox` and its category. The defaults are `Inbox` (no query), `Social` (`from:` with a comma-separated domain set), `Newsletters` (`is:newsletter`, set from the `List-Unsubscribe`/`List-Id` headers) and `GitHub` (`from:github.com`). Splits are stored queries ANDed with the selected mailbox, so users can edit or add their own (e.g. `from:github.com`); Tab and Shift+Tab cycle through them.
@@ -28,6 +28,8 @@ The mailbox picker in the list header offers Inbox, Drafts, Sent, Starred, Snooz
 - **Read status**: not implemented (no tracking pixels, by design).
 - **Calendar sidebar** (Graph accounts only): today's agenda in the right pane, toggled with `Cmd/Ctrl+Shift+C`.
 - **AI (optional, off by default)**: "Write with AI" in compose (`Cmd/Ctrl+J`) and "Summarize thread" (`Shift+S`). This works with any OpenAI-compatible Chat Completions endpoint. The default preset is **OpenCode Go** with `deepseek-v4.1-flash`. Base URL, model and API key are configured in Settings, and the key is stored in the keychain. Responses stream.
+
+Mail sync starts when Kite opens. Native Proton events poll every 25-40 seconds with independent random jitter; Refresh requests sync immediately, at most once every 10 seconds, and never bypasses a provider retry deadline. A send that is permanently rejected or exhausts eight attempts returns to Drafts with an error toast.
 
 ## Input modes and shortcuts
 Settings › General chooses the input mode:
@@ -54,6 +56,7 @@ Settings › Shortcuts lists every command by group with its current keys. Each 
 | `r` / `a` / `f` | reply / reply all / forward |
 | `/` | search |
 | `Cmd/Ctrl+K` | command palette |
+| `Cmd/Ctrl+R` | refresh mail (also the list header refresh button) |
 | `Tab` / `Shift+Tab` | next / previous split |
 | `g i` `g s` `g d` `g t` `g h` `g a` | go to inbox / starred / drafts / sent / snoozed / all mail |
 | `g e` / `g p` / `g b` | archive / spam / trash |

@@ -2,7 +2,7 @@
 //!
 //! The same file is opened twice (a reader for the UI, a writer for sync); WAL makes that work.
 //! Every write is one short transaction so a UI action never waits behind a long sync batch.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -599,6 +599,13 @@ impl Store {
 // -------------------------------------------------------------------- deltas
 
 impl Store {
+    pub(crate) fn remote_ids(&self, account: Id) -> Result<BTreeSet<String>> {
+        let mut statement = self.conn.prepare("SELECT remote_id FROM messages WHERE account_id=?1 AND remote_id NOT LIKE 'kite-draft:%'")?;
+        Ok(statement
+            .query_map([account], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
     /// Applies one sync batch in a single transaction. Batches are Ã¢â€°Â¤ 200 messages (see ARCHITECTURE).
     pub fn apply_deltas(&self, account_id: Id, deltas: &[Delta]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -622,9 +629,9 @@ impl Store {
                     touched.insert(upsert_message(&tx, account_id, &account_email, m)?);
                     continue;
                 }
-                Delta::Flags { remote_id, .. } | Delta::Delete { remote_id } => {
-                    find_message(&tx, account_id, remote_id)?
-                }
+                Delta::Metadata { remote_id, .. }
+                | Delta::Flags { remote_id, .. }
+                | Delta::Delete { remote_id } => find_message(&tx, account_id, remote_id)?,
             };
             let Some((mid, tid)) = hit else { continue };
             let changed = match d {
@@ -637,6 +644,17 @@ impl Store {
                        AND (unread IS NOT ?1 OR starred IS NOT ?2)
                        AND NOT EXISTS (SELECT 1 FROM pending_ops WHERE message_id=?3)",
                     params![unread, starred, mid],
+                )?,
+                Delta::Metadata {
+                    folder,
+                    mailbox,
+                    unread,
+                    starred,
+                    ..
+                } => tx.execute(
+                    "UPDATE messages SET folder=?1, mailbox=?2, unread=?3, starred=?4 WHERE id=?5
+                     AND NOT EXISTS (SELECT 1 FROM pending_ops WHERE message_id=?5)",
+                    params![folder, mb_str(*mailbox), unread, starred, mid],
                 )?,
                 Delta::Delete { .. } => tx.execute("DELETE FROM messages WHERE id=?1", [mid])?,
                 Delta::Upsert(_) => unreachable!(),
@@ -2196,22 +2214,28 @@ impl Store {
         Ok(())
     }
 
-    /// A failed send stays in the outbox and retries with exponential backoff, capped at a minute,
-    /// so a dead server is reported once a minute instead of on every tick.
-    pub fn outbox_failed(&self, id: Id, now: Ms) -> Result<()> {
-        let attempts: i64 = self
-            .conn
-            .query_row("SELECT attempts FROM outbox WHERE id=?1", [id], |r| {
-                r.get(0)
-            })
-            .optional()?
-            .unwrap_or(0);
-        let backoff = (1_000i64 << attempts.min(6)).min(60_000);
+    /// Stop after eight attempts; return (stopped, first failure) for draft recovery and one retry toast.
+    pub fn outbox_failed(
+        &self,
+        id: Id,
+        now: Ms,
+        permanent: bool,
+        not_before: Option<Ms>,
+    ) -> Result<(bool, bool)> {
+        let attempts: i64 =
+            self.conn
+                .query_row("SELECT attempts FROM outbox WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if permanent || attempts >= 7 {
+            return Ok((true, attempts == 0));
+        }
+        let backoff = (5_000i64 << attempts.min(8)).min(15 * 60_000);
         self.conn.execute(
             "UPDATE outbox SET attempts=attempts+1, at=?1 WHERE id=?2",
-            params![now + backoff, id],
+            params![(now + backoff).max(not_before.unwrap_or(0)), id],
         )?;
-        Ok(())
+        Ok((false, attempts == 0))
     }
 
     /// Everything the engine needs to build reply MIME. `references` already includes this

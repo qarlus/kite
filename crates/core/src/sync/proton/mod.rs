@@ -13,7 +13,7 @@ mod api;
 mod crypto;
 pub mod srp;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result, bail};
@@ -319,8 +319,13 @@ pub struct Proton {
     passphrases: BTreeMap<String, String>,
     keys: Option<Keyring>,
     sent: Option<RemoteMsg>,
-    /// The account's folders (custom labels of type 3), fetched once.
+    /// Custom folders, cached until a label event or mail refresh.
     folders: Option<Vec<(String, String)>>,
+    known: BTreeSet<String>,
+    reported: HashSet<String>,
+    warnings: Vec<String>,
+    fetch_concurrency: usize,
+    cleanup: Vec<String>,
 }
 
 impl Proton {
@@ -334,6 +339,11 @@ impl Proton {
             keys: None,
             sent: None,
             folders: None,
+            known: BTreeSet::new(),
+            reported: HashSet::new(),
+            warnings: Vec::new(),
+            fetch_concurrency: FETCH_CONCURRENCY,
+            cleanup: Vec::new(),
         }
     }
 
@@ -353,7 +363,35 @@ impl Proton {
         let _ = self.api.logout().await;
     }
 
+    pub(crate) fn has_more(cursor: &str) -> bool {
+        serde_json::from_str::<Cursor>(cursor).is_ok_and(|c| c.label < BACKFILL.len())
+    }
+
+    pub(crate) fn set_known(&mut self, known: BTreeSet<String>) {
+        self.known = known;
+    }
+
+    pub(crate) fn take_warnings(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.warnings)
+    }
+
+    fn warn(&mut self, id: &str, message: String) {
+        if self.reported.insert(id.to_string()) {
+            self.warnings
+                .push(format!("Proton message {id}: {message}"));
+        }
+    }
+
+    async fn cleanup_drafts(&mut self) -> Result<()> {
+        if !self.cleanup.is_empty() {
+            self.api.delete_messages(&self.cleanup).await?;
+            self.cleanup.clear();
+        }
+        Ok(())
+    }
+
     pub async fn sync(&mut self, cursor: Option<String>) -> Result<(Vec<Delta>, String)> {
+        self.cleanup_drafts().await?;
         self.load_keys().await?;
         let mut cursor = match cursor {
             Some(raw) => serde_json::from_str::<Cursor>(&raw).context("proton cursor")?,
@@ -361,6 +399,7 @@ impl Proton {
                 event: self.api.latest_event().await?,
                 label: 0,
                 page: 0,
+                remaining: None,
             },
         };
 
@@ -368,12 +407,41 @@ impl Proton {
         if cursor.label < BACKFILL.len() {
             let label = BACKFILL[cursor.label];
             let metas = self.api.messages(label, cursor.page, PAGE).await?;
-            let deltas = self.upserts(&metas).await?;
+            let mut deltas = Vec::new();
+            let mut fetch = Vec::new();
+            for meta in &metas {
+                if let Some(remaining) = &mut cursor.remaining {
+                    remaining.remove(&meta.id);
+                }
+                if self.known.contains(&meta.id) && !meta.label_ids.iter().any(|l| l == ALL_DRAFTS)
+                {
+                    let (mailbox, folder) = mailbox_for(&meta.label_ids);
+                    deltas.push(Delta::Metadata {
+                        remote_id: meta.id.clone(),
+                        folder,
+                        mailbox,
+                        unread: meta.unread,
+                        starred: meta.label_ids.iter().any(|l| l == STARRED),
+                    });
+                } else {
+                    fetch.push(meta.clone());
+                }
+            }
+            deltas.extend(self.upserts(&fetch).await?);
             if metas.len() < PAGE as usize {
                 cursor.label += 1;
                 cursor.page = 0;
             } else {
                 cursor.page += 1;
+            }
+            if cursor.label == BACKFILL.len()
+                && let Some(remaining) = cursor.remaining.take()
+            {
+                deltas.extend(
+                    remaining
+                        .into_iter()
+                        .map(|remote_id| Delta::Delete { remote_id }),
+                );
             }
             return Ok((deltas, serde_json::to_string(&cursor)?));
         }
@@ -392,6 +460,7 @@ impl Proton {
                     event,
                     label: 0,
                     page: 0,
+                    remaining: Some(self.known.clone()),
                 };
                 return Ok((Vec::new(), serde_json::to_string(&fresh)?));
             }
@@ -401,6 +470,14 @@ impl Proton {
             if !event.event_id.is_empty() {
                 cursor.event = event.event_id;
             }
+            if !event.labels.is_empty() || event.refresh & 1 != 0 {
+                self.folders = None;
+            }
+            if event.refresh & 1 != 0 {
+                cursor.label = 0;
+                cursor.page = 0;
+                cursor.remaining = Some(self.known.clone());
+            }
             let mut changed = Vec::new();
             for message in &event.messages {
                 if message.action == api::EVENT_DELETE {
@@ -408,10 +485,11 @@ impl Proton {
                         remote_id: message.id.clone(),
                     });
                 } else if !message.id.is_empty() {
-                    changed.push(message.message.clone().unwrap_or_else(|| api::Meta {
+                    // Event metadata can omit even its nested ID; the envelope owns it.
+                    changed.push(api::Meta {
                         id: message.id.clone(),
                         ..Default::default()
-                    }));
+                    });
                 }
             }
             deltas.extend(self.upserts(&changed).await?);
@@ -420,6 +498,7 @@ impl Proton {
     }
 
     pub async fn apply(&mut self, op: &Op) -> Result<Option<String>> {
+        self.cleanup_drafts().await?;
         self.load_keys().await?;
         match op {
             Op::Move { remote_id, to } => {
@@ -575,22 +654,61 @@ impl Proton {
 
     /// Bodies for a page of metadata, fetched a few at a time so a large mailbox does
     /// not serialise into minutes of round trips.
-    async fn upserts(&self, metas: &[api::Meta]) -> Result<Vec<Delta>> {
-        if metas.is_empty() {
-            return Ok(Vec::new());
-        }
-        let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
+    async fn upserts(&mut self, metas: &[api::Meta]) -> Result<Vec<Delta>> {
         let mut out = Vec::with_capacity(metas.len());
-        for chunk in metas.chunks(FETCH_CONCURRENCY) {
+        let mut offset = 0;
+        while offset < metas.len() {
+            let end = (offset + self.fetch_concurrency).min(metas.len());
+            let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
             let results = futures_util::future::join_all(
-                chunk
+                metas[offset..end]
                     .iter()
                     .map(|meta| fetch_delta(self.api.clone(), keys, meta)),
             )
             .await;
-            for result in results {
-                out.push(result?);
+            let mut systemic = None;
+            let mut throttled = false;
+            for (meta, result) in metas[offset..end].iter().zip(results) {
+                match result {
+                    Ok((delta, warning)) => {
+                        out.push(delta);
+                        if let Some(warning) = warning {
+                            self.warn(&meta.id, warning);
+                        }
+                    }
+                    Err(error) => {
+                        // Only a message-specific missing/invalid response can be skipped.
+                        let isolated = error.downcast_ref::<serde_json::Error>().is_some()
+                            || error.downcast_ref::<api::ApiError>().is_some_and(|e| {
+                                e.status == 404
+                                    || (e.status == 400 && e.code == api::CODE_INVALID_VALUE)
+                            });
+                        if isolated {
+                            self.warn(&meta.id, format!("body unavailable: {error:#}"));
+                        } else {
+                            if error
+                                .downcast_ref::<api::ApiError>()
+                                .is_some_and(|e| e.status == 429)
+                            {
+                                throttled = true;
+                            }
+                            if systemic
+                                .as_ref()
+                                .is_none_or(|e: &anyhow::Error| retry_at(&error) > retry_at(e))
+                            {
+                                systemic = Some(error);
+                            }
+                        }
+                    }
+                }
             }
+            if throttled {
+                self.fetch_concurrency = (self.fetch_concurrency / 2).max(1);
+            }
+            if let Some(error) = systemic {
+                return Err(error);
+            }
+            offset = end;
         }
         Ok(out)
     }
@@ -618,24 +736,27 @@ impl Proton {
             .create_draft(&draft.body())
             .await
             .context("create the Proton draft")?;
-        let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
-        let mut message = remote_msg(keys, &saved.meta, &saved)?;
-        let sent = match self.packages(&draft).await {
-            Ok(packages) => self
+        let result = async {
+            let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
+            let (message, _) = remote_msg(keys, &saved)?;
+            let packages = self.packages(&draft).await?;
+            let sent = self
                 .api
                 .send_draft(&saved.meta.id, &json!({ "Packages": packages }))
                 .await
-                .context("send the Proton draft"),
-            Err(error) => Err(error),
-        };
-        if sent.is_err() {
-            // The outbox retries with a fresh draft, so this one would only pile up in Drafts.
-            let _ = self
-                .api
-                .delete_messages(std::slice::from_ref(&saved.meta.id))
-                .await;
+                .context("send the Proton draft")?;
+            Ok::<_, anyhow::Error>((message, sent))
         }
-        let sent = sent?;
+        .await;
+        let (mut message, sent) = match result {
+            Ok(sent) => sent,
+            Err(error) => {
+                self.cleanup.push(saved.meta.id);
+                // A throttle defers cleanup until its deadline, just like other requests.
+                let _ = self.cleanup_drafts().await;
+                return Err(error);
+            }
+        };
         // Use the accepted send response and the body we already hold; Sent must not wait
         // for another event poll or body download.
         message.remote_id = sent.meta.id;
@@ -761,16 +882,33 @@ impl Proton {
 
 /// What one event's metadata turns into once the body is decrypted. Needs only the
 /// shared pieces of the backend so a page of them can run at once.
-async fn fetch_delta(mut client: Api, keys: &Keyring, meta: &api::Meta) -> Result<Delta> {
+async fn fetch_delta(
+    mut client: Api,
+    keys: &Keyring,
+    meta: &api::Meta,
+) -> Result<(Delta, Option<String>)> {
     let message = client.message(&meta.id).await?;
-    Ok(Delta::Upsert(Box::new(remote_msg(keys, meta, &message)?)))
+    let (message, warning) = remote_msg(keys, &message)?;
+    Ok((Delta::Upsert(Box::new(message)), warning))
 }
 
-fn remote_msg(keys: &Keyring, meta: &api::Meta, message: &api::Message) -> Result<RemoteMsg> {
+fn remote_msg(keys: &Keyring, message: &api::Message) -> Result<(RemoteMsg, Option<String>)> {
+    let meta = &message.meta;
+    let mut warning = None;
     // Proton keeps the RFC 822 header block in clear; only the body is encrypted.
     let header = message.header.trim_end().to_string();
-    let body = if message.body.trim_start().starts_with("-----BEGIN PGP") {
-        String::from_utf8_lossy(&keys.decrypt(&message.body)?).into_owned()
+    let body = if message
+        .body
+        .trim_start()
+        .starts_with("-----BEGIN PGP MESSAGE-----")
+    {
+        match keys.decrypt(&message.body) {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(_) => {
+                warning = Some("could not decrypt; showing the original body".to_string());
+                message.body.clone()
+            }
+        }
     } else {
         message.body.clone()
     };
@@ -825,58 +963,63 @@ fn remote_msg(keys: &Keyring, meta: &api::Meta, message: &api::Message) -> Resul
         None => String::new(),
     };
     let html = parsed.as_ref().and_then(body_html);
-    Ok(RemoteMsg {
-        remote_id: meta.id.clone(),
-        folder,
-        mailbox,
-        // Proton also groups unrelated sends by subject; only RFC header links count.
-        thread_hint: None,
-        message_id: parsed.as_ref().and_then(|p| p.message_id()).map(bare_id),
-        in_reply_to: parsed.as_ref().and_then(|p| match p.in_reply_to() {
-            mail_parser::HeaderValue::Text(text) if !text.trim().is_empty() => Some(bare_id(text)),
-            _ => None,
-        }),
-        references: match parsed.as_ref().map(|p| p.references()) {
-            Some(mail_parser::HeaderValue::TextList(list)) => {
-                list.iter().map(|id| bare_id(id)).collect()
-            }
-            Some(mail_parser::HeaderValue::Text(text)) => {
-                text.split_whitespace().map(bare_id).collect()
-            }
-            _ => Vec::new(),
+    Ok((
+        RemoteMsg {
+            remote_id: meta.id.clone(),
+            folder,
+            mailbox,
+            // Proton also groups unrelated sends by subject; only RFC header links count.
+            thread_hint: None,
+            message_id: parsed.as_ref().and_then(|p| p.message_id()).map(bare_id),
+            in_reply_to: parsed.as_ref().and_then(|p| match p.in_reply_to() {
+                mail_parser::HeaderValue::Text(text) if !text.trim().is_empty() => {
+                    Some(bare_id(text))
+                }
+                _ => None,
+            }),
+            references: match parsed.as_ref().map(|p| p.references()) {
+                Some(mail_parser::HeaderValue::TextList(list)) => {
+                    list.iter().map(|id| bare_id(id)).collect()
+                }
+                Some(mail_parser::HeaderValue::Text(text)) => {
+                    text.split_whitespace().map(bare_id).collect()
+                }
+                _ => Vec::new(),
+            },
+            from,
+            to,
+            cc,
+            date: meta.time.max(0) * 1000,
+            subject,
+            text,
+            html,
+            unread: meta.unread,
+            starred: meta.label_ids.iter().any(|id| id == STARRED),
+            important: None,
+            list_unsubscribe: parsed
+                .as_ref()
+                .is_some_and(|p| !p.list_unsubscribe().is_empty() || !p.list_id().is_empty()),
+            attachments: message
+                .attachments
+                .iter()
+                .map(|attachment| RemoteAttachment {
+                    remote_id: attachment.id.clone(),
+                    name: if attachment.name.is_empty() {
+                        "attachment".to_string()
+                    } else {
+                        attachment.name.clone()
+                    },
+                    mime: if attachment.mime_type.is_empty() {
+                        "application/octet-stream".to_string()
+                    } else {
+                        attachment.mime_type.clone()
+                    },
+                    size: attachment.size.max(0) as u64,
+                })
+                .collect(),
         },
-        from,
-        to,
-        cc,
-        date: meta.time.max(0) * 1000,
-        subject,
-        text,
-        html,
-        unread: meta.unread,
-        starred: meta.label_ids.iter().any(|id| id == STARRED),
-        important: None,
-        list_unsubscribe: parsed
-            .as_ref()
-            .is_some_and(|p| !p.list_unsubscribe().is_empty() || !p.list_id().is_empty()),
-        attachments: message
-            .attachments
-            .iter()
-            .map(|attachment| RemoteAttachment {
-                remote_id: attachment.id.clone(),
-                name: if attachment.name.is_empty() {
-                    "attachment".to_string()
-                } else {
-                    attachment.name.clone()
-                },
-                mime: if attachment.mime_type.is_empty() {
-                    "application/octet-stream".to_string()
-                } else {
-                    attachment.mime_type.clone()
-                },
-                size: attachment.size.max(0) as u64,
-            })
-            .collect(),
-    })
+        warning,
+    ))
 }
 
 /// The mailbox a set of labels puts a message in (Trash wins, then Spam, then the
@@ -1151,9 +1294,15 @@ fn parser() -> &'static MessageParser {
 /// A Proton event id that the API no longer knows about: the account has to be walked
 /// again. Proton answers with a plain invalid-value code here.
 fn is_stale_event(error: &anyhow::Error) -> bool {
-    error
-        .downcast_ref::<api::ApiError>()
-        .is_some_and(|e| e.code == api::CODE_INVALID_VALUE || e.status == 400 || e.status == 404)
+    error.downcast_ref::<api::ApiError>().is_some_and(|e| {
+        let text = e.message.to_ascii_lowercase();
+        e.status == 400
+            && e.code == api::CODE_INVALID_VALUE
+            && (text.contains("event id") || text.contains("eventid"))
+            && ["invalid", "unknown", "expired", "not found"]
+                .iter()
+                .any(|word| text.contains(word))
+    })
 }
 
 /// Opaque per-account sync state: the live-sync cursor plus how far the first walk got.
@@ -1165,6 +1314,26 @@ struct Cursor {
     label: usize,
     #[serde(default)]
     page: u32,
+    /// Persist progress so an interrupted re-walk cannot delete unseen mail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    remaining: Option<BTreeSet<String>>,
+}
+
+pub(crate) fn retry_at(error: &anyhow::Error) -> Option<i64> {
+    error
+        .downcast_ref::<api::ApiError>()
+        .and_then(|e| e.retry_at)
+}
+
+pub(crate) fn permanent_send(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<api::ApiError>().is_some_and(|e| {
+        e.retry_at.is_none()
+            && (e.code == api::CODE_INVALID_VALUE
+                || ((400..500).contains(&e.status) && !matches!(e.status, 408 | 429)))
+    }) || error
+        .downcast_ref::<reqwest::Error>()
+        .and_then(|e| e.status())
+        .is_some_and(|s| s.is_client_error() && !matches!(s.as_u16(), 408 | 429))
 }
 
 /// Random hex, for the OAuth-style `State` the refresh route asks for.

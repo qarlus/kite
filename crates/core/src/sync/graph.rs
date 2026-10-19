@@ -519,7 +519,11 @@ async fn check(res: reqwest::Response, what: &str) -> Result<()> {
         return Ok(());
     }
     let status = res.status();
+    let error = res.error_for_status_ref().err();
     let text = res.text().await.unwrap_or_default();
+    if let Some(error) = error {
+        return Err(error).with_context(|| format!("{what} failed ({status}): {}", clip(&text)));
+    }
     bail!("{what} failed ({status}): {}", clip(&text))
 }
 
