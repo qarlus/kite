@@ -92,49 +92,73 @@ pub fn proofs(
     use anyhow::bail;
     let n = to_int(modulus);
     ensure_group(&n)?;
-    let g = BigUint::from(2u8);
     let b = to_int(server_ephemeral);
     let n_minus_one = &n - BigUint::from(1u8);
     if b <= BigUint::from(1u8) || b >= n_minus_one {
         bail!("Proton's SRP server ephemeral is out of range");
     }
 
-    // a is random, above 2*bitLength and below N-1; A = g^a mod N.
-    let (secret, client_ephemeral) = {
-        let mut rng = rand::thread_rng();
-        loop {
-            let a = random_below(&n_minus_one, &mut rng);
-            if a > BigUint::from(2 * BITS as u64) {
-                let ephemeral = g.modpow(&a, &n);
-                break (a, ephemeral);
-            }
+    // a is random, above 2*bitLength and below N-1.
+    let mut rng = rand::thread_rng();
+    let secret = loop {
+        let a = random_below(&n_minus_one, &mut rng);
+        if a > BigUint::from(2 * BITS as u64) {
+            break a;
         }
     };
-    let client_ephemeral_bytes = from_int(&client_ephemeral);
+    Ok(proofs_for_secret(
+        &n,
+        server_ephemeral,
+        hashed_password,
+        secret,
+    ))
+}
 
-    let k = to_int(&expand_hash(&[from_int(&g), from_int(&n)].concat())) % &n;
+/// The deterministic rest of the exchange for a chosen client secret `a`.
+fn proofs_for_secret(
+    n: &BigUint,
+    server_ephemeral: &[u8],
+    hashed_password: &[u8],
+    secret: BigUint,
+) -> Proofs {
+    let g = BigUint::from(2u8);
+    let b = to_int(server_ephemeral);
+    let client_ephemeral_bytes = from_int(&g.modpow(&secret, n));
+
+    let k = to_int(&expand_hash(&[from_int(&g), from_int(n)].concat())) % n;
     let u = to_int(&expand_hash(
         &[client_ephemeral_bytes.clone(), server_ephemeral.to_vec()].concat(),
     ));
     let x = to_int(hashed_password);
 
     // S = (B - k*g^x mod N)^(u*x + a) mod N
-    let base = (&b + &n - (&k * g.modpow(&x, &n)) % &n) % &n;
+    let base = (&b + n - (&k * g.modpow(&x, n)) % n) % n;
     let exponent = u * x + secret;
-    let shared = base.modpow(&exponent, &n);
+    let shared = base.modpow(&exponent, n);
     let shared = from_int(&shared);
 
     let client_proof = expand_hash(
-        &[client_ephemeral_bytes.clone(), server_ephemeral.to_vec(), shared.clone()].concat(),
+        &[
+            client_ephemeral_bytes.clone(),
+            server_ephemeral.to_vec(),
+            shared.clone(),
+        ]
+        .concat(),
     );
-    let expected_server_proof =
-        expand_hash(&[client_ephemeral_bytes.clone(), client_proof.to_vec(), shared].concat())
-            .to_vec();
-    Ok(Proofs {
+    let expected_server_proof = expand_hash(
+        &[
+            client_ephemeral_bytes.clone(),
+            client_proof.to_vec(),
+            shared,
+        ]
+        .concat(),
+    )
+    .to_vec();
+    Proofs {
         client_ephemeral: client_ephemeral_bytes,
         client_proof: client_proof.to_vec(),
         expected_server_proof,
-    })
+    }
 }
 
 fn ensure_group(n: &BigUint) -> anyhow::Result<()> {
@@ -179,6 +203,34 @@ mod tests {
         assert_eq!(
             bcrypt_hash(b"test!!!", &salt).expect("hash"),
             "$2y$10$PTTsDBs/mlLnSk6VmtFgheNSiK/lSwtJsrBLLDK3kZYI7193nInqy"
+        );
+    }
+
+    /// `TestSRPauth` in go-srp: user "jakubqa", password "abc123", Proton's published
+    /// modulus and server ephemeral. `SECRET` is the client secret go-srp draws from
+    /// its seeded test RNG (recovered by replaying that RNG against go-srp itself), so
+    /// both proofs must equal the ones go-srp's test publishes, byte for byte.
+    #[test]
+    fn login_proofs_match_go_srp_vector() {
+        use crate::sync::proton::crypto::unb64;
+        const MODULUS: &str = "W2z5HBi8RvsfYzZTS7qBaUxxPhsfHJFZpu3Kd6s1JafNrCCH9rfvPLrfuqocxWPgWDH2R8neK7PkNvjxto9TStuY5z7jAzWRvFWN9cQhAKkdWgy0JY6ywVn22+HFpF4cYesHrqFIKUPDMSSIlWjBVmEJZ/MusD44ZT29xcPrOqeZvwtCffKtGAIjLYPZIEbZKnDM1Dm3q2K/xS5h+xdhjnndhsrkwm9U9oyA2wxzSXFL+pdfj2fOdRwuR5nW0J2NFrq3kJjkRmpO/Genq1UW+TEknIWAb6VzJJJA244K/H8cnSx2+nSNZO3bbo6Ys228ruV9A8m6DhxmS+bihN3ttQ==";
+        const SERVER_EPHEMERAL: &str = "l13IQSVFBEV0ZZREuRQ4ZgP6OpGiIfIjbSDYQG3Yp39FkT2B/k3n1ZhwqrAdy+qvPPFq/le0b7UDtayoX4aOTJihoRvifas8Hr3icd9nAHqd0TUBbkZkT6Iy6UpzmirCXQtEhvGQIdOLuwvy+vZWh24G2ahBM75dAqwkP961EJMh67/I5PA5hJdQZjdPT5luCyVa7BS1d9ZdmuR0/VCjUOdJbYjgtIH7BQoZs+KacjhUN8gybu+fsycvTK3eC+9mCN2Y6GdsuCMuR3pFB0RF9eKae7cA6RbJfF1bjm0nNfWLXzgKguKBOeF3GEAsnCgK68q82/pq9etiUDizUlUBcA==";
+        const SECRET: &str = "b19256d09afdcac0ba7489ff27ed6f6b57e3a83f0216c1d40e4144f3fd47894961108e6517386e052b8e822623c9053f275e7029e1b2745b5ac22ddca296e771701c1ca100da07b62c695f882dcdda00e18728100cbefdfe12575b49e0c37baef3c4c6e30ced8a97160662785a4643aa3c903ced428a1051a7821b88aeaf0b1b8ec7a2cf79557c87a22ece04ac1add13ac8f6d54eaeb1cfe4f8c3ed6e83e84badc4ce36fbd4b9ee7818e744ee5826f9eda8fe12919f9f41db402bc75d3613f0858079b70e0cb1a843585884c14d6c00c5ba53b0d9f9f0c7a619b42764d9bd7df529ddd09ba923e34d9c90952f284145b9fe872b44b9fbb971bbf64b1967f8c53";
+        const CLIENT_PROOF: &str = "Qb+1+jEqHRqpJ3nEJX2FEj0kXgCIWHngO0eT4R2Idkwke/ceCIUmQa0RfTYU53ybO1AVergtb7N0W/3bathdHT9FAHhy0vDGQDg/yPnuUneqV76NuU+pQHnO83gcjmZjDq/zvRRSD7dtIORRK97xhdR9W9bG5XRGr2c9Zev40YVcXgUiNUG/0zHSKQfEhUpMKxdauKtGC+dZnZzU6xaU0qvulYEsraawurRf0b1VXwohM6KE52Fj5xlS2FWZ3Mg0WIOC5KW5ziI6QirEUDK2pH/Rxvu4HcW9aMuppUmHk9Bm6kdg99o3vl0G7OgmEI7y6iyEYmXqH44XGORJ2sDMxQ==";
+        const SERVER_PROOF: &str = "SLCSIClioSAtozauZZzcJuVPyY+MjnxfJSgEe9y6RafgjlPqnhQTZclRKPGsEhxVyWan7PIzhL+frPyZNaE1QaV5zbqz1yf9RXpGyTjZwU3FuVCJpkhp6iiCK3Wd2SemxawFXC06dgAdJ7I3HKvfkXeMANOUUh5ofjnJtXg42OGp4x1lKoFcH+IbB/CvRNQCmRTyhOiBJmZyUFwxHXLT/h+PlD0XSehcyybIIBIsscQ7ZPVPxQw4BqlqoYzTjjXPJxLxeQUQm2g9bPzT+izuR0VOPDtjt+dXrWny90k2nzS0Bs2YvNIqbJn1aQwFZr42p/O1I9n5S3mYtMgGk/7b1g==";
+
+        let modulus = unb64(MODULUS).expect("modulus");
+        let n = to_int(&modulus);
+        ensure_group(&n).expect("Proton's group");
+        let salt = unb64("yKlc5/CvObfoiw==").expect("salt");
+        let hashed = hashed_password(b"abc123", &salt, &modulus).expect("hash");
+        let server_ephemeral = unb64(SERVER_EPHEMERAL).expect("B");
+
+        let proofs = proofs_for_secret(&n, &server_ephemeral, &hashed, to_int(&hex(SECRET)));
+        assert_eq!(proofs.client_proof, unb64(CLIENT_PROOF).expect("M"));
+        assert_eq!(
+            proofs.expected_server_proof,
+            unb64(SERVER_PROOF).expect("M2")
         );
     }
 
