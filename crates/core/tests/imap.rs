@@ -346,3 +346,87 @@ async fn attachment_downloads_the_mime_part() {
         .expect("attachment");
     assert_eq!(bytes, b"%PDF-1.4");
 }
+
+// -------------------------------------------------------------------- drafts
+
+#[tokio::test]
+async fn save_draft_appends_to_drafts_and_replaces_the_old_copy() {
+    let world = Arc::new(Mutex::new(world()));
+    let (imap_port, smtp_port) = serve(world.clone()).await.ports();
+    let mut imap = Imap::new(config(imap_port, smtp_port));
+
+    let first = b"From: karl@example.com\r\n\
+To: bob@example.org\r\n\
+Subject: Half-written\r\n\
+Message-ID: <draft-1@example.com>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+first half\r\n";
+    let remote = imap
+        .apply(&Op::SaveDraft {
+            mime: first.to_vec(),
+            replaces: None,
+        })
+        .await
+        .expect("save")
+        .expect("appenduid");
+    assert_eq!(remote, "Drafts/3/1", "the new copy's remote id");
+
+    let second = b"From: karl@example.com\r\n\
+To: bob@example.org\r\n\
+Subject: Finished\r\n\
+Message-ID: <draft-1@example.com>\r\n\
+Content-Type: text/plain; charset=utf-8\r\n\
+\r\n\
+second half\r\n";
+    let replaced = imap
+        .apply(&Op::SaveDraft {
+            mime: second.to_vec(),
+            replaces: Some(remote),
+        })
+        .await
+        .expect("replace")
+        .expect("appenduid");
+    assert_eq!(replaced, "Drafts/3/2");
+
+    let world = world.lock().expect("world");
+    let drafts = world
+        .folders
+        .iter()
+        .find(|f| f.name == "Drafts")
+        .expect("drafts");
+    assert_eq!(drafts.uids(), vec![2], "the replaced copy is expunged");
+    assert_eq!(drafts.msgs[0].raw, second);
+    let mut flags = drafts.msgs[0].flags.clone();
+    flags.sort();
+    assert_eq!(flags, vec!["\\Draft", "\\Seen"], "a draft is a seen draft");
+}
+
+#[tokio::test]
+async fn delete_draft_expunges_the_provider_copy() {
+    let world = Arc::new(Mutex::new(world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("Drafts")
+        .push(b"Subject: gone\r\n\r\nx\r\n", &["\\Draft"]);
+    let (imap_port, smtp_port) = serve(world.clone()).await.ports();
+    let mut imap = Imap::new(config(imap_port, smtp_port));
+
+    imap.apply(&Op::DeleteDraft {
+        remote_id: "Drafts/3/1".into(),
+    })
+    .await
+    .expect("delete");
+
+    let world = world.lock().expect("world");
+    assert!(
+        world
+            .folders
+            .iter()
+            .find(|f| f.name == "Drafts")
+            .expect("drafts")
+            .uids()
+            .is_empty()
+    );
+}

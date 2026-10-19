@@ -84,4 +84,14 @@ pub enum Op {
     Send {
         mime: Vec<u8>,
     },
+    /// Creates or replaces the provider's copy of a saved draft. `replaces` is the previous remote
+    /// id of the same draft; `apply` returns the new one so the store can delete it later.
+    SaveDraft {
+        mime: Vec<u8>,
+        replaces: Option<String>,
+    },
+    /// Removes a saved draft's provider copy (discarded, or already sent).
+    DeleteDraft {
+        remote_id: String,
+    },
 }

@@ -121,6 +121,10 @@ pub enum Action {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Draft {
+    /// The saved draft this edits (from [`crate::api::Mail::save_draft`]). Sending or discarding it
+    /// removes the saved copy locally and on the provider.
+    #[serde(default)]
+    pub id: Option<Id>,
     pub account_id: Id,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
@@ -183,6 +187,14 @@ pub struct Settings {
     pub ai_enabled: bool,
     pub ai_base_url: String,
     pub ai_model: String,
+    /// Microsoft app registration (client) ID. Empty = the ID compiled into this build.
+    pub ms_client_id: String,
+    /// `"keyboard"`: single-key shortcuts (Superhuman style). `"classic"`: click-first, where only
+    /// modifier shortcuts (Ctrl/Cmd+…) stay bound and actions are shown as buttons.
+    pub input_mode: String,
+    /// User shortcut overrides: command slug -> keystrokes (GPUI syntax). Absent = default keys;
+    /// an empty list unbinds the command.
+    pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Default for Settings {
@@ -198,6 +210,9 @@ impl Default for Settings {
             ai_enabled: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
             ai_model: "deepseek-v4.1-flash".into(),
+            ms_client_id: String::new(),
+            input_mode: "keyboard".into(),
+            shortcuts: Default::default(),
         }
     }
 }

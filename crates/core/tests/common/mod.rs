@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 
 use kite_core::sync::imap::ImapConfig;
 use kite_core::sync::{Delta, RemoteMsg};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 // ---- world model ----
@@ -90,6 +90,8 @@ pub struct World {
     pub folders: Vec<Folder>,
     pub subscribed: Vec<String>,
     pub sent: Vec<Sent>,
+    /// Bridge files SMTP-delivered mail into Sent itself. Off by default so a test opts in.
+    pub files_sent_into_sent: bool,
 }
 
 impl World {
@@ -118,6 +120,7 @@ pub fn world() -> World {
         ],
         subscribed: Vec::new(),
         sent: Vec::new(),
+        files_sent_into_sent: false,
     }
 }
 
@@ -209,11 +212,68 @@ async fn imap_conn(stream: TcpStream, world: Arc<Mutex<World>>, alive: Arc<Atomi
         let Some((tag, rest)) = line.split_once(' ') else {
             return;
         };
+        // APPEND carries a literal: answer the continuation, read exactly that many bytes, then
+        // accept the message the way a UIDPLUS server does (Bridge included).
+        if let Some((mailbox, flags, size)) = append_head(rest) {
+            if io.get_mut().write_all(b"+ send it\r\n").await.is_err() {
+                return;
+            }
+            let mut raw = vec![0u8; size];
+            if io.read_exact(&mut raw).await.is_err() {
+                return;
+            }
+            let mut crlf = [0u8; 2];
+            if io.read_exact(&mut crlf).await.is_err() {
+                return;
+            }
+            let body = handle_append(
+                &mut world.lock().expect("world"),
+                tag,
+                &mailbox,
+                &flags,
+                raw,
+            );
+            if io.get_mut().write_all(&body).await.is_err() {
+                return;
+            }
+            continue;
+        }
         let reply = handle(&mut world.lock().expect("world"), tag, rest, &mut selected);
         if io.get_mut().write_all(&reply).await.is_err() {
             return;
         }
     }
+}
+
+/// `APPEND "Drafts" (\Draft \Seen) {123}` -> `(mailbox, flags, literal size)`.
+fn append_head(rest: &str) -> Option<(String, Vec<String>, usize)> {
+    let rest = rest.strip_prefix("APPEND ")?;
+    let (mailbox, tail) = unquote(rest);
+    let open = tail.find('{')?;
+    let size = tail[open + 1..].trim_end_matches('}').trim().parse().ok()?;
+    let flags = tail[..open]
+        .trim()
+        .trim_matches(['(', ')'])
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    Some((mailbox, flags, size))
+}
+
+fn handle_append(
+    world: &mut World,
+    tag: &str,
+    mailbox: &str,
+    flags: &[String],
+    raw: Vec<u8>,
+) -> Vec<u8> {
+    let Some(folder) = world.folders.iter_mut().find(|f| f.name == mailbox) else {
+        return format!("{tag} NO no such mailbox\r\n").into_bytes();
+    };
+    let flags: Vec<&str> = flags.iter().map(String::as_str).collect();
+    let uid = folder.push(&raw, &flags);
+    let validity = folder.uidvalidity;
+    format!("{tag} OK [APPENDUID {validity} {uid}] APPEND completed\r\n").into_bytes()
 }
 
 fn reply(tag: &str, text: &str) -> Vec<u8> {
@@ -271,6 +331,7 @@ fn handle(world: &mut World, tag: &str, rest: &str, selected: &mut String) -> Ve
                 "FETCH" => uid_fetch(world, tag, args, selected),
                 "STORE" => uid_store(world, tag, args, selected),
                 "MOVE" => uid_move(world, tag, args, selected),
+                "EXPUNGE" => uid_expunge(world, tag, args, selected),
                 _ => reply(tag, "UID"),
             }
         }
@@ -424,6 +485,37 @@ fn uid_move(world: &mut World, tag: &str, args: &str, selected: &str) -> Vec<u8>
     out
 }
 
+fn uid_expunge(world: &mut World, tag: &str, args: &str, selected: &str) -> Vec<u8> {
+    let Some(folder) = world.folders.iter_mut().find(|f| f.name == selected) else {
+        return reply(tag, "done");
+    };
+    let all = folder.uids();
+    for uid in parse_set(args.trim(), &all) {
+        let deleted = folder
+            .msgs
+            .iter()
+            .any(|m| m.uid == uid && m.flags.iter().any(|f| f == "\\Deleted"));
+        if deleted {
+            folder.expunge(uid);
+        }
+    }
+    reply(tag, "EXPUNGE completed")
+}
+
+fn file_sent(world: &Mutex<World>, rcpts: Vec<String>, raw: &[u8]) {
+    let mut world = world.lock().expect("world");
+    world.sent.push(Sent {
+        rcpts,
+        raw: raw.to_vec(),
+    });
+    if !world.files_sent_into_sent {
+        return;
+    }
+    if let Some(folder) = world.folders.iter_mut().find(|f| f.name == "Sent") {
+        folder.push(raw, &["\\Seen"]);
+    }
+}
+
 async fn smtp_conn(stream: TcpStream, world: Arc<Mutex<World>>, alive: Arc<AtomicBool>) {
     let mut io = BufReader::new(stream);
     if io.get_mut().write_all(b"220 fake smtp\r\n").await.is_err() {
@@ -444,7 +536,7 @@ async fn smtp_conn(stream: TcpStream, world: Arc<Mutex<World>>, alive: Arc<Atomi
             if line == ".\r\n" {
                 let raw = data.take().expect("data");
                 let rcpts = std::mem::take(&mut rcpts);
-                world.lock().expect("world").sent.push(Sent { rcpts, raw });
+                file_sent(&world, rcpts, &raw);
                 if io.get_mut().write_all(b"250 queued\r\n").await.is_err() {
                     return;
                 }

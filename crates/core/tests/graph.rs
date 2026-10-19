@@ -853,3 +853,90 @@ async fn calendar_today_parses_all_day_events() {
         q["endDateTime"]
     );
 }
+
+// ------------------------------------------------------------------- drafts
+
+#[tokio::test]
+async fn save_draft_creates_the_message_and_deletes_the_replaced_copy() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/messages") => Reply::json(
+            201,
+            json!({ "id": "d2", "@odata.type": "#microsoft.graph.message" }),
+        ),
+        ("DELETE", "/me/messages/d1") => Reply::empty(204),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mime =
+        b"From: karl@example.com\r\nTo: bob@example.com\r\nSubject: draft\r\n\r\nhalf written\r\n";
+    let mut g = graph(&fake);
+    let created = g
+        .apply(&Op::SaveDraft {
+            mime: mime.to_vec(),
+            replaces: Some("d1".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(created.as_deref(), Some("d2"));
+
+    let post = &fake.path("/me/messages")[0];
+    assert_eq!(post.method, "POST");
+    assert!(
+        post.header("content-type")
+            .expect("content type")
+            .starts_with("text/plain")
+    );
+    assert_eq!(STANDARD.decode(post.body_str()).unwrap(), mime);
+    assert_eq!(post.header("authorization"), Some("Bearer token"));
+
+    let delete = fake
+        .calls()
+        .into_iter()
+        .find(|c| c.method == "DELETE")
+        .expect("the replaced draft is deleted");
+    assert_eq!(delete.path, "/me/messages/d1");
+}
+
+#[tokio::test]
+async fn delete_draft_removes_the_provider_message() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("DELETE", "/me/messages/d9") => Reply::empty(204),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    assert_eq!(
+        g.apply(&Op::DeleteDraft {
+            remote_id: "d9".into()
+        })
+        .await
+        .unwrap(),
+        None
+    );
+    assert_eq!(fake.path("/me/messages/d9")[0].method, "DELETE");
+}
+
+#[tokio::test]
+async fn a_rejected_draft_create_is_an_error() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/messages") => Reply::json(
+            400,
+            json!({ "error": { "code": "ErrorInvalidRecipients" } }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    assert!(
+        g.apply(&Op::SaveDraft {
+            mime: b"Subject: x\r\n\r\nbody".to_vec(),
+            replaces: None,
+        })
+        .await
+        .is_err(),
+        "a failed create must not look like success"
+    );
+}

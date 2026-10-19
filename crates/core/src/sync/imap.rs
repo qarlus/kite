@@ -92,9 +92,16 @@ impl Imap {
     }
 
     pub async fn apply(&mut self, op: &Op) -> Result<Option<String>> {
-        // Never replay a send: a duplicate delivery is worse than a failed one.
-        if matches!(op, Op::Send { .. }) {
-            return self.apply_once(op).await;
+        // Never replay a send or an append in the same call: a duplicate delivery or draft copy is
+        // worse than a failed one. Dropping the session makes the retry dial again.
+        if matches!(op, Op::Send { .. } | Op::SaveDraft { .. }) {
+            return match self.apply_once(op).await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    self.session = None;
+                    Err(error)
+                }
+            };
         }
         match self.apply_once(op).await {
             Ok(v) => Ok(v),
@@ -368,7 +375,101 @@ impl Imap {
                 self.send(mime).await?;
                 Ok(None)
             }
+            Op::SaveDraft { mime, replaces } => {
+                let folder = self.folder_for(Mailbox::Drafts).await?;
+                let appended = self.append_draft(&folder, mime).await?;
+                if let Some(old) = replaces {
+                    self.delete_message(old).await?;
+                }
+                Ok(appended)
+            }
+            Op::DeleteDraft { remote_id } => {
+                self.delete_message(remote_id).await?;
+                Ok(None)
+            }
         }
+    }
+
+    /// `APPEND` with the `\Draft` and `\Seen` flags, returning the new remote id from `APPENDUID`.
+    /// Bridge and other UIDPLUS servers report it; without it the copy is still saved.
+    async fn append_draft(&mut self, folder: &str, mime: &[u8]) -> Result<Option<String>> {
+        let session = self.session().await?;
+        let command = format!(
+            "APPEND {} (\\Draft \\Seen) {{{}}}",
+            quote(folder),
+            mime.len()
+        );
+        let tag = timed(session.run_command(command.as_str()))
+            .await
+            .context("append draft")?;
+        let continued = match timed(session.read_response())
+            .await
+            .context("append draft")?
+        {
+            Some(response) => matches!(response.parsed(), Response::Continue { .. }),
+            None => false,
+        };
+        if !continued {
+            bail!("imap append was refused");
+        }
+        let conn = session.get_mut();
+        timed(conn.write_all(mime)).await.context("append draft")?;
+        timed(conn.write_all(b"\r\n"))
+            .await
+            .context("append draft")?;
+        timed(conn.flush()).await.context("append draft")?;
+        let mut appended = None;
+        loop {
+            let response = timed(session.read_response())
+                .await
+                .context("append draft")?;
+            let Some(response) = response else {
+                bail!("imap connection closed during append")
+            };
+            match response.parsed() {
+                Response::Data {
+                    status: Status::Ok,
+                    outcome,
+                } => {
+                    if let Some(ResponseCode::AppendUid(validity, set)) = &outcome.code {
+                        appended = Some(remote_id(folder, *validity, first_uid(set)));
+                    }
+                }
+                Response::Done {
+                    tag: done,
+                    status,
+                    outcome,
+                    ..
+                } if done == &tag => {
+                    if *status != Status::Ok {
+                        bail!("imap append failed: {status:?}");
+                    }
+                    if let Some(ResponseCode::AppendUid(validity, set)) = &outcome.code {
+                        appended = Some(remote_id(folder, *validity, first_uid(set)));
+                    }
+                    return Ok(appended);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Delete plus expunge, for a draft's provider copy that was replaced, discarded or sent.
+    async fn delete_message(&mut self, remote_id: &str) -> Result<()> {
+        let (folder, _, uid) = split_remote_id(remote_id)?;
+        let session = self.session().await?;
+        timed(session.select(folder))
+            .await
+            .with_context(|| format!("select {folder}"))?;
+        timed(
+            session.run_command_and_check_ok(format!("UID STORE {uid} +FLAGS.SILENT (\\Deleted)")),
+        )
+        .await
+        .context("uid store")?;
+        timed(session.run_command_and_check_ok(format!("UID EXPUNGE {uid}")))
+            .await
+            .context("uid expunge")?;
+        Ok(())
     }
 
     async fn move_to(&mut self, message: &str, folder: &str) -> Result<Option<String>> {

@@ -156,7 +156,40 @@ impl Graph {
                 check(res, "sendMail").await?;
                 Ok(None)
             }
+            // Posting MIME to /me/messages creates the message as a draft in Drafts.
+            Op::SaveDraft { mime, replaces } => {
+                let url = format!("{}/me/messages", self.base_url);
+                let body = base64::engine::general_purpose::STANDARD.encode(mime);
+                let res = self
+                    .auth_send(|http, token| {
+                        http.post(&url)
+                            .bearer_auth(token)
+                            .header("Content-Type", "text/plain")
+                            .body(body.clone())
+                    })
+                    .await?;
+                let created = json_res(res, "create draft").await?;
+                let id = created["id"].as_str().map(str::to_owned);
+                if let Some(old) = replaces
+                    && old != id.as_deref().unwrap_or_default()
+                {
+                    self.delete_message(old).await?;
+                }
+                Ok(id)
+            }
+            Op::DeleteDraft { remote_id } => {
+                self.delete_message(remote_id).await?;
+                Ok(None)
+            }
         }
+    }
+
+    async fn delete_message(&mut self, remote_id: &str) -> Result<()> {
+        let url = format!("{}/me/messages/{remote_id}", self.base_url);
+        let res = self
+            .auth_send(|http, token| http.delete(&url).bearer_auth(token))
+            .await?;
+        check(res, "delete draft").await
     }
 
     pub async fn attachment(

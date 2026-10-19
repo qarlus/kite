@@ -119,7 +119,6 @@ pub(crate) struct Inner {
     wake: Sender<()>,
     secrets: Secrets,
     opts: Options,
-    dir: PathBuf,
 }
 
 impl Inner {
@@ -163,7 +162,6 @@ impl Engine {
             wake,
             secrets,
             opts,
-            dir: dir.to_path_buf(),
         });
         let _ = std::thread::Builder::new()
             .name("kite-engine".into())
@@ -359,15 +357,17 @@ async fn send_due(
     changed: &mut Vec<Id>,
 ) -> Result<()> {
     let due = inner.write(|s| s.outbox_due(auth::now_ms()))?;
+    let mut queued = false;
     for (outbox_id, draft) in due {
         let Some(account) = accounts.iter().find(|a| a.id == draft.account_id) else {
             inner.write(|s| s.outbox_sent(outbox_id))?;
             continue;
         };
-        let mime = match build_mime(inner, account, &draft) {
+        let mime = match build_mime(inner, account, &draft, &message_id(&account.email)) {
             Ok(mime) => mime,
             Err(e) => {
                 inner.emit(Event::Error(format!("could not build message: {e:#}")));
+                inner.write(|s| s.outbox_failed(outbox_id, auth::now_ms()))?;
                 continue;
             }
         };
@@ -379,6 +379,16 @@ async fn send_due(
             Ok(_) => {
                 persist_tokens(inner, account.id, backend)?;
                 inner.write(|s| s.outbox_sent(outbox_id))?;
+                // The provider copy of a saved draft is stale now that it has been sent; delete it
+                // on the next pass rather than leaving a duplicate in Drafts.
+                if let Some(id) = draft.id
+                    && let Some((account_id, remote)) = inner.write(|s| s.draft_sent(id))?
+                {
+                    inner.write(|s| {
+                        s.draft_op(account_id, &Op::DeleteDraft { remote_id: remote }, None)
+                    })?;
+                    queued = true;
+                }
                 changed.push(account.id);
                 if let (Some(at), Some(reply)) = (draft.remind_at, draft.reply_to)
                     && let Some(thread) = inner.read(|s| s.message_thread(reply))?
@@ -386,8 +396,16 @@ async fn send_due(
                     inner.write(|s| s.remind_if_no_reply(thread, at))?;
                 }
             }
-            Err(e) => inner.emit(Event::Error(format!("send failed: {e:#}"))),
+            Err(e) => {
+                inner.emit(Event::Error(format!("send failed: {e:#}")));
+                // Keep it queued: a transient failure must not lose the mail.
+                inner.write(|s| s.outbox_failed(outbox_id, auth::now_ms()))?;
+            }
         }
+    }
+    if queued {
+        // Drain the delete op in the next tick instead of waiting out the poll interval.
+        let _ = inner.wake.try_send(());
     }
     Ok(())
 }
@@ -507,31 +525,25 @@ fn graph(inner: &Inner, client_id: &str, tokens: Tokens) -> Graph {
     Graph::new(&base, &authority, client_id, tokens)
 }
 
+/// The Microsoft app registration Kite signs in as. It identifies the app, not the mailbox, so
+/// one registration serves every user: Settings overrides the build's, then the environment.
 fn ms_client_id(inner: &Inner) -> Result<String> {
-    if let Some(id) = std::env::var("KITE_MS_CLIENT_ID")
-        .ok()
-        .filter(|id| !id.trim().is_empty())
-    {
-        return Ok(id);
-    }
-    let path = inner.dir.join("config.json");
-    let text = std::fs::read_to_string(&path).with_context(|| {
-        format!(
-            "set KITE_MS_CLIENT_ID or add ms_client_id to {}",
-            path.display()
-        )
-    })?;
-    serde_json::from_str::<serde_json::Value>(&text)?
-        .get("ms_client_id")
-        .and_then(|v| v.as_str())
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .context("config.json has no ms_client_id")
+    let configured = inner.read(Store::settings)?.ms_client_id;
+    [
+        Some(configured),
+        std::env::var("KITE_MS_CLIENT_ID").ok(),
+        option_env!("KITE_MS_CLIENT_ID").map(str::to_string),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|id| id.trim().to_string())
+    .find(|id| !id.is_empty())
+    .context("Outlook needs a Microsoft app (client) ID: add one in Settings › Connections")
 }
 
 // ----------------------------------------------------------------------- MIME
 
-fn build_mime(inner: &Inner, account: &Account, draft: &Draft) -> Result<Vec<u8>> {
+fn build_mime(inner: &Inner, account: &Account, draft: &Draft, msg_id: &str) -> Result<Vec<u8>> {
     use mail_builder::MessageBuilder;
     let reply = match draft.reply_to {
         Some(id) => inner.read(|s| s.reply_context(id))?,
@@ -544,7 +556,7 @@ fn build_mime(inner: &Inner, account: &Account, draft: &Draft) -> Result<Vec<u8>
     let mut builder = MessageBuilder::new()
         .from((account.name.as_str(), account.email.as_str()))
         .subject(subject.as_str())
-        .message_id(message_id(&account.email))
+        .message_id(msg_id)
         .date(auth::now_ms() / 1000)
         .text_body(draft.body.as_str());
     if !draft.to.is_empty() {
@@ -722,17 +734,81 @@ impl Mail for Engine {
     }
 
     fn send(&self, draft: Draft) -> Result<Id> {
+        anyhow::ensure!(
+            draft
+                .to
+                .iter()
+                .chain(&draft.cc)
+                .chain(&draft.bcc)
+                .any(|a| !a.email.trim().is_empty()),
+            "Add a recipient before sending."
+        );
         let seconds = self.inner.read(Store::settings)?.undo_send_secs;
         let due = draft
             .send_at
             .unwrap_or_else(|| auth::now_ms() + i64::from(seconds) * 1000);
+        let saved = draft.id;
+        let account = draft.account_id;
         let id = self.inner.write(|s| s.outbox_add(&draft, due))?;
         self.wake();
+        if saved.is_some() {
+            // It left the Drafts mailbox; tell the list right away.
+            self.inner.emit(Event::Changed(vec![account]));
+        }
         Ok(id)
     }
 
     fn cancel_send(&self, id: Id) -> Result<Option<Draft>> {
-        self.inner.write(|s| s.outbox_cancel(id))
+        let draft = self.inner.write(|s| s.outbox_cancel(id))?;
+        if let Some(draft) = &draft
+            && draft.id.is_some()
+        {
+            // The cancelled draft is back in the Drafts mailbox.
+            self.inner.emit(Event::Changed(vec![draft.account_id]));
+        }
+        Ok(draft)
+    }
+
+    fn save_draft(&self, draft: Draft) -> Result<Id> {
+        let account = self
+            .inner
+            .read(Store::accounts)?
+            .into_iter()
+            .find(|a| a.id == draft.account_id)
+            .context("account was removed")?;
+        // A draft keeps its Message-ID across edits so the provider's own copy never becomes a
+        // second conversation.
+        let msg_id = match draft.id {
+            Some(id) => self
+                .inner
+                .read(|s| s.draft_msg_id(id))?
+                .unwrap_or_else(|| message_id(&account.email)),
+            None => message_id(&account.email),
+        };
+        let mime = build_mime(&self.inner, &account, &draft, &msg_id)?;
+        let (id, replaces) = self.inner.write(|s| s.save_draft(&draft, &msg_id))?;
+        self.inner
+            .write(|s| s.draft_op(account.id, &Op::SaveDraft { mime, replaces }, Some(id)))?;
+        self.wake();
+        self.inner.emit(Event::Changed(vec![account.id]));
+        Ok(id)
+    }
+
+    fn draft(&self, thread: Id) -> Result<Option<Draft>> {
+        // Adopting a draft written in another client writes, so this takes the writer.
+        self.inner.write(|s| s.draft(thread))
+    }
+
+    fn discard_draft(&self, id: Id) -> Result<()> {
+        let remote = self.inner.write(|s| s.discard_draft(id))?;
+        let Some((account, remote_id)) = remote else {
+            return Ok(());
+        };
+        self.inner
+            .write(|s| s.draft_op(account, &Op::DeleteDraft { remote_id }, None))?;
+        self.wake();
+        self.inner.emit(Event::Changed(vec![account]));
+        Ok(())
     }
 
     fn contacts(&self, query: &str) -> Result<Vec<Addr>> {

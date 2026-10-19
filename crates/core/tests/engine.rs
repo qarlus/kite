@@ -489,3 +489,510 @@ fn a_backend_error_is_reported_and_the_loop_recovers() {
     }
     assert_eq!(engine.accounts().expect("accounts").len(), 1);
 }
+
+// -------------------------------------------------------------------- drafts
+
+fn drafts(account_id: Id) -> View {
+    View {
+        account_id: Some(account_id),
+        mailbox: Mailbox::Drafts,
+        split: None,
+        query: None,
+        folder: None,
+    }
+}
+
+fn sent(account_id: Id) -> View {
+    View {
+        account_id: Some(account_id),
+        mailbox: Mailbox::Sent,
+        split: None,
+        query: None,
+        folder: None,
+    }
+}
+
+/// Polls the fake server's world: ops reach it asynchronously, with no event of their own.
+fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+fn draft_folder(world: &common::World) -> Vec<u8> {
+    world
+        .folders
+        .iter()
+        .find(|f| f.name == "Drafts")
+        .and_then(|f| f.msgs.first())
+        .map(|m| m.raw.clone())
+        .unwrap_or_default()
+}
+
+fn now_ms() -> Ms {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis() as Ms
+}
+
+#[test]
+fn a_saved_draft_shows_at_once_and_is_appended_with_reply_headers() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Seen"]);
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let events = Events::new(engine.events());
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+
+    let inbox_thread = engine
+        .threads(&inbox(account.id), 0, 10)
+        .expect("threads")
+        .remove(0);
+    let message = engine.thread(inbox_thread.id).expect("thread").remove(0);
+
+    let id = engine
+        .save_draft(Draft {
+            id: None,
+            account_id: account.id,
+            to: vec![addr("Ada", "ada@example.org")],
+            subject: "Re: Quarterly numbers".into(),
+            body: "looks good".into(),
+            reply_to: Some(message.id),
+            ..Default::default()
+        })
+        .expect("save draft");
+
+    // Local first: the Drafts mailbox shows it before any network round trip.
+    let rows = engine.threads(&drafts(account.id), 0, 10).expect("threads");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].subject, "Re: Quarterly numbers");
+    assert_eq!(rows[0].participants, "Ada");
+    let saved = engine.draft(rows[0].id).expect("draft").expect("saved");
+    assert_eq!(saved.id, Some(id));
+    assert_eq!(saved.body, "looks good");
+    assert_eq!(saved.reply_to, Some(message.id));
+
+    wait_for("the draft to reach the server", || {
+        let world = world.lock().expect("world");
+        !draft_folder(&world).is_empty()
+    });
+    let raw = String::from_utf8_lossy(&draft_folder(&world.lock().expect("world"))).to_string();
+    assert!(raw.contains("In-Reply-To: <abc@example.org>"), "{raw}");
+    assert!(
+        raw.contains("References: <root@example.org> <parent@example.org> <abc@example.org>"),
+        "{raw}"
+    );
+    assert!(raw.contains("Subject: Re: Quarterly numbers"), "{raw}");
+    assert!(raw.contains("looks good"), "{raw}");
+
+    // Saving again replaces the provider copy: one draft on the server, one row here.
+    engine
+        .save_draft(Draft {
+            id: Some(id),
+            body: "looks great".into(),
+            ..saved
+        })
+        .expect("resave");
+    wait_for("the replaced copy to be expunged", || {
+        let world = world.lock().expect("world");
+        let drafts = world
+            .folders
+            .iter()
+            .find(|f| f.name == "Drafts")
+            .expect("drafts");
+        drafts.msgs.len() == 1
+            && String::from_utf8_lossy(&drafts.msgs[0].raw).contains("looks great")
+    });
+    assert_eq!(
+        engine
+            .threads(&drafts(account.id), 0, 10)
+            .expect("threads")
+            .len(),
+        1,
+        "saving again never adds a row"
+    );
+
+    // The copy the server hands back must not become a second draft thread.
+    engine.sync_now();
+    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+    let rows = engine.threads(&drafts(account.id), 0, 10).expect("threads");
+    assert_eq!(rows.len(), 1, "the synced copy dedupes: {rows:?}");
+    assert_eq!(
+        engine.draft(rows[0].id).expect("draft").expect("saved").id,
+        Some(id)
+    );
+}
+
+#[test]
+fn discarding_a_draft_removes_it_locally_and_on_the_server() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    let id = engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Scratch".into(),
+            body: "never mind".into(),
+            ..Default::default()
+        })
+        .expect("save");
+    wait_for("the draft to reach the server", || {
+        let world = world.lock().expect("world");
+        !draft_folder(&world).is_empty()
+    });
+    let thread = engine.threads(&drafts(account.id), 0, 10).expect("threads")[0].id;
+
+    engine.discard_draft(id).expect("discard");
+    assert!(
+        engine
+            .threads(&drafts(account.id), 0, 10)
+            .expect("threads")
+            .is_empty(),
+        "gone from the Drafts mailbox at once"
+    );
+    assert!(engine.draft(thread).expect("draft").is_none());
+    wait_for("the provider copy to be deleted", || {
+        let world = world.lock().expect("world");
+        world
+            .folders
+            .iter()
+            .find(|f| f.name == "Drafts")
+            .is_some_and(|f| f.msgs.is_empty())
+    });
+}
+
+#[test]
+fn sending_a_saved_draft_removes_it_and_the_copy_lands_in_sent() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world.lock().expect("world").files_sent_into_sent = true;
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let account = engine.add_proton(login(server.ports())).expect("add");
+
+    engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Sent from a draft".into(),
+            body: "at last".into(),
+            ..Default::default()
+        })
+        .expect("save");
+    wait_for("the draft to reach the server", || {
+        let world = world.lock().expect("world");
+        !draft_folder(&world).is_empty()
+    });
+    let saved = engine
+        .draft(engine.threads(&drafts(account.id), 0, 10).expect("threads")[0].id)
+        .expect("draft")
+        .expect("saved");
+    engine.send(saved).expect("send");
+
+    assert!(
+        engine
+            .threads(&drafts(account.id), 0, 10)
+            .expect("threads")
+            .is_empty(),
+        "sending removes the draft at once"
+    );
+    wait_for("the message to leave SMTP", || {
+        world.lock().expect("world").sent.len() == 1
+    });
+    wait_for("the provider's draft copy to be deleted", || {
+        let world = world.lock().expect("world");
+        world
+            .folders
+            .iter()
+            .find(|f| f.name == "Drafts")
+            .is_some_and(|f| f.msgs.is_empty())
+    });
+
+    // Bridge files the sent copy itself, so it appears in Sent after the next sync.
+    wait_for("the sent copy to sync into Sent", || {
+        !engine
+            .threads(&sent(account.id), 0, 10)
+            .expect("threads")
+            .is_empty()
+    });
+    let rows = engine.threads(&sent(account.id), 0, 10).expect("threads");
+    assert_eq!(
+        rows.len(),
+        1,
+        "one conversation, no local duplicate: {rows:?}"
+    );
+    assert_eq!(rows[0].subject, "Sent from a draft");
+}
+
+#[test]
+fn reply_all_carries_every_recipient_without_leaking_the_bcc_header() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Seen"]);
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let events = Events::new(engine.events());
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+
+    let thread = engine
+        .threads(&inbox(account.id), 0, 10)
+        .expect("threads")
+        .remove(0);
+    let message = engine.thread(thread.id).expect("thread").remove(0);
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Ada", "ada@example.org")],
+            cc: vec![
+                addr("Bob", "bob@example.org"),
+                addr("Carol", "carol@example.org"),
+            ],
+            bcc: vec![addr("Hidden", "hidden@example.org")],
+            body: "reply all body".into(),
+            reply_to: Some(message.id),
+            ..Default::default()
+        })
+        .expect("send");
+
+    wait_for("the reply to reach SMTP", || {
+        world.lock().expect("world").sent.len() == 1
+    });
+    let world = world.lock().expect("world");
+    let sent = &world.sent[0];
+    let mut rcpts = sent.rcpts.clone();
+    rcpts.sort();
+    assert_eq!(
+        rcpts,
+        vec![
+            "ada@example.org",
+            "bob@example.org",
+            "carol@example.org",
+            "hidden@example.org"
+        ],
+        "the envelope carries To, Cc and Bcc"
+    );
+    let raw = String::from_utf8_lossy(&sent.raw).to_string();
+    let header = |name: &str| -> String {
+        raw.lines()
+            .find(|line| line.starts_with(name))
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(header("To: ").contains("ada@example.org"), "{raw}");
+    let cc = header("Cc: ");
+    assert!(
+        cc.contains("bob@example.org") && cc.contains("carol@example.org"),
+        "{raw}"
+    );
+    assert!(
+        !raw.to_ascii_lowercase().contains("bcc:"),
+        "a Bcc header would expose the hidden recipient: {raw}"
+    );
+    assert!(raw.contains("Subject: Re: Quarterly numbers"), "{raw}");
+    assert!(raw.contains("In-Reply-To: <abc@example.org>"), "{raw}");
+}
+
+#[test]
+fn a_scheduled_send_waits_for_its_time_and_cancels_cleanly() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    let hour = 3_600_000;
+
+    let later = engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Later".into(),
+            body: "later".into(),
+            send_at: Some(now_ms() + hour),
+            ..Default::default()
+        })
+        .expect("schedule");
+    // A due send proves the outbox ran while the scheduled one stayed put.
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Now".into(),
+            body: "now".into(),
+            send_at: Some(now_ms() - hour),
+            ..Default::default()
+        })
+        .expect("send");
+    wait_for("the due message to leave", || {
+        world.lock().expect("world").sent.len() == 1
+    });
+    assert_eq!(
+        world.lock().expect("world").sent.len(),
+        1,
+        "the scheduled message is still waiting"
+    );
+
+    let returned = engine.cancel_send(later).expect("cancel").expect("draft");
+    assert_eq!(returned.subject, "Later");
+    assert!(returned.send_at.is_some_and(|at| at > now_ms()));
+}
+
+#[test]
+fn a_failed_send_is_reported_and_the_mail_is_kept() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let events = Events::new(engine.events());
+    let account = engine.add_proton(login(server.ports())).expect("add");
+
+    server.stop();
+    let outbox = engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Must not vanish".into(),
+            body: "important".into(),
+            ..Default::default()
+        })
+        .expect("send");
+    events.wait(|e| matches!(e, Event::Error(text) if text.contains("send failed")));
+
+    let kept = engine
+        .cancel_send(outbox)
+        .expect("cancel")
+        .expect("the failed draft is still here");
+    assert_eq!(kept.subject, "Must not vanish");
+
+    // Retrying once the server is back delivers it.
+    server.start();
+    engine
+        .send(Draft {
+            subject: "Must arrive".into(),
+            ..kept
+        })
+        .expect("resend");
+    wait_for("the retried message to leave", || {
+        world.lock().expect("world").sent.len() == 1
+    });
+    let raw = String::from_utf8_lossy(&world.lock().expect("world").sent[0].raw).to_string();
+    assert!(raw.contains("Subject: Must arrive"), "{raw}");
+}
+
+#[test]
+fn a_send_without_recipients_is_rejected() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = engine.add_proton(login(server.ports())).expect("add");
+
+    assert!(
+        engine
+            .send(Draft {
+                account_id: account.id,
+                subject: "No one".into(),
+                ..Default::default()
+            })
+            .is_err(),
+        "an empty envelope must not reach the outbox"
+    );
+}
+
+#[test]
+fn a_forward_starts_a_new_conversation() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Seen"]);
+    let server = rt.block_on(serve(world.clone()));
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let account = engine.add_proton(login(server.ports())).expect("add");
+
+    // A forward carries the quoted original in the body but no threading headers, so it is not a
+    // reply to the original.
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Dana", "dana@example.org")],
+            subject: "Fwd: Quarterly numbers".into(),
+            body: "fyi\n\n> plain body".into(),
+            ..Default::default()
+        })
+        .expect("forward");
+
+    wait_for("the forward to reach SMTP", || {
+        world.lock().expect("world").sent.len() == 1
+    });
+    let raw = String::from_utf8_lossy(&world.lock().expect("world").sent[0].raw).to_string();
+    assert!(raw.contains("Subject: Fwd: Quarterly numbers"), "{raw}");
+    assert!(!raw.contains("In-Reply-To:"), "{raw}");
+    assert!(!raw.contains("References:"), "{raw}");
+}

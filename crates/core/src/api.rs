@@ -41,6 +41,19 @@ pub trait Mail: Send + Sync + 'static {
     /// Queues to the outbox (due after the undo window or at `send_at`). Returns the outbox id.
     fn send(&self, draft: Draft) -> Result<Id>;
     fn cancel_send(&self, id: Id) -> Result<Option<Draft>>;
+    /// Saves a draft locally at once (it shows in the Drafts mailbox) and queues the provider copy.
+    /// `draft.id: None` creates; `Some` replaces that draft. Returns the draft id.
+    fn save_draft(&self, _draft: Draft) -> Result<Id> {
+        anyhow::bail!("Drafts are not available")
+    }
+    /// The saved draft behind a Drafts-mailbox thread, so compose can reopen it.
+    fn draft(&self, _thread: Id) -> Result<Option<Draft>> {
+        Ok(None)
+    }
+    /// Deletes a saved draft locally and on the provider.
+    fn discard_draft(&self, _id: Id) -> Result<()> {
+        anyhow::bail!("Drafts are not available")
+    }
     fn contacts(&self, query: &str) -> Result<Vec<Addr>>;
     fn open_attachment(&self, id: Id) -> Result<()>;
 
