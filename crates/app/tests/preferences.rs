@@ -140,7 +140,7 @@ async fn importing_a_real_theme_file_applies_and_persists_its_palette(cx: &mut T
     let file = TempFile::new();
     std::fs::write(&file.0, kite::preferences::TEMPLATE).unwrap();
     let fixture = Fixture::showcase();
-    let (window, _) = mount(cx, fixture.clone());
+    let (window, kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -168,6 +168,13 @@ async fn importing_a_real_theme_file_applies_and_persists_its_palette(cx: &mut T
         );
     })
     .unwrap();
+    common::update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(
+            kite.colours().1,
+            "#101820",
+            "the imported palette is the page the app paints"
+        );
+    });
     let settings = fixture.settings.lock().unwrap();
     assert_eq!(settings.theme, "custom");
     assert_eq!(

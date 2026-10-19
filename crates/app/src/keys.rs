@@ -42,6 +42,8 @@ pub mod cmd {
     pub const SHOW_CC: u8 = 56;
     pub const SEND_LATER: u8 = 57;
     pub const DISCARD: u8 = 58;
+    pub const AI_WRITE: u8 = 59;
+    pub const AI_SUMMARY: u8 = 60;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -495,6 +497,22 @@ pub static COMMANDS: &[Cmd] = &[
         Group::Compose,
         cmd::DISCARD,
     ),
+    c(
+        "ai_write",
+        "Write with AI",
+        &["secondary-j"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::AI_WRITE,
+    ),
+    c(
+        "ai_summary",
+        "Summarize thread",
+        &["shift-s"],
+        "KiteThread",
+        Group::Compose,
+        cmd::AI_SUMMARY,
+    ),
 ];
 
 /// The mailboxes reachable through the `g` sequences, in the same order as the table above.
@@ -509,6 +527,17 @@ pub const GO_MAILBOXES: [(Mailbox, &str); 9] = [
     (Mailbox::Spam, "Spam"),
     (Mailbox::Trash, "Trash"),
 ];
+
+/// Whether a command only exists while Settings › AI is on.
+pub fn needs_ai(id: u8) -> bool {
+    matches!(id, cmd::AI_WRITE | cmd::AI_SUMMARY)
+}
+
+/// Whether a command is offered at all. The AI helpers only exist once the reader turned AI on,
+/// so the palette and the cheat sheet never advertise a command that cannot run.
+pub fn available(settings: &Settings, command: &Cmd) -> bool {
+    settings.ai_enabled || !needs_ai(command.id)
+}
 
 /// The command carrying `id`.
 pub fn command(id: u8) -> Option<&'static Cmd> {

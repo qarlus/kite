@@ -205,40 +205,41 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
         );
 
     if let Some(id) = page.accounts.remove {
-        content = content.child(
-            div()
-                .p_4()
-                .rounded(px(RADIUS))
-                .bg(t.bg2)
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(
-                    div()
-                        .text_size(t.px(13.))
-                        .child("Remove this account from Kite? Mail on the server is kept."),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            button("confirm-remove-account", "Remove account", t)
-                                .text_color(t.danger)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.disconnect_account(id, cx)
-                                })),
-                        )
-                        .child(button("cancel-remove-account", "Cancel", t).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                if let Some(page) = &mut this.preferences {
-                                    page.accounts.remove = None;
-                                }
-                                cx.notify();
-                            }),
-                        )),
-                ),
-        );
+        content =
+            content.child(
+                div()
+                    .p_4()
+                    .rounded(px(RADIUS))
+                    .bg(t.bg2)
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(t.px(13.))
+                            .child("Remove this account from Kite? Mail on the server is kept."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                button("confirm-remove-account", "Remove account", t)
+                                    .text_color(t.danger)
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.disconnect_account(id, cx)
+                                    })),
+                            )
+                            .child(button("cancel-remove-account", "Cancel", t).on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    if let Some(page) = &mut this.preferences {
+                                        page.accounts.remove = None;
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
+            );
     }
 
     content.into_any_element()

@@ -48,14 +48,19 @@ pub const TEMPLATE: &str = "{\n  \"name\": \"My midnight\",\n  \"base\": \"dark\
 fn tabs() -> [(usize, &'static str, &'static str, IconName); 8] {
     [
         (0, "Appearance", "Colours and palette", IconName::Palette),
-        (1, "Typography", "Type, size and colour", IconName::ALargeSmall),
-        (2, "Accounts", "Mailboxes connected to Kite", IconName::CircleUser),
         (
-            3,
-            "Connections",
-            "Proton Bridge and Outlook",
-            IconName::Network,
+            1,
+            "Typography",
+            "Type, size and colour",
+            IconName::ALargeSmall,
         ),
+        (
+            2,
+            "Accounts",
+            "Mailboxes connected to Kite",
+            IconName::CircleUser,
+        ),
+        (3, "Connections", "Proton and Outlook", IconName::Network),
         (4, "General", "Everyday defaults", IconName::Settings2),
         (5, "Privacy", "Remote images and tracking", IconName::EyeOff),
         (6, "AI", "Writing and summaries", IconName::Bot),
@@ -284,21 +289,18 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 .font_weight(FontWeight(650.))
                                 .child(title),
                         )
-                        .child(
-                            div()
-                                .text_size(t.px(12.))
-                                .text_color(t.fg2)
-                                .child(subtitle),
-                        ),
+                        .child(div().text_size(t.px(12.)).text_color(t.fg2).child(subtitle)),
                 )
-                .child(button("close-settings", "Back to mail", t).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.preferences = None;
-                        this.sidebar_dirty = true;
-                        window.focus(&this.focus, cx);
-                        cx.notify();
-                    },
-                ))),
+                .child(
+                    button("close-settings", "Back to mail", t).on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.preferences = None;
+                            this.sidebar_dirty = true;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        },
+                    )),
+                ),
         )
         .child(
             div()

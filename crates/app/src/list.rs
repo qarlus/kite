@@ -135,55 +135,60 @@ impl Kite {
         let (title, note) = if self.view.query.is_some() {
             (
                 "No results".to_string(),
-                "Try another name, subject, or search term.",
+                "Try another name, subject, or search term.".to_string(),
             )
         } else if let Some(folder) = folder {
+            let move_hint = keys::hint_for(&self.settings, keys::cmd::MOVE);
             (
                 format!("{} is empty", folder.name),
-                "Move mail here with the folder menu or press L.",
+                if move_hint.is_empty() {
+                    "Move mail here with the folder menu.".to_string()
+                } else {
+                    format!("Move mail here with the folder menu or press {move_hint}")
+                },
             )
         } else if self.accounts.is_empty() {
             (
                 "Welcome to Kite".to_string(),
-                "Connect Proton Bridge or Outlook to start syncing your mail.",
+                "Connect Proton Bridge or Outlook to start syncing your mail.".to_string(),
             )
         } else {
             match self.view.mailbox {
                 Mailbox::Inbox => (
                     "Inbox Zero".to_string(),
-                    "You're all caught up. Enjoy the quiet.",
+                    "You're all caught up. Enjoy the quiet.".to_string(),
                 ),
                 Mailbox::Starred => (
                     "No starred mail".to_string(),
-                    "Star a conversation to find it here.",
+                    "Star a conversation to find it here.".to_string(),
                 ),
                 Mailbox::Snoozed => (
                     "Nothing snoozed".to_string(),
-                    "Conversations you snooze will wait here.",
+                    "Conversations you snooze will wait here.".to_string(),
                 ),
                 Mailbox::Drafts => (
                     "No drafts".to_string(),
-                    "Your unfinished messages will appear here.",
+                    "Your unfinished messages will appear here.".to_string(),
                 ),
                 Mailbox::Sent => (
                     "No sent mail".to_string(),
-                    "Messages you send will appear here.",
+                    "Messages you send will appear here.".to_string(),
                 ),
                 Mailbox::Archive => (
                     "Nothing archived".to_string(),
-                    "Conversations you mark done are filed here.",
+                    "Conversations you mark done are filed here.".to_string(),
                 ),
                 Mailbox::Spam => (
                     "No spam".to_string(),
-                    "A little less noise. Nothing to review here.",
+                    "A little less noise. Nothing to review here.".to_string(),
                 ),
                 Mailbox::Trash => (
                     "Trash is empty".to_string(),
-                    "Deleted conversations will appear here.",
+                    "Deleted conversations will appear here.".to_string(),
                 ),
                 Mailbox::All => (
                     "No mail".to_string(),
-                    "Nothing has arrived in this account yet.",
+                    "Nothing has arrived in this account yet.".to_string(),
                 ),
             }
         };
@@ -228,7 +233,7 @@ impl Kite {
                 div()
                     .id("empty-note")
                     .test_support()
-                    .aria_label(note)
+                    .aria_label(note.clone())
                     .text_size(t.px(14.))
                     .text_color(t.fg2)
                     .child(note),
@@ -264,7 +269,9 @@ impl Kite {
         for (ix, group) in Group::ALL.into_iter().enumerate() {
             let commands: Vec<(&Cmd, String)> = keys::COMMANDS
                 .iter()
-                .filter(|command| command.group == group)
+                .filter(|command| {
+                    command.group == group && keys::available(&self.settings, command)
+                })
                 .map(|command| (command, keys::bound(&self.settings, command).join(" ")))
                 .filter(|(_, keys)| !keys.is_empty())
                 .collect();

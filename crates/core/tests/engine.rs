@@ -113,11 +113,14 @@ impl Events {
     }
 }
 
-/// A minimal SSE server: answers one request with the given `data:` payloads.
-fn sse_server(chunks: &[&str]) -> String {
+/// A minimal SSE server: answers one request with the given `data:` payloads, and keeps the
+/// request it received so the model and the key it was sent can be checked.
+fn sse_server(chunks: &[&str]) -> (String, Arc<Mutex<Vec<u8>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sse");
     let address = listener.local_addr().expect("addr").to_string();
     let payloads: Vec<String> = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
     std::thread::spawn(move || {
         let Ok((mut sock, _)) = listener.accept() else {
             return;
@@ -144,6 +147,7 @@ fn sse_server(chunks: &[&str]) -> String {
                 Ok(n) => request.extend_from_slice(&buffer[..n]),
             }
         }
+        *recorded.lock().expect("request") = request.clone();
         let header =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         let _ = sock.write_all(header.as_bytes());
@@ -154,7 +158,7 @@ fn sse_server(chunks: &[&str]) -> String {
             std::thread::sleep(std::time::Duration::from_micros(300));
         }
     });
-    address
+    (address, seen)
 }
 
 // -------------------------------------------------------------------- tests
@@ -407,7 +411,7 @@ fn creating_a_folder_persists_it_and_a_provider_error_persists_nothing() {
 
 #[test]
 fn ai_streams_sse_chunks_in_order() {
-    let address = sse_server(&[
+    let (address, request) = sse_server(&[
         r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
         r#"{"choices":[{"delta":{"content":"lo, "}}]}"#,
         r#"{"choices":[{"delta":{"content":"wörld 🙂"}}]}"#,
@@ -448,6 +452,58 @@ fn ai_streams_sse_chunks_in_order() {
         }
     }
     assert_eq!(deltas, vec!["Hel", "lo, ", "wörld 🙂"]);
+    // Settings, not constants, decide where and for which model the request goes.
+    let seen = String::from_utf8_lossy(&request.lock().expect("request").clone()).to_string();
+    assert!(
+        seen.contains("\"model\":\"test-model\""),
+        "the configured model is sent: {seen}"
+    );
+    assert!(
+        seen.contains("authorization: Bearer secret"),
+        "the keychain key is the bearer token: {seen}"
+    );
+}
+
+#[test]
+fn fetch_image_downloads_http_and_refuses_everything_else() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind image");
+    let address = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 2048];
+        let _ = sock.read(&mut buffer);
+        let body = b"\x89PNG\r\n\x1a\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(body);
+    });
+    let url = format!("http://{address}/pixel.png");
+    let dir = temp_dir();
+    assert!(
+        engine(&dir).fetch_image(&url).is_err(),
+        "mail must not make Kite fetch from the reader's own machine"
+    );
+    let dir = temp_dir();
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::new())),
+        Options {
+            local_images: true,
+            ..Default::default()
+        },
+    )
+    .expect("engine");
+    let bytes = engine.fetch_image(&url).expect("image");
+    assert_eq!(bytes, b"\x89PNG\r\n\x1a\n".to_vec());
+    assert!(
+        engine.fetch_image("file:///C:/Windows/win.ini").is_err(),
+        "only http(s) is fetched for a message"
+    );
 }
 
 #[test]

@@ -67,6 +67,11 @@ pub trait Mail: Send + Sync + 'static {
     }
     fn contacts(&self, query: &str) -> Result<Vec<Addr>>;
     fn open_attachment(&self, id: Id) -> Result<()>;
+    /// One remote image for HTML mail, fetched only when the reader allowed remote images for
+    /// that message. Blocking; call it on the background executor.
+    fn fetch_image(&self, _url: &str) -> Result<Vec<u8>> {
+        anyhow::bail!("Remote images are not available")
+    }
 
     fn splits(&self) -> Result<Vec<Split>>;
     fn set_splits(&self, splits: Vec<Split>) -> Result<()>;

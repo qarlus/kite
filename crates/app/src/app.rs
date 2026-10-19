@@ -14,8 +14,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action as MailAction, Event, Folder, Id, Mailbox, Message, Settings, ThreadSummary,
-    View,
+    Account, Action as MailAction, ChatMsg, Event, Folder, Id, Mailbox, Message, Settings,
+    ThreadSummary, View,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -84,6 +84,20 @@ pub struct Open {
     pub expanded: usize,
 }
 
+/// Where a streamed AI answer belongs.
+pub enum AiFor {
+    Compose,
+    Summary(Id),
+}
+
+/// One streamed AI answer, filled by `Event::Ai` chunks.
+pub struct Ai {
+    pub req: u32,
+    pub text: String,
+    pub done: bool,
+    pub target: AiFor,
+}
+
 pub enum Overlay {
     None,
     Palette(palette::Palette),
@@ -139,6 +153,13 @@ pub struct Kite {
     pub(crate) undo_gen: u64,
     pub(crate) undo: Option<i64>,
     pub(crate) toast: Option<Toast>,
+    pub(crate) ai: Option<Ai>,
+    /// Remote images the reader loaded, by URL, as `data:` URLs.
+    pub(crate) images: Arc<HashMap<String, String>>,
+    /// URLs whose fetch is in flight, so one frame never asks twice.
+    pub(crate) images_pending: std::collections::HashSet<String>,
+    /// Messages the reader allowed remote images for, one at a time.
+    pub(crate) images_allowed: std::collections::HashSet<Id>,
     pub(crate) overlay: Overlay,
     pub(crate) search: Entity<InputState>,
     pub(crate) focus: FocusHandle,
@@ -174,6 +195,11 @@ impl Kite {
 
     pub fn open_id(&self) -> Option<Id> {
         self.open.as_ref().map(|o| o.id)
+    }
+
+    /// The resolved ink and page colours, so a test can see a palette reach the app.
+    pub fn colours(&self) -> (String, String) {
+        (theme::hex(self.theme.fg), theme::hex(self.theme.bg))
     }
 
     pub fn view(&self) -> &View {
@@ -246,6 +272,10 @@ impl Kite {
             undo_gen: 0,
             undo: None,
             toast: None,
+            ai: None,
+            images: Arc::new(HashMap::new()),
+            images_pending: std::collections::HashSet::new(),
+            images_allowed: std::collections::HashSet::new(),
             overlay: Overlay::None,
             search: search.clone(),
             focus: cx.focus_handle(),
@@ -375,7 +405,17 @@ impl Kite {
                 cx.notify();
             }
             Event::Error(message) => self.toast(message, cx),
-            Event::Ai { .. } => {}
+            Event::Ai { req, delta, done } => {
+                let Some(ai) = &mut self.ai else {
+                    return;
+                };
+                if ai.req != req {
+                    return;
+                }
+                ai.text.push_str(&delta);
+                ai.done |= done;
+                cx.notify();
+            }
         }
     }
 
@@ -603,7 +643,12 @@ impl Kite {
     }
 
     fn toggle_read(&mut self, cx: &mut Context<Self>) {
-        let unread = self.rows.get(self.sel).is_some_and(|r| r.unread);
+        // In the reading pane the open conversation is the target, so read its own state.
+        let target = self.target_ids().first().copied();
+        let unread = target
+            .and_then(|id| self.rows.iter().find(|row| row.id == id))
+            .or_else(|| self.rows.get(self.sel))
+            .is_some_and(|row| row.unread);
         let (action, text) = if unread {
             (MailAction::Read, "Marked read")
         } else {
@@ -750,6 +795,8 @@ impl Kite {
                 cx.notify();
             }
             cmd::MOVE => self.show_move(window, cx),
+            cmd::AI_WRITE => self.ai_write(cx),
+            cmd::AI_SUMMARY => self.ai_summary(cx),
             cmd::CREATE_FOLDER => self.show_create_folder(window, cx),
             cmd::STAR => {
                 self.star(cx);
@@ -759,7 +806,7 @@ impl Kite {
             cmd::SELECT => self.select(cx),
             cmd::SEARCH => self.search_focus(window, cx),
             cmd::PALETTE => {
-                self.overlay = Overlay::Palette(palette::Palette::default());
+                self.overlay = Overlay::Palette(palette::Palette::new(&self.settings));
                 cx.notify();
             }
             cmd::HELP => {
@@ -813,6 +860,89 @@ impl Kite {
             }
             _ => {}
         }
+    }
+
+    // ---- AI --------------------------------------------------------------------
+
+    /// One AI answer, shared by "Write with AI" and "Summarize thread". The engine owns the
+    /// endpoint and model from Settings and streams the answer back as `Event::Ai`.
+    fn ai_request(&mut self, id: u8, target: AiFor, prompt: Vec<ChatMsg>, cx: &mut Context<Self>) {
+        if !self.settings.ai_enabled {
+            self.toast("AI is off. Turn it on in Settings › AI.", cx);
+            return;
+        }
+        if self.ai.as_ref().is_some_and(|ai| !ai.done) {
+            self.toast("An AI answer is still arriving", cx);
+            return;
+        }
+        self.seq += 1;
+        let req = self.seq as u32;
+        match self.mail.ai(req, prompt) {
+            Ok(()) => {
+                self.ai = Some(Ai {
+                    req,
+                    text: String::new(),
+                    done: false,
+                    target,
+                });
+                self.pulse = Some((id, self.seq));
+            }
+            Err(error) => self.toast(format!("AI: {error}"), cx),
+        }
+        cx.notify();
+    }
+
+    /// Cmd/Ctrl+J in compose: draft the reply from the subject and what is written so far.
+    fn ai_write(&mut self, cx: &mut Context<Self>) {
+        let Some(compose) = &self.compose else {
+            self.toast("Open compose first", cx);
+            return;
+        };
+        let subject = compose.subject.read(cx).value().to_string();
+        let body = compose.body.read(cx).value().to_string();
+        let ask = if body.trim().is_empty() {
+            format!("Write a reply to an email about \"{subject}\".")
+        } else {
+            format!("Write a reply to the email below.\n\nSubject: {subject}\n\n{body}")
+        };
+        let prompt = vec![
+            ChatMsg {
+                role: "system".into(),
+                content: "You draft one email reply. Answer with the reply body only: no subject line, no commentary.".into(),
+            },
+            ChatMsg {
+                role: "user".into(),
+                content: ask,
+            },
+        ];
+        self.ai_request(cmd::AI_WRITE, AiFor::Compose, prompt, cx);
+    }
+
+    /// Shift+S in the reading pane: summarize the open conversation.
+    fn ai_summary(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &self.open else {
+            self.toast("Open a conversation first", cx);
+            return;
+        };
+        let id = open.id;
+        let mut thread = format!("Subject: {}\n\n", open.subject);
+        for message in &open.messages {
+            thread.push_str(&format!(
+                "From: {}\n{}\n\n",
+                message.from.email, message.text
+            ));
+        }
+        let prompt = vec![
+            ChatMsg {
+                role: "system".into(),
+                content: "Summarize an email thread in at most four short lines: what the sender wants and what is still open.".into(),
+            },
+            ChatMsg {
+                role: "user".into(),
+                content: thread,
+            },
+        ];
+        self.ai_request(cmd::AI_SUMMARY, AiFor::Summary(id), prompt, cx);
     }
 
     fn action(&mut self, action: &Act, window: &mut Window, cx: &mut Context<Self>) {

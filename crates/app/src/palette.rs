@@ -7,6 +7,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use kite_core::model::Settings;
 use std::collections::HashSet;
 
 pub struct Palette {
@@ -14,14 +15,17 @@ pub struct Palette {
     pub sel: usize,
     /// Command ids matching the query, best first.
     pub items: Vec<u8>,
+    /// The AI helpers stay out of the list until Settings › AI turns them on.
+    pub show_ai: bool,
 }
 
-impl Default for Palette {
-    fn default() -> Self {
+impl Palette {
+    pub fn new(settings: &Settings) -> Self {
         let mut palette = Self {
             query: String::new(),
             sel: 0,
             items: Vec::new(),
+            show_ai: settings.ai_enabled,
         };
         palette.refilter();
         palette
@@ -55,6 +59,7 @@ impl Palette {
         let query = self.query.trim().to_lowercase();
         let mut scored: Vec<(i32, u8)> = keys::COMMANDS
             .iter()
+            .filter(|c| self.show_ai || !keys::needs_ai(c.id))
             .filter_map(|c| {
                 let score = if query.is_empty() {
                     Some(0)

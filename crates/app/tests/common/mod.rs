@@ -28,6 +28,15 @@ pub const HTML: &str = "<p>Hello there.</p><p>Second paragraph with enough text 
 type Locations = HashMap<Id, (Mailbox, Option<String>)>;
 type Snapshot = (Vec<ThreadSummary>, Locations);
 
+/// A 1x1 PNG, so the fixture answers a real image without any network.
+pub const PNG: &[u8] = &[
+    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
+    0x42, 0x60, 0x82,
+];
+
 pub struct Fixture {
     pub folders: Mutex<Vec<Folder>>,
     pub locations: Mutex<Locations>,
@@ -49,6 +58,12 @@ pub struct Fixture {
     pub proton_answers: Mutex<Vec<String>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
+    /// URLs the UI asked the engine to fetch as remote images, in order.
+    pub images_fetched: Mutex<Vec<String>>,
+    /// The bytes `fetch_image` answers with; a 1x1 PNG unless a test replaces it.
+    pub image_bytes: Mutex<Vec<u8>>,
+    /// Every `ai` request the UI made, with the prompt it sent.
+    pub ai_requests: Mutex<Vec<(u32, Vec<ChatMsg>)>>,
     pub settings: Mutex<Settings>,
     /// The AI key the UI handed to `set_ai_key`; never part of `Settings`.
     pub ai_key: Mutex<Option<String>>,
@@ -143,6 +158,9 @@ impl Fixture {
             proton_answers: Mutex::new(Vec::new()),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
+            images_fetched: Mutex::new(Vec::new()),
+            image_bytes: Mutex::new(PNG.to_vec()),
+            ai_requests: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
                 ..Settings::default()
@@ -253,6 +271,19 @@ impl Fixture {
             .and_then(|messages| messages.last_mut())
         {
             message.subject = subject.into();
+        }
+    }
+
+    /// Replaces the latest message's HTML body, so image handling can be exercised.
+    pub fn set_message_html(&self, thread: Id, html: &str) {
+        if let Some(message) = self
+            .messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+        {
+            message.html = Some(html.into());
         }
     }
 
@@ -949,6 +980,11 @@ impl Mail for Fixture {
         Ok(())
     }
 
+    fn fetch_image(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        self.images_fetched.lock().unwrap().push(url.to_string());
+        Ok(self.image_bytes.lock().unwrap().clone())
+    }
+
     fn splits(&self) -> anyhow::Result<Vec<Split>> {
         Ok(vec![
             Split {
@@ -1002,7 +1038,8 @@ impl Mail for Fixture {
         Ok(Vec::new())
     }
 
-    fn ai(&self, _: u32, _: Vec<ChatMsg>) -> anyhow::Result<()> {
+    fn ai(&self, req: u32, messages: Vec<ChatMsg>) -> anyhow::Result<()> {
+        self.ai_requests.lock().unwrap().push((req, messages));
         Ok(())
     }
 

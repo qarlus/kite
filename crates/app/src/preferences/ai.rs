@@ -52,7 +52,9 @@ impl Kite {
                 .key
                 .update(cx, |input, cx| input.set_value("", window, cx));
             let mail = self.mail.clone();
-            let task = cx.background_executor().spawn(async move { mail.set_ai_key(&key) });
+            let task = cx
+                .background_executor()
+                .spawn(async move { mail.set_ai_key(&key) });
             cx.spawn(async move |this, cx| {
                 if let Err(error) = task.await {
                     this.update(cx, |this, cx| {
@@ -134,13 +136,17 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                         .child(field(
                             t,
                             "Model",
-                            Input::new(&page.ai.model).id("ai-model").aria_label("AI model"),
+                            Input::new(&page.ai.model)
+                                .id("ai-model")
+                                .aria_label("AI model"),
                         )),
                 )
                 .child(field(
                     t,
                     "API key",
-                    Input::new(&page.ai.key).id("ai-key").aria_label("AI API key"),
+                    Input::new(&page.ai.key)
+                        .id("ai-key")
+                        .aria_label("AI API key"),
                 ))
                 .child(
                     div()

@@ -118,3 +118,98 @@ fn switching_back_to_keyboard_mode_re_enables_single_keys_without_a_restart(
         "e archives again as soon as the mode changes"
     );
 }
+
+/// The command ids behind the reading-pane toolbar buttons (keys::cmd).
+const BACK: usize = 3;
+const SNOOZE: usize = 7;
+const MOVE: usize = 19;
+
+#[gpui_kit::test]
+fn classic_mode_reaches_snooze_and_move_from_the_reading_pane_toolbar(cx: &mut TestAppContext) {
+    let fixture = click_first();
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert!(kite.open_id().is_some(), "Enter still opens a conversation");
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("action", SNOOZE), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snooze").is_some(),
+            "the toolbar's snooze button opens the picker without a key"
+        );
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("action", MOVE), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("folder-dialog").label(),
+            Some("Move to folder"),
+            "the toolbar's move button opens the folder picker"
+        );
+    })
+    .unwrap();
+    assert!(
+        !fixture
+            .actions()
+            .iter()
+            .any(|(_, action)| matches!(action, Action::Move { .. })),
+        "opening the picker must not move anything"
+    );
+}
+
+#[gpui_kit::test]
+fn classic_mode_toolbar_labels_carry_no_dead_keys_and_back_returns_to_the_list(
+    cx: &mut TestAppContext,
+) {
+    let fixture = click_first();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        // Escape still reaches Back in either mode, so its hint stays; single-key triage does not.
+        assert_eq!(window.find(("action", BACK)).label(), Some("Back (escape)"));
+        for (cmd, label) in [(SNOOZE, "Snooze"), (MOVE, "Move to folder")] {
+            assert_eq!(
+                window.find(("action", cmd)).label(),
+                Some(label),
+                "a single-key command shows no key it no longer has"
+            );
+        }
+        window.click(("action", BACK), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("thread-toolbar").is_some(),
+            "the conversation stays open beside the list"
+        );
+    })
+    .unwrap();
+    // Back hands the keyboard to the list: the arrows move its selection again.
+    cx.simulate_keystrokes(window.into(), "down");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find(("row", 1usize)).selected(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn classic_mode_composes_from_the_list_header_button(cx: &mut TestAppContext) {
+    let fixture = click_first();
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-new", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose").is_some(),
+            "the header's compose button is the click-first way to write"
+        );
+    })
+    .unwrap();
+}

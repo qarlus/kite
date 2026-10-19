@@ -105,7 +105,7 @@ fn cached_key(id: &'static str) -> TestKey {
 /// on one side, the PKESK that unlocks its session key on the other.
 fn encrypt_split(public: &SignedPublicKey, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
     use pgp::packet::{PacketTrait as _, PublicKeyEncryptedSessionKey};
-        let mut rng = rand::thread_rng();
+    let mut rng = rand::thread_rng();
     let builder = MessageBuilder::from_bytes("", plaintext.to_vec())
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
     let session = pgp::composed::RawSessionKey::from(builder.session_key().as_ref().to_vec());
@@ -115,9 +115,13 @@ fn encrypt_split(public: &SignedPublicKey, plaintext: &[u8]) -> (Vec<u8>, Vec<u8
         .iter()
         .find(|key| key.algorithm().can_encrypt())
         .expect("encryption subkey");
-    let packet =
-        PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, &session, SymmetricKeyAlgorithm::AES256, subkey)
-            .expect("session key packet");
+    let packet = PublicKeyEncryptedSessionKey::from_session_key_v3(
+        &mut rng,
+        &session,
+        SymmetricKeyAlgorithm::AES256,
+        subkey,
+    )
+    .expect("session key packet");
     let mut key_packets = Vec::new();
     packet
         .to_writer_with_header(&mut key_packets)
@@ -419,7 +423,8 @@ impl World {
     pub fn push_event(&mut self, id: &str, action: i64) -> String {
         self.event_serial += 1;
         let event_id = format!("evt-{}", self.event_serial);
-        self.events.push((event_id.clone(), vec![(id.to_string(), action)]));
+        self.events
+            .push((event_id.clone(), vec![(id.to_string(), action)]));
         event_id
     }
 
@@ -571,7 +576,9 @@ fn ok(mut value: Value) -> (u16, Vec<u8>) {
 fn error(status: u16, code: i64, message: &str) -> (u16, Vec<u8>) {
     (
         status,
-        json!({ "Code": code, "Error": message }).to_string().into_bytes(),
+        json!({ "Code": code, "Error": message })
+            .to_string()
+            .into_bytes(),
     )
 }
 
@@ -681,7 +688,9 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
         ("GET", "/api/core/v4/addresses") => {
             let email = world.email.clone();
             let keys: Vec<Value> = world.address_keys.iter().map(key_json).collect();
-            ok(json!({ "Addresses": [{ "ID": "address-1", "Email": email, "Order": 1, "Keys": keys }] }))
+            ok(
+                json!({ "Addresses": [{ "ID": "address-1", "Email": email, "Order": 1, "Keys": keys }] }),
+            )
         }
         ("GET", "/api/core/v4/keys/salts") => ok(json!({
             "KeySalts": world
@@ -831,16 +840,18 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                     value["Header"] = json!(message.header);
                     value["Body"] = json!(message.body);
                     value["MIMEType"] = json!(message.mime_type);
-                    value["Attachments"] = json!(message
-                        .attachments
-                        .iter()
-                        .map(|attachment| json!({
-                            "ID": attachment.id,
-                            "Name": attachment.name,
-                            "Size": attachment.data.len(),
-                            "MIMEType": attachment.mime_type,
-                        }))
-                        .collect::<Vec<_>>());
+                    value["Attachments"] = json!(
+                        message
+                            .attachments
+                            .iter()
+                            .map(|attachment| json!({
+                                "ID": attachment.id,
+                                "Name": attachment.name,
+                                "Size": attachment.data.len(),
+                                "MIMEType": attachment.mime_type,
+                            }))
+                            .collect::<Vec<_>>()
+                    );
                     ok(json!({ "Message": value }))
                 }
                 None => error(404, 2001, "Message not found"),
@@ -996,7 +1007,9 @@ fn verify_proof(world: &mut World, body: &Value) -> bool {
     let server_ephemeral = world.server_ephemeral.clone();
     let n = modulus();
     let a = int(&ephemeral);
-    let u = int(&expand(&[ephemeral.clone(), server_ephemeral.clone()].concat()));
+    let u = int(&expand(
+        &[ephemeral.clone(), server_ephemeral.clone()].concat(),
+    ));
     let shared =
         ((a * verifier(&world.password).modpow(&u, &n)) % &n).modpow(&world.server_secret, &n);
     let shared = elem(&shared);

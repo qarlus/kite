@@ -157,3 +157,64 @@ fn the_input_mode_choice_is_shown_and_saved(cx: &mut TestAppContext) {
     .unwrap();
     assert_eq!(fixture.settings.lock().unwrap().input_mode, "classic");
 }
+
+#[gpui_kit::test]
+fn the_undo_send_window_from_settings_decides_whether_z_still_cancels(cx: &mut TestAppContext) {
+    // Off means send at once: by the time the writer can reach z, the mail is gone.
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    open_section(window, cx, 4);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("undo-send-0", cx);
+        window.render_frame(cx);
+        window.click("close-settings", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().undo_send_secs, 0);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Sent for good", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert_eq!(fixture.drafts().len(), 1);
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "z");
+    assert!(
+        fixture.cancelled().is_empty(),
+        "a zero-second window means the message has already left"
+    );
+}
+
+#[gpui_kit::test]
+fn a_typed_undo_send_window_keeps_the_send_cancellable(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    fixture.settings.lock().unwrap().undo_send_secs = 30;
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Still mine", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    cx.simulate_keystrokes(window.into(), "z");
+    assert_eq!(
+        fixture.cancelled(),
+        vec![9001],
+        "z takes the message back inside the configured window"
+    );
+}

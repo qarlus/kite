@@ -4783,6 +4783,7 @@ dependencies = [
  "anyrender",
  "anyrender_vello_cpu",
  "async-channel 2.5.0",
+ "base64 0.22.1",
  "blitz-dom",
  "blitz-html",
  "blitz-paint",

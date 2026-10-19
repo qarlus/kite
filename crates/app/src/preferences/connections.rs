@@ -428,8 +428,15 @@ impl Kite {
 
     /// Publishes a freshly created account to the sidebar and the open view.
     fn account_created(&mut self, account: Account, cx: &mut Context<Self>) {
-        self.accounts = self.mail.accounts().unwrap_or_else(|_| self.accounts.clone());
-        if !self.accounts.iter().any(|existing| existing.id == account.id) {
+        self.accounts = self
+            .mail
+            .accounts()
+            .unwrap_or_else(|_| self.accounts.clone());
+        if !self
+            .accounts
+            .iter()
+            .any(|existing| existing.id == account.id)
+        {
             self.accounts.push(account);
         }
         self.folders = self.mail.folders().unwrap_or_default();
@@ -599,7 +606,9 @@ fn proton_form(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
     match &connections.step {
         Step::Password => {
             form = form
-                .child(hint("Use your normal Proton password. Kite never stores it."))
+                .child(hint(
+                    "Use your normal Proton password. Kite never stores it.",
+                ))
                 .child(
                     Input::new(&connections.address)
                         .id("proton-address")
@@ -610,20 +619,19 @@ fn proton_form(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
                         .id("proton-secret")
                         .aria_label("Proton password"),
                 )
-                .child(
-                    primary("proton-sign-in", "Sign in", t).on_click(
-                        cx.listener(|this, _, window, cx| this.start_proton_sign_in(window, cx)),
-                    ),
-                );
+                .child(primary("proton-sign-in", "Sign in", t).on_click(
+                    cx.listener(|this, _, window, cx| this.start_proton_sign_in(window, cx)),
+                ));
         }
         Step::TwoFactor => {
             form = form
-                .child(hint("Enter the six-digit code from your authenticator app."))
+                .child(hint(
+                    "Enter the six-digit code from your authenticator app.",
+                ))
                 .child(answer())
                 .child(
-                    primary("proton-step", "Verify code", t).on_click(
-                        cx.listener(|this, _, _, cx| this.answer_proton_step(cx)),
-                    ),
+                    primary("proton-step", "Verify code", t)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_proton_step(cx))),
                 );
         }
         Step::MailboxPassword => {
@@ -633,9 +641,8 @@ fn proton_form(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
                 ))
                 .child(answer())
                 .child(
-                    primary("proton-step", "Unlock mail", t).on_click(
-                        cx.listener(|this, _, _, cx| this.answer_proton_step(cx)),
-                    ),
+                    primary("proton-step", "Unlock mail", t)
+                        .on_click(cx.listener(|this, _, _, cx| this.answer_proton_step(cx))),
                 );
         }
         Step::HumanVerification(url) => {

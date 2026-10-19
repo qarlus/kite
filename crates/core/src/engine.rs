@@ -102,6 +102,8 @@ pub struct Options {
     pub poll: Duration,
     /// Send STARTTLS on Proton connections. Tests set false to reach a local plaintext fake server.
     pub proton_tls: bool,
+    /// Fetch remote images from loopback/private addresses. Tests set true to reach a local fake.
+    pub local_images: bool,
 }
 
 impl Default for Options {
@@ -112,6 +114,7 @@ impl Default for Options {
             proton_api_url: None,
             poll: Duration::from_secs(30),
             proton_tls: true,
+            local_images: false,
         }
     }
 }
@@ -225,10 +228,12 @@ impl Engine {
                 Ok(ProtonAuth::HumanVerification { url })
             }
             ProtonStep::Done => {
-                let signed = sign_in.take().context("Proton sign-in returned no session")?;
-                let account = self.inner.write(|s| {
-                    s.add_account(Provider::Proton, &signed.email, &signed.name)
-                })?;
+                let signed = sign_in
+                    .take()
+                    .context("Proton sign-in returned no session")?;
+                let account = self
+                    .inner
+                    .write(|s| s.add_account(Provider::Proton, &signed.email, &signed.name))?;
                 let key = format!("proton:{}", account.id);
                 self.inner
                     .secrets
@@ -991,6 +996,56 @@ impl Mail for Engine {
         );
         std::fs::write(&file, &bytes)?;
         open_path(&file)
+    }
+
+    fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {
+        const MAX: usize = 4 << 20;
+        let url = reqwest::Url::parse(url).context("image URL")?;
+        anyhow::ensure!(
+            matches!(url.scheme(), "https" | "http"),
+            "Remote images must be http(s)"
+        );
+        // Mail must not be able to make Kite probe the reader's own machine or LAN.
+        let host = url.host_str().unwrap_or_default();
+        let local = match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
+            Ok(std::net::IpAddr::V4(ip)) => {
+                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
+            }
+            Ok(std::net::IpAddr::V6(ip)) => {
+                let first = ip.segments()[0];
+                ip.is_loopback()
+                    || ip.is_unspecified()
+                    || (first & 0xfe00) == 0xfc00
+                    || (first & 0xffc0) == 0xfe80
+            }
+            Err(_) => {
+                host.is_empty()
+                    || host.eq_ignore_ascii_case("localhost")
+                    || host.to_ascii_lowercase().ends_with(".localhost")
+            }
+        };
+        anyhow::ensure!(
+            !local || self.inner.opts.local_images,
+            "Remote images on local addresses are not loaded"
+        );
+        run_async(async move {
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()?;
+            let mut res = client.get(url).send().await.context("fetch image")?;
+            anyhow::ensure!(
+                res.status().is_success(),
+                "image request failed ({})",
+                res.status()
+            );
+            // Stop at the cap rather than buffering an arbitrarily large body first.
+            let mut bytes = Vec::new();
+            while let Some(chunk) = res.chunk().await? {
+                bytes.extend_from_slice(&chunk);
+                anyhow::ensure!(bytes.len() <= MAX, "image is too large to display");
+            }
+            Ok(bytes)
+        })
     }
 
     fn splits(&self) -> Result<Vec<Split>> {

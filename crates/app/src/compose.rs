@@ -1,6 +1,7 @@
 //! Compose: a floating panel for new mail, reply, reply-all and forward.
 //! Drafts save through `Mail::save_draft`: debounced while typing, and on close.
 use crate::app::{Kite, Overlay};
+use crate::keys;
 use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
@@ -527,6 +528,28 @@ impl Kite {
         window.focus(&handle, cx);
     }
 
+    /// Put the streamed answer into the draft, above anything already written so a quoted
+    /// message stays below it, then forget the answer.
+    pub(crate) fn insert_ai(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ai) = self.ai.take() else {
+            return;
+        };
+        let Some(compose) = &self.compose else {
+            return;
+        };
+        let existing = compose.body.read(cx).value().to_string();
+        let text = if existing.trim().is_empty() {
+            ai.text.trim_end().to_string()
+        } else {
+            format!("{}\n\n{existing}", ai.text.trim_end())
+        };
+        compose.body.update(cx, |body, cx| {
+            body.set_value(text, window, cx);
+        });
+        self.compose_changed(cx);
+        cx.notify();
+    }
+
     pub fn render_compose(
         &mut self,
         window: &mut Window,
@@ -551,6 +574,12 @@ impl Kite {
         let body = compose.body.clone();
         let show_cc = compose.show_cc;
         let title = compose.title;
+        let ai = match &self.ai {
+            Some(ai) if matches!(ai.target, crate::app::AiFor::Compose) => {
+                Some((ai.text.clone(), ai.done))
+            }
+            _ => None,
+        };
         let status = if compose.dirty {
             "Saving…"
         } else if compose.saved {
@@ -658,6 +687,49 @@ impl Kite {
                     "compose-subject",
                     "Subject",
                 ))
+                .when_some(ai, |d, (text, done)| {
+                    d.child(
+                        div()
+                            .id("compose-ai")
+                            .test_support()
+                            .aria_label(text.clone())
+                            .mx_4()
+                            .mb_2()
+                            .p_3()
+                            .rounded(px(RADIUS_SM))
+                            .bg(t.bg3)
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(t.px(11.))
+                                    .font_weight(FontWeight(650.))
+                                    .text_color(t.fg2)
+                                    .child(if done { "AI draft" } else { "Writing…" }),
+                            )
+                            .child(div().text_size(t.px(13.)).child(text))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .child(
+                                        crate::preferences::button("insert-ai", "Insert", t)
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.insert_ai(window, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        crate::preferences::button("discard-ai", "Discard", t)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.ai = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            ),
+                    )
+                })
                 .child(
                     div()
                         .id("compose-body")
@@ -696,12 +768,14 @@ impl Kite {
                                 .flex()
                                 .items_center()
                                 .gap_3()
-                                .child(
-                                    div()
-                                        .text_size(t.px(11.))
-                                        .text_color(t.fg3)
-                                        .child("Esc keeps this draft"),
-                                )
+                                .child(div().text_size(t.px(11.)).text_color(t.fg3).child(
+                                    match keys::hint_for(&self.settings, keys::cmd::COMPOSE_CLOSE) {
+                                        hint if hint.is_empty() => {
+                                            "Closing keeps this draft".to_string()
+                                        }
+                                        hint => format!("{hint} keeps this draft"),
+                                    },
+                                ))
                                 .child(
                                     div()
                                         .id("compose-status")
@@ -736,12 +810,9 @@ impl Kite {
                                             this.discard_compose(window, cx)
                                         }))
                                         .child("Discard")
-                                        .child(
-                                            div()
-                                                .text_size(t.px(11.))
-                                                .text_color(t.fg3)
-                                                .child("⌘⇧D"),
-                                        ),
+                                        .child(div().text_size(t.px(11.)).text_color(t.fg3).child(
+                                            keys::hint_for(&self.settings, keys::cmd::DISCARD),
+                                        )),
                                 )
                                 .child(
                                     div()
@@ -763,9 +834,9 @@ impl Kite {
                                             this.send_compose(window, cx)
                                         }))
                                         .child("Send")
-                                        .child(
-                                            div().text_size(t.px(11.)).text_color(t.fg).child("⌘↵"),
-                                        ),
+                                        .child(div().text_size(t.px(11.)).text_color(t.fg).child(
+                                            keys::hint_for(&self.settings, keys::cmd::SEND),
+                                        )),
                                 ),
                         ),
                 )

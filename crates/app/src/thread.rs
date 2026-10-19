@@ -22,6 +22,10 @@ pub const PANE_PAD: f32 = 32.;
 /// Past the avatar column, so everything a message holds lines up under its sender's name.
 pub const BODY_INDENT: f32 = 44.;
 
+/// How many fetched remote images are kept in memory. A body that asks for more keeps its
+/// remaining images blocked, which bounds a long session without a retry loop.
+const IMAGE_CACHE: usize = 128;
+
 /// Cache key: a body is re-rendered when the message, width, theme or DPI scale changes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HtmlKey {
@@ -104,6 +108,7 @@ impl Kite {
             .unwrap_or_default();
         let messages = open.messages.clone();
         let expanded = open.expanded;
+        let open_id = open.id;
         let count = messages.len();
         let mut column = div()
             .flex()
@@ -143,6 +148,17 @@ impl Kite {
                     .border_t_1()
                     .border_color(t.line),
             );
+        // A summary sits under the thread header, above the messages it describes.
+        let summary = match &self.ai {
+            Some(ai) => match ai.target {
+                crate::app::AiFor::Summary(id) if id == open_id => Some((ai.text.clone(), ai.done)),
+                _ => None,
+            },
+            None => None,
+        };
+        if let Some((text, done)) = summary {
+            column = column.child(self.ai_summary_card(&text, done, cx));
+        }
         for (ix, message) in messages.into_iter().enumerate() {
             let is_last = ix + 1 == count;
             column =
@@ -170,20 +186,38 @@ impl Kite {
             .into_any_element()
     }
 
-    /// The reading-pane toolbar: icon-only buttons right-aligned in what they do to the
-    /// conversation, with the list/reading-pane toggle first. Each label carries the key that is
-    /// bound right now, so a click-first reader loses nothing.
+    /// The reading-pane toolbar: icon-only buttons in the order they act on the conversation,
+    /// with back and the list/reading-pane toggle first. Each label carries the key that is bound
+    /// right now, so a click-first reader loses nothing.
     fn thread_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        const ACTIONS: [(u8, IconName, &str); 6] = [
-            (keys::cmd::DONE, IconName::Archive, "Mark done"),
-            (keys::cmd::TRASH, IconName::Trash, "Trash"),
-            (keys::cmd::REPLY, IconName::Reply, "Reply"),
-            (keys::cmd::REPLY_ALL, IconName::ReplyAll, "Reply all"),
-            (keys::cmd::FORWARD, IconName::Forward, "Forward"),
-            (keys::cmd::STAR, IconName::Star, "Star"),
+        const GROUPS: [&[(u8, IconName, &str)]; 4] = [
+            &[
+                (keys::cmd::DONE, IconName::Archive, "Mark done"),
+                (keys::cmd::TRASH, IconName::Trash, "Trash"),
+            ],
+            &[
+                (keys::cmd::MOVE, IconName::FolderInput, "Move to folder"),
+                (keys::cmd::SNOOZE, IconName::Clock, "Snooze"),
+            ],
+            &[
+                (keys::cmd::REPLY, IconName::Reply, "Reply"),
+                (keys::cmd::REPLY_ALL, IconName::ReplyAll, "Reply all"),
+                (keys::cmd::FORWARD, IconName::Forward, "Forward"),
+            ],
+            &[
+                (keys::cmd::TOGGLE_READ, IconName::Mails, "Mark unread"),
+                (keys::cmd::STAR, IconName::Star, "Star"),
+            ],
         ];
-        // File it away, answer it, mark it: three groups, so the eye can find a verb.
+        let hint = |cmd: u8, label: &str| {
+            let hint = keys::hint_for(&self.settings, cmd);
+            if hint.is_empty() {
+                label.to_string()
+            } else {
+                format!("{label} ({hint})")
+            }
+        };
         let mut bar = div()
             .id("thread-toolbar")
             .test_support()
@@ -197,25 +231,138 @@ impl Kite {
             .border_b_1()
             .border_color(t.line)
             .child(self.pane_toggle(cx))
+            .child(self.action_icon(
+                keys::cmd::BACK,
+                IconName::ArrowLeft,
+                hint(keys::cmd::BACK, "Back"),
+                cx,
+            ))
             .child(div().flex_1());
-        for group in [[0, 2], [2, 5], [5, 6]] {
+        for group in GROUPS {
             bar = bar.child(
-                div().flex().items_center().gap_1().children(
-                    ACTIONS[group[0]..group[1]]
-                        .iter()
-                        .map(|(cmd, icon, label)| {
-                            let hint = keys::hint_for(&self.settings, *cmd);
-                            let label = if hint.is_empty() {
-                                label.to_string()
-                            } else {
-                                format!("{label} ({hint})")
-                            };
-                            self.action_icon(*cmd, *icon, label, cx)
-                        }),
-                ),
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .children(group.iter().map(|(cmd, icon, label)| {
+                        self.action_icon(*cmd, *icon, hint(*cmd, label), cx)
+                    })),
             );
         }
         bar.into_any_element()
+    }
+
+    /// The streamed answer to Shift+S, above the messages it summarizes.
+    fn ai_summary_card(&self, text: &str, done: bool, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        div()
+            .id("ai-summary")
+            .test_support()
+            .aria_label(text.to_string())
+            .mt_4()
+            .p_4()
+            .rounded(px(RADIUS_SM))
+            .bg(t.bg2)
+            .border_1()
+            .border_color(t.line)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(t.px(12.))
+                            .font_weight(FontWeight(650.))
+                            .text_color(t.fg2)
+                            .child(if done { "AI summary" } else { "Summarizing…" }),
+                    )
+                    .child(
+                        crate::preferences::button("ai-summary-dismiss", "Dismiss", t).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.ai = None;
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(t.px(13.))
+                    .line_height(relative(1.6))
+                    .child(text.to_string()),
+            )
+            .into_any_element()
+    }
+
+    /// "Remote images are blocked" plus the way to load them for this message only.
+    fn image_notice(&self, id: Id, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        div()
+            .id(format!("image-notice-{id}"))
+            .test_support()
+            .aria_label("Remote images are blocked")
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_3()
+            .py_2()
+            .rounded(px(RADIUS_SM))
+            .bg(t.bg2)
+            .text_size(t.px(12.))
+            .text_color(t.fg2)
+            .child("Remote images are blocked.")
+            .child(
+                crate::preferences::button(format!("load-images-{id}"), "Load images", t).on_click(
+                    cx.listener(move |this, _, _, cx| {
+                        this.images_allowed.insert(id);
+                        this.html_cache.clear();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    /// Fetches the images a message is now allowed to load, once each, off the UI thread.
+    fn request_images(&mut self, urls: &[String], cx: &mut Context<Self>) {
+        for url in urls {
+            if self.images.len() >= IMAGE_CACHE
+                || self.images.contains_key(url)
+                || !self.images_pending.insert(url.clone())
+            {
+                continue;
+            }
+            let url = url.clone();
+            let mail = self.mail.clone();
+            let asked = url.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { mail.fetch_image(&asked) });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| {
+                    // A URL only leaves the asked set once it has bytes: a failure is not
+                    // retried on every frame, which would hammer a sender's server.
+                    let Ok(bytes) = result else {
+                        return;
+                    };
+                    this.images_pending.remove(&url);
+                    let mut images = (*this.images).clone();
+                    images.insert(url, crate::html::data_url(&bytes));
+                    this.images = std::sync::Arc::new(images);
+                    // The body that was painted without it has to be laid out again.
+                    this.html_cache.clear();
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// Side by side, or one at a time: `settings.reading_pane`, saved like any preference.
@@ -379,7 +526,23 @@ impl Kite {
             return card.into_any_element();
         }
         let body = match &message.html {
-            Some(source) => self.html_body(&message, source, scale, body_width, cx),
+            Some(source) => {
+                // Only a reader who asked for remote images can load them here.
+                let allowed =
+                    self.settings.load_remote_images || self.images_allowed.contains(&message.id);
+                let remote = crate::html::remote_images(source);
+                let blocked = !allowed && !remote.is_empty();
+                if allowed && !remote.is_empty() {
+                    self.request_images(&remote, cx);
+                }
+                let mut stack = div().flex().flex_col().gap_3();
+                if blocked {
+                    stack = stack.child(self.image_notice(message.id, cx));
+                }
+                stack
+                    .child(self.html_body(&message, source, allowed, scale, body_width, cx))
+                    .into_any_element()
+            }
             None => div()
                 .id(format!("text-{}", message.id))
                 .test_support()
@@ -486,6 +649,7 @@ impl Kite {
         &mut self,
         message: &Message,
         source: &str,
+        images_allowed: bool,
         scale: f32,
         body_width: f32,
         cx: &mut Context<Self>,
@@ -493,7 +657,13 @@ impl Kite {
         let t = self.theme;
         let width = (body_width * scale).round() / scale;
         let key = HtmlKey::new(message.id, width, scale, self.dark, self.appearance_version);
-        self.request_html(source, key, cx);
+        // A blocked body has every remote source replaced, so nothing can reach the network.
+        let images = if images_allowed {
+            self.images.clone()
+        } else {
+            std::sync::Arc::new(std::collections::HashMap::new())
+        };
+        self.request_html(source, key, images, cx);
         match self.html_cache.get(&key) {
             Some(rendered) => {
                 let image: Arc<RenderImage> = rendered.image.clone();
@@ -559,7 +729,13 @@ impl Kite {
 
 impl Kite {
     /// Renders one message body in the background unless it is already cached or in flight.
-    fn request_html(&mut self, source: &str, key: HtmlKey, cx: &mut Context<Self>) {
+    fn request_html(
+        &mut self,
+        source: &str,
+        key: HtmlKey,
+        images: Arc<std::collections::HashMap<String, String>>,
+        cx: &mut Context<Self>,
+    ) {
         if self.html_cache.get(&key).is_some() || !self.html_cache.start(key) {
             return;
         }
@@ -567,9 +743,10 @@ impl Kite {
         let source = source.to_string();
         let theme = self.theme;
         let font = crate::theme::font(&self.settings).to_string();
-        let task = cx
-            .background_executor()
-            .spawn(async move { html::render_styled(&source, width, scale, theme, &font) });
+        let task = cx.background_executor().spawn(async move {
+            let html = crate::html::inline_images(&source, &images);
+            html::render_styled(&html, width, scale, theme, &font)
+        });
         cx.spawn(async move |this, cx| {
             let rendered = task.await;
             this.update(cx, |this, cx| {
@@ -583,10 +760,13 @@ impl Kite {
 
     /// Renders the bodies of a prefetched thread so opening it is instant.
     pub(crate) fn warm_html(&mut self, messages: &[Message], cx: &mut Context<Self>) {
+        let images = self.images.clone();
         for message in messages {
             let Some(source) = message.html.clone() else {
                 continue;
             };
+            let allowed =
+                self.settings.load_remote_images || self.images_allowed.contains(&message.id);
             let key = HtmlKey::new(
                 message.id,
                 self.body_width(),
@@ -594,7 +774,12 @@ impl Kite {
                 self.dark,
                 self.appearance_version,
             );
-            self.request_html(&source, key, cx);
+            let images = if allowed {
+                images.clone()
+            } else {
+                Arc::new(std::collections::HashMap::new())
+            };
+            self.request_html(&source, key, images, cx);
         }
     }
 }
