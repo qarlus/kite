@@ -79,22 +79,36 @@ fn verifier(password: &str) -> BigUint {
 
 pub struct TestKey {
     pub id: String,
+    /// What unlocks `secret`: the salted mailbox password for the user key, the token for
+    /// the address key.
+    pub passphrase: String,
     pub secret: SignedSecretKey,
     pub armored_secret: String,
     pub armored_public: String,
 }
 
-/// A reusable RSA key pair (primary plus encryption subkey, as Proton issues) protected
-/// with the bcrypt passphrase Proton would store in `KeySalts`.
-/// Key generation is slow, so each key is made once per test binary. Both are protected
-/// with the bcrypt passphrase Proton would store in `KeySalts`.
+/// The address key's passphrase on a current Proton account: a random token that Proton
+/// hands out encrypted to the user key (`Token`) and signed by it (`Signature`).
+pub const ADDRESS_TOKEN: &str = "6f2b9c0d4e8a17f35c6d2e9b0a4f8c1d7e3a5b9c2d6f0e4a8b1c5d9e3f7a2b6c";
+
+/// RSA key pairs (primary plus encryption subkey, as Proton issues) shaped like a current
+/// account: the user key is protected with the salted mailbox password from `KeySalts`,
+/// the address key with `ADDRESS_TOKEN`. Key generation is slow, so each key is made once
+/// per test binary.
 fn cached_key(id: &'static str) -> TestKey {
     static USER: OnceLock<TestKey> = OnceLock::new();
     static ADDRESS: OnceLock<TestKey> = OnceLock::new();
-    let slot = if id == "user-key" { &USER } else { &ADDRESS };
-    let key = slot.get_or_init(|| make_key(id));
+    let key = if id == "user-key" {
+        USER.get_or_init(|| {
+            let salted = srp::key_passphrase(KEY_PASSWORD, &KEY_SALT).expect("passphrase");
+            make_key(id, &salted)
+        })
+    } else {
+        ADDRESS.get_or_init(|| make_key(id, ADDRESS_TOKEN))
+    };
     TestKey {
         id: key.id.clone(),
+        passphrase: key.passphrase.clone(),
         secret: key.secret.clone(),
         armored_secret: key.armored_secret.clone(),
         armored_public: key.armored_public.clone(),
@@ -129,8 +143,8 @@ fn encrypt_split(public: &SignedPublicKey, plaintext: &[u8]) -> (Vec<u8>, Vec<u8
     (data, key_packets)
 }
 
-fn make_key(id: &str) -> TestKey {
-    let passphrase = srp::key_passphrase(KEY_PASSWORD, &KEY_SALT).expect("passphrase");
+fn make_key(id: &str, passphrase: &str) -> TestKey {
+    let passphrase = passphrase.to_string();
     let mut rng = rand::thread_rng();
     let mut subkey = pgp::composed::SubkeyParamsBuilder::default();
     subkey
@@ -147,7 +161,7 @@ fn make_key(id: &str) -> TestKey {
         .can_certify(true)
         .can_encrypt(EncryptionCaps::All)
         .can_authenticate(false)
-        .passphrase(Some(passphrase))
+        .passphrase(Some(passphrase.clone()))
         .primary_user_id(format!("Kite Test <{id}@proton.me>"))
         .subkey(subkey.build().expect("subkey"));
     let secret = builder
@@ -157,6 +171,7 @@ fn make_key(id: &str) -> TestKey {
         .expect("keygen");
     TestKey {
         id: id.to_string(),
+        passphrase,
         armored_secret: secret
             .to_armored_string(Default::default())
             .expect("armor secret"),
@@ -189,12 +204,11 @@ fn encrypt_to(key: &SignedPublicKey, plaintext: &str) -> String {
 
 /// Decrypts with a secret key directly, so the test does not depend on the backend's own
 /// crypto code being right.
-pub fn decrypt(key: &SignedSecretKey, armored: &str) -> Vec<u8> {
+pub fn decrypt(key: &TestKey, armored: &str) -> Vec<u8> {
     use std::io::Read as _;
-    let passphrase = srp::key_passphrase(KEY_PASSWORD, &KEY_SALT).expect("passphrase");
     let (message, _) = Message::from_string(armored).expect("armored message");
     let mut message = message
-        .decrypt(&Password::from(passphrase.as_str()), key)
+        .decrypt(&Password::from(key.passphrase.as_str()), &key.secret)
         .expect("decrypt");
     let mut out = Vec::new();
     message.read_to_end(&mut out).expect("plaintext");
@@ -202,12 +216,11 @@ pub fn decrypt(key: &SignedSecretKey, armored: &str) -> Vec<u8> {
 }
 
 /// Reads raw packets (`PKESK || SEIPD`) with a secret key.
-pub fn decrypt_packets(key: &SignedSecretKey, packets: &[u8]) -> Vec<u8> {
+pub fn decrypt_packets(key: &TestKey, packets: &[u8]) -> Vec<u8> {
     use std::io::Read as _;
-    let passphrase = srp::key_passphrase(KEY_PASSWORD, &KEY_SALT).expect("passphrase");
     let message = Message::from_bytes(packets).expect("packets");
     let mut message = message
-        .decrypt(&Password::from(passphrase.as_str()), key)
+        .decrypt(&Password::from(key.passphrase.as_str()), &key.secret)
         .expect("decrypt packets");
     let mut out = Vec::new();
     message.read_to_end(&mut out).expect("plaintext");
@@ -251,6 +264,8 @@ pub struct World {
     /// Require a human-verification token on the first sign-in attempt.
     pub human_verification: bool,
     pub hv_challenge: String,
+    /// The user solved the puzzle on verify.proton.me, which marks `hv_challenge` as verified.
+    pub hv_solved: bool,
     pub user_keys: Vec<TestKey>,
     pub address_keys: Vec<TestKey>,
     pub messages: Vec<FakeMessage>,
@@ -287,6 +302,7 @@ impl World {
             totp: None,
             human_verification: false,
             hv_challenge: "hv-challenge-token".into(),
+            hv_solved: false,
             user_keys: vec![cached_key("user-key")],
             address_keys: vec![cached_key("address-key")],
             messages: Vec::new(),
@@ -631,7 +647,8 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                     .get("x-pm-human-verification-token")
                     .cloned()
                     .unwrap_or_default();
-                if token != world.hv_challenge {
+                // Like Proton: the challenge token only passes once it was solved in a browser.
+                if token != world.hv_challenge || !world.hv_solved {
                     return (
                         422,
                         json!({
@@ -687,17 +704,28 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
         }
         ("GET", "/api/core/v4/addresses") => {
             let email = world.email.clone();
-            let keys: Vec<Value> = world.address_keys.iter().map(key_json).collect();
+            let user = &world.user_keys[0];
+            let keys: Vec<Value> = world
+                .address_keys
+                .iter()
+                .map(|key| address_key_json(key, user))
+                .collect();
             ok(
                 json!({ "Addresses": [{ "ID": "address-1", "Email": email, "Order": 1, "Keys": keys }] }),
             )
         }
+        // Like Proton: only user keys have a salt; token-unlocked address keys get `null`.
         ("GET", "/api/core/v4/keys/salts") => ok(json!({
             "KeySalts": world
                 .user_keys
                 .iter()
-                .chain(world.address_keys.iter())
                 .map(|key| json!({ "ID": key.id, "KeySalt": b64(&KEY_SALT) }))
+                .chain(
+                    world
+                        .address_keys
+                        .iter()
+                        .map(|key| json!({ "ID": key.id, "KeySalt": null })),
+                )
                 .collect::<Vec<_>>(),
         })),
         ("GET", "/api/core/v4/labels") => ok(json!({
@@ -966,6 +994,28 @@ fn key_json(key: &TestKey) -> Value {
         "Active": 1,
         "Flags": 3,
     })
+}
+
+/// An address key as current accounts have it: `Token` is its passphrase encrypted to the
+/// user key, and `Signature` the user key's detached signature over that passphrase.
+fn address_key_json(key: &TestKey, user: &TestKey) -> Value {
+    let signature = pgp::composed::DetachedSignature::sign_binary_data(
+        rand::thread_rng(),
+        &user.secret.primary_key,
+        &Password::from(user.passphrase.as_str()),
+        pgp::crypto::hash::HashAlgorithm::Sha256,
+        key.passphrase.as_bytes(),
+    )
+    .expect("sign token")
+    .to_armored_string(Default::default())
+    .expect("armor signature");
+    let mut json = key_json(key);
+    json["Token"] = json!(encrypt_to(
+        &public_key(&user.armored_public),
+        &key.passphrase
+    ));
+    json["Signature"] = json!(signature);
+    json
 }
 
 fn meta_json(message: &FakeMessage) -> Value {

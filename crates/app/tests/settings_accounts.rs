@@ -288,3 +288,45 @@ async fn a_native_proton_sign_in_takes_the_second_step_and_adds_the_account(
         "the 2FA code is answered on the same sign-in"
     );
 }
+
+#[gpui_kit::test]
+async fn human_verification_finishes_without_asking_for_a_token(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    *fixture.proton_step.lock().unwrap() = Some(ProtonAuth::HumanVerification {
+        url: "https://verify.proton.me/?methods=captcha&token=challenge".into(),
+    });
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
+        window.click("proton-address", cx);
+        window.input("kite@proton.me", cx);
+        window.click("proton-secret", cx);
+        window.input("my proton password", cx);
+        window.click("proton-sign-in", cx);
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("proton-verify").is_some()
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        // Proton's verify page hands no token to the user, so there is nothing to type.
+        assert!(window.try_find("proton-answer").is_none());
+        window.click("proton-step", cx);
+        window.render_frame(cx);
+        window.click(("settings-tab", 2usize), cx);
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("settings-account-3").is_some()
+    })
+    .await;
+    assert_eq!(
+        *fixture.proton_answers.lock().unwrap(),
+        vec![String::new()],
+        "the retry carries no typed answer; the engine reuses Proton's challenge"
+    );
+}

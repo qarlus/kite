@@ -9,7 +9,9 @@
 use std::io::Read as _;
 
 use anyhow::{Context, Result, anyhow, bail};
-use pgp::composed::{Deserializable, Message, MessageBuilder, SignedPublicKey, SignedSecretKey};
+use pgp::composed::{
+    Deserializable, DetachedSignature, Message, MessageBuilder, SignedPublicKey, SignedSecretKey,
+};
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
 use pgp::packet::{PacketTrait as _, PublicKeyEncryptedSessionKey};
@@ -144,6 +146,28 @@ impl Keyring {
     }
 }
 
+/// The passphrase of an address key on a current Proton account: its `Token` is encrypted
+/// to the user key and signed by it (`Key.getPassphraseFromToken` in go-proton-api).
+pub fn token_passphrase(user: &SecretKey, token: &str, signature: &str) -> Result<String> {
+    let (message, _) = Message::from_string(token).context("Proton address key token")?;
+    let plain = user
+        .decrypt_message(message)
+        .context("decrypt Proton address key token")?;
+    let (signature, _) =
+        DetachedSignature::from_string(signature).context("Proton address key token signature")?;
+    let public = user.key.to_public_key();
+    let signed = signature.verify(&public.primary_key, &plain).is_ok()
+        || public
+            .public_subkeys
+            .iter()
+            .any(|subkey| signature.verify(&subkey.key, &plain).is_ok());
+    anyhow::ensure!(
+        signed,
+        "Proton address key token is not signed by the user key"
+    );
+    String::from_utf8(plain).context("Proton address key token is not text")
+}
+
 /// A signed-and-encrypted body, split the way Proton's send route wants it.
 pub struct Package {
     /// Base64 of the encrypted data packet (the body Proton stores).
@@ -215,12 +239,18 @@ pub fn session_key_packet(public_key: &SignedPublicKey, session_key: &str) -> Re
     let mut rng = rand::thread_rng();
     let recipient = Recipient::of(public_key)?;
     let packet = match &recipient {
-        Recipient::Primary(key) => {
-            PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, &raw, SESSION_ALGORITHM, key)
-        }
-        Recipient::Subkey(key) => {
-            PublicKeyEncryptedSessionKey::from_session_key_v3(&mut rng, &raw, SESSION_ALGORITHM, key)
-        }
+        Recipient::Primary(key) => PublicKeyEncryptedSessionKey::from_session_key_v3(
+            &mut rng,
+            &raw,
+            SESSION_ALGORITHM,
+            key,
+        ),
+        Recipient::Subkey(key) => PublicKeyEncryptedSessionKey::from_session_key_v3(
+            &mut rng,
+            &raw,
+            SESSION_ALGORITHM,
+            key,
+        ),
     }
     .context("seal Proton session key")?;
     let mut out = Vec::new();

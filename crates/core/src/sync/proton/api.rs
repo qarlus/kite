@@ -86,6 +86,7 @@ impl Api {
             base: base.trim_end_matches('/').to_string(),
             app_version: app_version.to_string(),
             http: reqwest::Client::builder()
+                .user_agent(concat!("Kite/", env!("CARGO_PKG_VERSION")))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_else(|_| reqwest::Client::new()),
@@ -243,7 +244,13 @@ impl Api {
             ]
         };
         let value = self
-            .send(reqwest::Method::POST, "/auth/v4", Some(body), &headers, None)
+            .send(
+                reqwest::Method::POST,
+                "/auth/v4",
+                Some(body),
+                &headers,
+                None,
+            )
             .await?;
         serde_json::from_value(value).context("Proton auth response")
     }
@@ -264,13 +271,17 @@ impl Api {
     }
 
     pub async fn salts(&mut self) -> Result<Vec<Salt>> {
-        let value = self.call(reqwest::Method::GET, "/core/v4/keys/salts", None).await?;
+        let value = self
+            .call(reqwest::Method::GET, "/core/v4/keys/salts", None)
+            .await?;
         let list = value["KeySalts"].clone();
         serde_json::from_value(list).context("Proton key salts")
     }
 
     pub async fn user(&mut self) -> Result<User> {
-        let value = self.call(reqwest::Method::GET, "/core/v4/users", None).await?;
+        let value = self
+            .call(reqwest::Method::GET, "/core/v4/users", None)
+            .await?;
         serde_json::from_value(value["User"].clone()).context("Proton user")
     }
 
@@ -283,12 +294,7 @@ impl Api {
     }
 
     /// One page of message metadata, newest first (`Sort: ID`, `Desc: 1`).
-    pub async fn messages(
-        &mut self,
-        label: &str,
-        page: u32,
-        size: u32,
-    ) -> Result<Vec<Meta>> {
+    pub async fn messages(&mut self, label: &str, page: u32, size: u32) -> Result<Vec<Meta>> {
         let body = json!({
             "LabelID": label,
             "Page": page,
@@ -353,8 +359,7 @@ impl Api {
                     None,
                 )
                 .await?;
-            let event: Event =
-                serde_json::from_value(value.clone()).context("Proton event")?;
+            let event: Event = serde_json::from_value(value.clone()).context("Proton event")?;
             let more = value["More"].as_i64().unwrap_or(0) != 0;
             cursor = event.event_id.clone();
             out.push(event);
@@ -366,7 +371,8 @@ impl Api {
     }
 
     pub async fn label_messages(&mut self, ids: &[String], label: &str) -> Result<()> {
-        self.act_on_messages("/mail/v4/messages/label", ids, label).await
+        self.act_on_messages("/mail/v4/messages/label", ids, label)
+            .await
     }
 
     pub async fn unlabel_messages(&mut self, ids: &[String], label: &str) -> Result<()> {
@@ -393,8 +399,12 @@ impl Api {
 
     pub async fn delete_messages(&mut self, ids: &[String]) -> Result<()> {
         let body = json!({ "IDs": ids });
-        self.call(reqwest::Method::PUT, "/mail/v4/messages/delete", Some(&body))
-            .await?;
+        self.call(
+            reqwest::Method::PUT,
+            "/mail/v4/messages/delete",
+            Some(&body),
+        )
+        .await?;
         Ok(())
     }
 
@@ -466,7 +476,9 @@ fn urlencode(value: &str) -> String {
 }
 
 fn is_error_code(value: &Value) -> bool {
-    value["Code"].as_i64().is_some_and(|code| code != 1000 && code != 1001)
+    value["Code"]
+        .as_i64()
+        .is_some_and(|code| code != 1000 && code != 1001)
 }
 
 fn is_auth_expired(error: &anyhow::Error) -> bool {
@@ -545,8 +557,9 @@ impl Auth {
 pub struct Salt {
     #[serde(rename = "ID")]
     pub id: String,
+    /// `null` for keys that are not unlocked from the password (address keys with a token).
     #[serde(default)]
-    pub key_salt: String,
+    pub key_salt: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -581,6 +594,12 @@ pub struct Key {
     pub primary: bool,
     #[serde(default, deserialize_with = "flag_field")]
     pub active: bool,
+    /// Address keys on current accounts: their passphrase, encrypted to the user key.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// The user key's detached signature over the decrypted token.
+    #[serde(default)]
+    pub signature: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]

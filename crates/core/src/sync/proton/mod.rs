@@ -82,9 +82,7 @@ pub enum Step {
     Done,
     TwoFactor,
     MailboxPassword,
-    HumanVerification {
-        url: String,
-    },
+    HumanVerification { url: String },
 }
 
 /// A sign-in in progress: SRP proofs, then 2FA, then (in two-password mode) the
@@ -155,15 +153,16 @@ impl SignIn {
                 self.finish_with(auth, &answer).await
             }
             Pending::Srp => {
-                // A human-verification token: retry the same handshake with it.
-                anyhow::ensure!(!answer.is_empty(), "Paste the verification token.");
-                let mut challenge = self.challenge.clone().unwrap_or(api::Challenge {
-                    token: String::new(),
-                    methods: Vec::new(),
-                    web_url: String::new(),
-                });
-                challenge.token = answer;
-                self.challenge = Some(challenge);
+                // Human verification, as Bridge does it: solving the puzzle in the browser marks
+                // the 9001 challenge token as verified server-side, so the retry sends that same
+                // token back. The verify page never shows the user a token to paste.
+                let challenge = self
+                    .challenge
+                    .as_mut()
+                    .context("no Proton verification in progress")?;
+                if !answer.is_empty() {
+                    challenge.token = answer;
+                }
                 self.authenticate().await
             }
         }
@@ -257,14 +256,36 @@ impl SignIn {
         let user = self.api.user().await?;
         let addresses = self.api.addresses().await?;
         let salts = self.api.salts().await?;
+        // As Bridge does: one passphrase, salted with the primary user key's salt, unlocks
+        // the user keys; address keys either carry a token sealed to the user key (current
+        // accounts) or share that passphrase (older ones).
+        let primary = user
+            .keys
+            .iter()
+            .find(|key| key.primary)
+            .or_else(|| user.keys.first())
+            .context("this Proton account has no user key")?;
+        let salt = salts
+            .iter()
+            .find(|salt| salt.id == primary.id)
+            .and_then(|salt| salt.key_salt.as_deref())
+            .with_context(|| format!("Proton has no salt for user key {}", primary.id))?;
+        let salted = srp::key_passphrase(mailbox_password, &crypto::unb64(salt)?)?;
+        let user_key = crypto::SecretKey::parse(&primary.id, true, &primary.private_key, &salted)?;
+
         let mut passphrases = BTreeMap::new();
-        for key in user.keys.iter().chain(addresses.iter().flat_map(|a| a.keys.iter())) {
-            let salt = salts
-                .iter()
-                .find(|salt| salt.id == key.id)
-                .with_context(|| format!("Proton has no salt for key {}", key.id))?;
-            let salt = crypto::unb64(&salt.key_salt)?;
-            passphrases.insert(key.id.clone(), srp::key_passphrase(mailbox_password, &salt)?);
+        for key in &user.keys {
+            passphrases.insert(key.id.clone(), salted.clone());
+        }
+        for key in addresses.iter().flat_map(|a| a.keys.iter()) {
+            let passphrase = match (key.token.as_deref(), key.signature.as_deref()) {
+                (Some(token), Some(signature)) if !token.is_empty() && !signature.is_empty() => {
+                    crypto::token_passphrase(&user_key, token, signature)
+                        .with_context(|| format!("unlock Proton address key {}", key.id))?
+                }
+                _ => salted.clone(),
+            };
+            passphrases.insert(key.id.clone(), passphrase);
         }
         let email = if user.email.is_empty() {
             self.email.clone()
@@ -304,11 +325,7 @@ pub struct Proton {
 impl Proton {
     pub fn new(base_url: &str, app_version: &str, email: &str, credentials: &Credentials) -> Self {
         let mut api = Api::new(base_url, app_version);
-        api.session(
-            &credentials.uid,
-            &credentials.access,
-            &credentials.refresh,
-        );
+        api.session(&credentials.uid, &credentials.access, &credentials.refresh);
         Self {
             api,
             email: email.to_string(),
@@ -443,7 +460,11 @@ impl Proton {
                 Ok(Some(saved.meta.id))
             }
             Op::DeleteDraft { remote_id } => {
-                if let Err(error) = self.api.delete_messages(std::slice::from_ref(remote_id)).await {
+                if let Err(error) = self
+                    .api
+                    .delete_messages(std::slice::from_ref(remote_id))
+                    .await
+                {
                     // Already gone (a sent draft becomes the sent message): not a failure.
                     let missing = error
                         .downcast_ref::<api::ApiError>()
@@ -749,14 +770,10 @@ fn remote_msg(keys: &Keyring, meta: &api::Meta, message: &api::Message) -> Resul
         // Proton groups mail into conversations; the store prefers this over headers.
         thread_hint: (!meta.conversation_id.is_empty()).then(|| meta.conversation_id.clone()),
         message_id: parsed.as_ref().and_then(|p| p.message_id()).map(bare_id),
-        in_reply_to: parsed
-            .as_ref()
-            .and_then(|p| match p.in_reply_to() {
-                mail_parser::HeaderValue::Text(text) if !text.trim().is_empty() => {
-                    Some(bare_id(text))
-                }
-                _ => None,
-            }),
+        in_reply_to: parsed.as_ref().and_then(|p| match p.in_reply_to() {
+            mail_parser::HeaderValue::Text(text) if !text.trim().is_empty() => Some(bare_id(text)),
+            _ => None,
+        }),
         references: match parsed.as_ref().map(|p| p.references()) {
             Some(mail_parser::HeaderValue::TextList(list)) => {
                 list.iter().map(|id| bare_id(id)).collect()
@@ -856,11 +873,9 @@ fn mailbox_label(mailbox: Mailbox) -> Option<&'static str> {
         Mailbox::Archive => Some(ARCHIVE),
         Mailbox::Trash => Some(TRASH),
         Mailbox::Spam => Some(SPAM),
-        Mailbox::Sent
-        | Mailbox::Drafts
-        | Mailbox::Starred
-        | Mailbox::Snoozed
-        | Mailbox::All => None,
+        Mailbox::Sent | Mailbox::Drafts | Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => {
+            None
+        }
     }
 }
 
@@ -922,7 +937,9 @@ impl Outgoing {
 
 /// Splits an engine-built MIME message into the parts Proton needs.
 fn outgoing(mime: &[u8], account_email: &str) -> Result<Outgoing> {
-    let parsed = parser().parse(mime).context("unparseable outbound message")?;
+    let parsed = parser()
+        .parse(mime)
+        .context("unparseable outbound message")?;
     let from = parsed
         .from()
         .and_then(|list| addrs(list).into_iter().next())
@@ -967,7 +984,11 @@ fn name_addr(addr: &api::NameAddr) -> Addr {
 }
 
 fn non_empty(primary: Vec<Addr>, fallback: Vec<Addr>) -> Vec<Addr> {
-    if primary.is_empty() { fallback } else { primary }
+    if primary.is_empty() {
+        fallback
+    } else {
+        primary
+    }
 }
 
 /// A body, preferring the text part and falling back to a stripped HTML one, so a row
@@ -1046,9 +1067,9 @@ fn parser() -> &'static MessageParser {
 /// A Proton event id that the API no longer knows about: the account has to be walked
 /// again. Proton answers with a plain invalid-value code here.
 fn is_stale_event(error: &anyhow::Error) -> bool {
-    error.downcast_ref::<api::ApiError>().is_some_and(|e| {
-        e.code == api::CODE_INVALID_VALUE || e.status == 400 || e.status == 404
-    })
+    error
+        .downcast_ref::<api::ApiError>()
+        .is_some_and(|e| e.code == api::CODE_INVALID_VALUE || e.status == 400 || e.status == 404)
 }
 
 /// Opaque per-account sync state: the live-sync cursor plus how far the first walk got.
@@ -1068,4 +1089,3 @@ pub fn random_token(bytes: usize) -> String {
     let _ = getrandom::fill(&mut raw);
     raw.iter().map(|byte| format!("{byte:02x}")).collect()
 }
-

@@ -302,7 +302,9 @@ impl Kite {
             return;
         };
         let answer = page.connections.answer.read(cx).value().trim().to_string();
-        if answer.is_empty() {
+        // Verification has nothing to type: Proton already knows the puzzle was solved.
+        let verifying = matches!(page.connections.step, Step::HumanVerification(_));
+        if answer.is_empty() && !verifying {
             page.error = Some("Enter the answer Proton asked for.".into());
             cx.notify();
             return;
@@ -353,7 +355,8 @@ impl Kite {
                     }
                     Err(error) => {
                         if let Some(page) = &mut this.preferences {
-                            page.error = Some(error.to_string());
+                            // The whole chain: the outer context alone ("Proton key salts") hides the reason.
+                            page.error = Some(format!("{error:#}"));
                         }
                     }
                 }
@@ -649,16 +652,15 @@ fn proton_form(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
             let url = url.clone();
             form = form
                 .child(hint(
-                    "Proton needs to verify this is you. Open the page, solve the challenge, then paste the token it gives you.",
+                    "Proton wants to check you are human. Open the page, solve the puzzle until it says Verification completed, then come back here.",
                 ))
                 .child(
                     button("proton-verify", "Open verification page", t).on_click(
                         cx.listener(move |_, _, _, cx| cx.open_url(&url)),
                     ),
                 )
-                .child(answer())
                 .child(
-                    primary("proton-step", "Submit token", t).on_click(
+                    primary("proton-step", "I've completed the verification", t).on_click(
                         cx.listener(|this, _, _, cx| this.answer_proton_step(cx)),
                     ),
                 );
@@ -858,7 +860,7 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 .child(heading(
                     t,
                     "Connect an account",
-                    "Proton Bridge is found and connected for you. Outlook opens a secure sign-in.",
+                    "Sign in to Proton directly, or let Kite find Proton Bridge. Outlook opens a secure sign-in.",
                 ))
                 .child(card(t, connect)),
         )

@@ -26,9 +26,11 @@ const DEFAULT_GRAPH: &str = "https://graph.microsoft.com/v1.0";
 const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/common";
 /// Proton's API. The native backend talks to it directly, so free accounts work.
 const DEFAULT_PROTON_API: &str = "https://mail.proton.me/api";
-/// Kite's own client identifier. Proton's API takes the app version as free text and
-/// pretending to be Proton Bridge or one of Proton's apps would be impersonation.
-const PROTON_APP_VERSION: &str = "kite-mail@0.1.0";
+/// Proton's API only accepts `<platform>-<product>@<version>` for Proton's own products
+/// (`kite-mail@…` and `windows-kite@…` both fail with code 2064), so naming a product would
+/// mean impersonating Bridge or a Proton app. `Other` is the generic value third-party clients
+/// (hydroxide, ferroxide) send; Kite names itself honestly in the User-Agent instead.
+const PROTON_APP_VERSION: &str = "Other";
 /// Messages per transaction: a UI write never waits behind a long first sync (see ARCHITECTURE).
 const APPLY_CHUNK: usize = 200;
 /// Sync calls per account per tick, so one huge mailbox cannot monopolise the loop.

@@ -74,7 +74,10 @@ fn eventually<T>(mut step: impl FnMut() -> Option<T>) -> T {
         if let Some(value) = step() {
             return value;
         }
-        assert!(Instant::now() < deadline, "timed out waiting for the engine");
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the engine"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -98,9 +101,7 @@ fn sign_in(engine: &Engine, login: &fake::Login) -> Account {
                     .expect("mailbox password step");
             }
             ProtonAuth::HumanVerification { url } => {
-                assert!(url.starts_with("https://verify.proton.me/"), "{url}");
-                let token = login.hv_challenge.clone();
-                auth = engine.proton_sign_in_step(&token).expect("hv step");
+                panic!("verification is covered by its own test, got {url}")
             }
         }
     }
@@ -242,7 +243,7 @@ fn two_password_accounts_ask_for_the_mailbox_password() {
 }
 
 #[test]
-fn human_verification_returns_the_page_and_accepts_the_token() {
+fn human_verification_finishes_once_the_puzzle_is_solved_in_the_browser() {
     let rt = runtime();
     let mut world = World::new();
     world.human_verification = true;
@@ -258,13 +259,14 @@ fn human_verification_returns_the_page_and_accepts_the_token() {
         panic!("expected a verification challenge, got {step:?}");
     };
     assert!(url.contains("verify.proton.me"), "{url}");
+    // "I've completed the verification" before solving it: Proton still asks.
     let step = engine
-        .proton_sign_in_step("wrong-token")
-        .expect("wrong token is still a challenge");
+        .proton_sign_in_step("")
+        .expect("unsolved is still a challenge");
     assert!(matches!(step, ProtonAuth::HumanVerification { .. }));
-    let step = engine
-        .proton_sign_in_step(&login.hv_challenge)
-        .expect("token accepted");
+    // Solved on verify.proton.me: the same click now finishes, with nothing to paste.
+    server.world().hv_solved = true;
+    let step = engine.proton_sign_in_step("").expect("verified");
     assert!(matches!(step, ProtonAuth::Done(_)), "{step:?}");
 }
 
@@ -307,7 +309,10 @@ fn the_event_loop_applies_flag_changes_and_deletions() {
         (threads.len() == 1 && !threads[0].unread).then_some(threads)
     });
     assert_eq!(remaining[0].subject, "Keep me");
-    assert!(!remaining[0].unread, "the flag change must land in the store");
+    assert!(
+        !remaining[0].unread,
+        "the flag change must land in the store"
+    );
 }
 
 #[test]
@@ -328,10 +333,18 @@ fn archiving_relabels_the_message_on_the_server() {
     let labels = eventually(|| {
         engine.sync_now();
         let world = server.world();
-        let labels = world.messages.iter().find(|m| m.id == message)?.label_ids.clone();
+        let labels = world
+            .messages
+            .iter()
+            .find(|m| m.id == message)?
+            .label_ids
+            .clone();
         (label_ids_contain(&labels, "6") && !label_ids_contain(&labels, "0")).then_some(labels)
     });
-    assert!(label_ids_contain(&labels, "5"), "it stays in all mail: {labels:?}");
+    assert!(
+        label_ids_contain(&labels, "5"),
+        "it stays in all mail: {labels:?}"
+    );
     assert!(
         engine
             .threads(&inbox(account.id), 0, 5)
@@ -401,14 +414,22 @@ fn sending_encrypts_for_proton_recipients_and_sends_cleartext_outside() {
     // The body is a signed+encrypted data packet and the Proton recipient's key packet
     // unlocks it: rebuild the message the way the receiving client would.
     let body = fake::unb64(package["Body"].as_str().expect("body"));
-    let key_packet = fake::unb64(addresses["alice@proton.me"]["BodyKeyPacket"].as_str().expect("key packet"));
+    let key_packet = fake::unb64(
+        addresses["alice@proton.me"]["BodyKeyPacket"]
+            .as_str()
+            .expect("key packet"),
+    );
     let mut packets = key_packet;
     packets.extend(body);
     let world = server.world();
-    let plaintext = fake::decrypt_packets(&world.address_keys[0].secret, &packets);
+    let plaintext = fake::decrypt_packets(&world.address_keys[0], &packets);
     assert_eq!(String::from_utf8_lossy(&plaintext), "Plain text body");
     // The clear-scheme recipient needs the session key in the clear.
-    assert!(package["BodyKey"]["Key"].as_str().is_some_and(|k| !k.is_empty()));
+    assert!(
+        package["BodyKey"]["Key"]
+            .as_str()
+            .is_some_and(|k| !k.is_empty())
+    );
     assert_eq!(package["BodyKey"]["Algorithm"].as_str(), Some("aes256"));
 }
 
@@ -445,7 +466,7 @@ fn a_draft_is_saved_and_discarded_on_the_server() {
     let body = saved["Message"]["Body"].as_str().expect("encrypted body");
     let plaintext = {
         let world = server.world();
-        fake::decrypt(&world.address_keys[0].secret, body)
+        fake::decrypt(&world.address_keys[0], body)
     };
     assert_eq!(String::from_utf8_lossy(&plaintext), "Draft body");
 
@@ -509,7 +530,10 @@ fn a_created_folder_is_a_proton_label() {
     let folder = engine.create_folder(account.id, "Travel").expect("folder");
     assert_eq!(folder.name, "Travel");
     assert_eq!(folder.id, "label-1");
-    assert_eq!(server.world().labels, vec![("label-1".into(), "Travel".into())]);
+    assert_eq!(
+        server.world().labels,
+        vec![("label-1".into(), "Travel".into())]
+    );
     assert_eq!(engine.folders().expect("folders").len(), 1);
 }
 
@@ -539,7 +563,9 @@ fn drafts_and_sent_mail_land_in_their_mailboxes() {
 
     let sent_threads = eventually(|| {
         engine.sync_now();
-        let threads = engine.threads(&mailbox(account.id, Mailbox::Sent), 0, 10).ok()?;
+        let threads = engine
+            .threads(&mailbox(account.id, Mailbox::Sent), 0, 10)
+            .ok()?;
         (!threads.is_empty()).then_some(threads)
     });
     assert_eq!(sent_threads[0].subject, "Already sent");
@@ -558,12 +584,7 @@ fn drafts_and_sent_mail_land_in_their_mailboxes() {
 fn star_and_read_state_round_trip_through_the_api() {
     let rt = runtime();
     let mut world = World::new();
-    let message = world.add_message(
-        "Star me",
-        ("Alice", "alice@proton.me"),
-        "one",
-        &["0", "5"],
-    );
+    let message = world.add_message("Star me", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
     let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
     let thread = engine.threads(&inbox(account.id), 0, 5).expect("threads")[0].id;
 
@@ -571,7 +592,12 @@ fn star_and_read_state_round_trip_through_the_api() {
     eventually(|| {
         engine.sync_now();
         let world = server.world();
-        let labels = world.messages.iter().find(|m| m.id == message)?.label_ids.clone();
+        let labels = world
+            .messages
+            .iter()
+            .find(|m| m.id == message)?
+            .label_ids
+            .clone();
         label_ids_contain(&labels, "10").then_some(())
     });
 
@@ -579,7 +605,11 @@ fn star_and_read_state_round_trip_through_the_api() {
     eventually(|| {
         engine.sync_now();
         let world = server.world();
-        world.read_requests.iter().any(|id| id == &message).then_some(())
+        world
+            .read_requests
+            .iter()
+            .any(|id| id == &message)
+            .then_some(())
     });
     let starred = engine
         .threads(&mailbox(account.id, Mailbox::Starred), 0, 5)
@@ -603,7 +633,12 @@ fn an_attachment_is_decrypted_through_the_backend() {
     let server = rt.block_on(fake::serve(world));
     let login = server.login();
     rt.block_on(async {
-        let mut sign_in = SignIn::new(&server.url, "kite-test@0.1.0", &login.email, &login.password);
+        let mut sign_in = SignIn::new(
+            &server.url,
+            "kite-test@0.1.0",
+            &login.email,
+            &login.password,
+        );
         assert!(matches!(sign_in.start().await.expect("start"), Step::Done));
         let signed = sign_in.take().expect("session");
         let mut client = Proton::new(
