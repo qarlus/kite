@@ -650,8 +650,6 @@ pub struct Meta {
     pub id: String,
     #[serde(rename = "LabelIDs", default)]
     pub label_ids: Vec<String>,
-    #[serde(rename = "ConversationID", default)]
-    pub conversation_id: String,
     #[serde(default)]
     pub subject: String,
     #[serde(default)]

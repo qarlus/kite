@@ -234,7 +234,7 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     let t = &s.threads(&view(Mailbox::Inbox), 0, 50).unwrap()[0];
     assert!(t.unread && t.starred);
 
-    // A Graph thread hint wins over the header union.
+    // A provider hint cannot group unrelated Proton messages.
     let mut g1 = msg("g1", "carol@c.com", "Odd one", D0 + 10);
     g1.thread_hint = Some("conv-9".into());
     let mut g2 = msg("g2", "dave@d.com", "Totally unrelated", D0 + 20);
@@ -243,20 +243,10 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
     assert_eq!(
         inbox.len(),
-        2,
-        "hint groups the two, the rest stay separate"
+        3,
+        "a shared hint does not establish a reply chain"
     );
-    let hinted = inbox
-        .iter()
-        .find(|t| t.participants == "carol, dave")
-        .expect("hinted thread");
-    let subjects: Vec<String> = s
-        .thread(hinted.id)
-        .unwrap()
-        .into_iter()
-        .map(|m| m.subject)
-        .collect();
-    assert_eq!(subjects, vec!["Odd one", "Totally unrelated"]);
+    assert!(inbox.iter().filter(|t| t.id != tid).all(|t| t.count == 1));
 
     // Deleting messages shrinks the thread, then removes it.
     s.apply_deltas(
@@ -2502,5 +2492,205 @@ fn old_grouped_provider_drafts_are_separated_without_losing_sent_mail() {
     s.undo(token).unwrap();
     assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().len(), 2);
     drop(s);
+    cleanup(&path);
+}
+
+#[test]
+fn repeated_subjects_stay_separate_and_only_header_links_join_in_date_order() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let first = in_mailbox(msg("first", "me@x.com", "test", D0), Mailbox::Sent);
+    let second = in_mailbox(msg("second", "me@x.com", "test", D0 + 10), Mailbox::Sent);
+    s.apply_deltas(account.id, &[up(first), up(second)])
+        .unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "independent sends with identical participants and subject stay separate"
+    );
+    assert_eq!(
+        rows.iter().map(|r| (r.date, r.count)).collect::<Vec<_>>(),
+        vec![(D0 + 10, 1), (D0, 1)]
+    );
+    let original = rows[1].id;
+    let mut reply = in_mailbox(msg("reply", "me@x.com", "Re: test", D0 + 20), Mailbox::Sent);
+    reply.in_reply_to = Some("<first@x>".into());
+    s.apply_deltas(account.id, &[up(reply)]).unwrap();
+    let mut forward = in_mailbox(
+        msg("forward", "me@x.com", "Different subject", D0 + 30),
+        Mailbox::Sent,
+    );
+    forward.references = vec!["<first@x>".into()];
+    s.apply_deltas(account.id, &[up(forward)]).unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].id, rows[0].date, rows[0].count),
+        (original, D0 + 30, 3)
+    );
+    assert_eq!(
+        s.thread(original)
+            .unwrap()
+            .iter()
+            .map(|m| m.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["test", "Re: test", "Different subject"]
+    );
+}
+
+#[test]
+fn late_parents_and_headers_added_on_resync_unite_their_replies() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let child = replying_to(msg("child", "a@x.com", "reply", D0 + 1), "parent");
+    let parent = msg("parent", "b@x.com", "root", D0);
+    s.apply_deltas(account.id, &[up(child), up(parent)])
+        .unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap()[0].count, 2);
+    let unlinked = msg("later", "c@x.com", "unlinked", D0 + 2);
+    s.apply_deltas(account.id, &[up(unlinked.clone())]).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap().len(), 2);
+    let mut linked = unlinked;
+    linked.references = vec!["<parent@x>".into()];
+    s.apply_deltas(account.id, &[up(linked)]).unwrap();
+    let rows = s.threads(&view(Mailbox::Inbox), 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 3);
+}
+
+#[test]
+fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
+    let path = temp_db("header-threading");
+    let s = Store::open(&path).unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    for (i, name) in ["first", "second", "third", "fourth"].iter().enumerate() {
+        let mut message = in_mailbox(
+            body(
+                msg(name, "me@x.com", "test", D0 + i as i64),
+                "retained body",
+            ),
+            Mailbox::Sent,
+        );
+        message.thread_hint = Some("loose-proton-conversation".into());
+        s.apply_deltas(account.id, &[up(with_attachment(message, "kept.pdf"))])
+            .unwrap();
+    }
+    let reply = replying_to(
+        in_mailbox(msg("reply", "me@x.com", "Re: test", D0 + 10), Mailbox::Sent),
+        "first",
+    );
+    let mut reference = in_mailbox(
+        msg("reference", "me@x.com", "Fwd: test", D0 + 11),
+        Mailbox::Sent,
+    );
+    reference.references = vec!["<first@x>".into()];
+    s.apply_deltas(account.id, &[up(reply), up(reference)])
+        .unwrap();
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("UPDATE messages SET thread_id=(SELECT thread_id FROM messages WHERE remote_id='first');
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages);
+        DELETE FROM thread_keys;
+        INSERT INTO thread_keys SELECT account_id,'h:loose-proton-conversation',thread_id FROM messages LIMIT 1;").unwrap();
+    drop(connection);
+    // Keep schema v7 while setting up the old merged conversation's local actions,
+    // then mark the completed fixture v6 before the migration under test.
+    let s = Store::open(&path).unwrap();
+    let thread = s.threads(&view(Mailbox::Sent), 0, 10).unwrap()[0].id;
+    let label = s
+        .act(
+            &[thread],
+            &Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
+        .unwrap();
+    let star = s.act(&[thread], &Action::Star).unwrap();
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA user_version=6;").unwrap();
+    let message_ids: Vec<Id> = connection
+        .prepare("SELECT id FROM messages ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(connection);
+    let s = Store::open(&path).unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "four independent sends, with genuine replies retained"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.date).collect::<Vec<_>>(),
+        vec![D0 + 11, D0 + 3, D0 + 2, D0 + 1]
+    );
+    assert_eq!(rows[0].count, 3);
+    assert!(rows.iter().all(|r| r.starred && r.labels == vec!["Urgent"]));
+    let mut retained: Vec<Id> = rows
+        .iter()
+        .flat_map(|r| s.thread(r.id).unwrap())
+        .map(|m| m.id)
+        .collect();
+    retained.sort_unstable();
+    assert_eq!(retained, message_ids);
+    assert_eq!(
+        s.threads(&search(Mailbox::Sent, "retained"), 0, 10)
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        rows.iter()
+            .flat_map(|r| s.thread(r.id).unwrap())
+            .map(|m| m.attachments.len())
+            .sum::<usize>(),
+        4
+    );
+    s.undo(star).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .all(|r| !r.starred)
+    );
+    s.undo(label).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .all(|r| r.labels.is_empty())
+    );
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    assert!(
+        !connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+    drop(connection);
     cleanup(&path);
 }

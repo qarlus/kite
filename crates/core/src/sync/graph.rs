@@ -383,6 +383,35 @@ fn delta_for(
         Some(html) => html_to_text(html),
         None => item["bodyPreview"].as_str().unwrap_or_default().to_string(),
     };
+    let headers = &item["internetMessageHeaders"];
+    let header = |name: &str| {
+        headers
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|h| {
+                h["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(name))
+            })
+            .filter_map(|h| h["value"].as_str())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    };
+    let raw = format!(
+        "In-Reply-To: {}\r\nReferences: {}\r\nMessage-ID: {}\r\n\r\n",
+        header("In-Reply-To"),
+        header("References"),
+        header("Message-ID")
+    );
+    let parsed = mail_parser::MessageParser::default().parse(raw.as_bytes());
+    let ids = |value: &mail_parser::HeaderValue<'_>| match value {
+        mail_parser::HeaderValue::Text(value) => vec![value.to_string()],
+        mail_parser::HeaderValue::TextList(values) => {
+            values.iter().map(ToString::to_string).collect()
+        }
+        _ => Vec::new(),
+    };
     Some(Delta::Upsert(Box::new(RemoteMsg {
         remote_id: id.to_string(),
         folder: item["parentFolderId"]
@@ -390,11 +419,21 @@ fn delta_for(
             .unwrap_or(folder)
             .to_string(),
         mailbox,
-        thread_hint: item["conversationId"].as_str().map(str::to_owned),
-        message_id: item["internetMessageId"].as_str().map(str::to_owned),
-        // conversationId already threads Graph mail; header parsing is not worth a round trip.
-        in_reply_to: None,
-        references: Vec::new(),
+        // Missing full headers means we cannot distinguish a root from a reply yet.
+        thread_hint: (!headers.is_array())
+            .then(|| item["conversationId"].as_str().map(str::to_owned))
+            .flatten(),
+        message_id: item["internetMessageId"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| parsed.as_ref()?.message_id().map(str::to_owned)),
+        in_reply_to: parsed
+            .as_ref()
+            .and_then(|p| ids(p.in_reply_to()).into_iter().next()),
+        references: parsed
+            .as_ref()
+            .map(|p| ids(p.references()))
+            .unwrap_or_default(),
         from: addr(&item["from"]["emailAddress"]),
         to: addrs(&item["toRecipients"]),
         cc: addrs(&item["ccRecipients"]),

@@ -31,7 +31,8 @@ pub struct RemoteMsg {
     /// Remote folder id/path the message lives in.
     pub folder: String,
     pub mailbox: Mailbox,
-    /// Provider thread id if any (Graph conversationId). The store threads by headers otherwise.
+    /// Graph conversationId fallback only when full threading headers are unavailable.
+    /// Other backends leave this empty; header links always take precedence.
     pub thread_hint: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,

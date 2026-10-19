@@ -878,3 +878,76 @@ fn external_sending_uses_protons_clock_even_when_the_computer_is_ahead() {
     );
     assert_eq!(server.world().sends.len(), 1);
 }
+
+#[test]
+fn independent_sends_in_one_proton_conversation_stay_separate_but_composed_replies_join() {
+    let rt = runtime();
+    let (engine, server, account) = signed_in_with_mail(&rt, World::new(), 0);
+    server.world().pause_events = true;
+    let mut settings = engine.settings().expect("settings");
+    settings.undo_send_secs = 0;
+    engine.set_settings(settings).expect("settings");
+    let draft = Draft {
+        account_id: account.id,
+        to: vec![Addr {
+            name: "Alice".into(),
+            email: "alice@proton.me".into(),
+        }],
+        subject: "test".into(),
+        body: "Independent send".into(),
+        ..Default::default()
+    };
+    let sent = mailbox(account.id, Mailbox::Sent);
+    for expected in 1..=2 {
+        engine.send(draft.clone()).expect("send to local fake");
+        eventually(|| {
+            let rows = engine.threads(&sent, 0, 10).ok()?;
+            (rows.len() == expected).then_some(())
+        });
+    }
+    {
+        let world = server.world();
+        assert_eq!(world.messages.len(), 2);
+        assert_eq!(
+            world.messages[0].conversation_id, world.messages[1].conversation_id,
+            "the fake must reproduce Proton's loose subject grouping"
+        );
+    }
+    let rows = engine
+        .threads(&sent, 0, 10)
+        .expect("independent sent threads");
+    assert!(rows.iter().all(|r| r.count == 1));
+    let original = rows[0].id;
+    let parent = engine.thread(original).expect("original message")[0].id;
+    for (subject, count) in [("Re: test", 2), ("Fwd: test", 3)] {
+        let mut reply = draft.clone();
+        reply.subject = subject.into();
+        reply.reply_to = Some(parent);
+        reply.body = subject.into();
+        engine.send(reply).expect("linked send to local fake");
+        eventually(|| {
+            let rows = engine.threads(&sent, 0, 10).ok()?;
+            (rows.len() == 2 && rows.iter().any(|r| r.id == original && r.count == count))
+                .then_some(())
+        });
+    }
+    // Require an actual event sync before asserting that provider headers keep the same chain.
+    {
+        let mut world = server.world();
+        world.pause_events = false;
+        world.add_message(
+            "Sync barrier",
+            ("Alice", "alice@proton.me"),
+            "arrived",
+            &["0", "5"],
+        );
+    }
+    engine.sync_now();
+    eventually(|| (!engine.threads(&inbox(account.id), 0, 10).ok()?.is_empty()).then_some(()));
+    let rows = engine
+        .threads(&sent, 0, 10)
+        .expect("synced sent conversations");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(engine.thread(original).expect("retained chain").len(), 3);
+    assert_eq!(server.world().sends.len(), 4);
+}

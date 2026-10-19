@@ -326,9 +326,105 @@ impl Store {
             tx.execute_batch("PRAGMA user_version=6")?;
             tx.commit()?;
         }
+        if version < 7 {
+            let tx = conn.unchecked_transaction()?;
+            rethread_messages(&tx, None)?;
+            tx.execute_batch("DROP INDEX IF EXISTS messages_subject; PRAGMA user_version=7")?;
+            tx.commit()?;
+        }
         migrate_split_defaults(&conn)?;
         Ok(Store { conn })
     }
+}
+
+/// Rebuild v6's loose conversations atomically without rewriting message IDs, bodies,
+/// attachments, pending operations or outbox reply targets. Split conversations inherit
+/// their local tags and reminders; message-specific undo follows the individual message.
+fn rethread_messages(tx: &Transaction, only_thread: Option<Id>) -> Result<()> {
+    tx.execute(
+        "CREATE TEMP TABLE rethread_map AS SELECT id AS message_id, thread_id AS old_thread
+        FROM messages WHERE ?1 IS NULL OR thread_id=?1",
+        [only_thread],
+    )?;
+    tx.execute_batch(
+        "DELETE FROM thread_keys WHERE thread_id IN (SELECT old_thread FROM rethread_map)",
+    )?;
+    let rows = {
+        let mut statement = tx.prepare("SELECT id, account_id, thread_id, mailbox, message_id, in_reply_to, refs,
+            CASE WHEN (SELECT provider FROM accounts WHERE id=account_id)='microsoft' THEN thread_hint END
+            FROM messages WHERE id IN (SELECT message_id FROM rethread_map) ORDER BY id")?;
+        statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Id>(0)?,
+                    r.get::<_, Id>(1)?,
+                    r.get::<_, Id>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (message, account, old, _, _, _, _, _) in &rows {
+        let thread = new_thread(tx, *account)?;
+        tx.execute(
+            "UPDATE messages SET thread_id=?1 WHERE id=?2",
+            params![thread, message],
+        )?;
+        tx.execute("INSERT INTO thread_tags(thread_id,tag_id) SELECT ?1,tag_id FROM thread_tags WHERE thread_id=?2", params![thread, old])?;
+        tx.execute(
+            "UPDATE threads SET
+            snoozed_until=(SELECT snoozed_until FROM threads WHERE id=?2),
+            remind_after=(SELECT remind_after FROM threads WHERE id=?2) WHERE id=?1",
+            params![thread, old],
+        )?;
+    }
+    for (message, account, _, mailbox, message_id, in_reply_to, refs, hint) in rows {
+        let references: Vec<String> = serde_json::from_str(&refs)?;
+        let keys = msg_keys(message_id.as_deref(), in_reply_to.as_deref(), &references);
+        resolve_thread(
+            tx,
+            account,
+            mb_parse(&mailbox),
+            &keys,
+            hint.as_deref(),
+            Some(thread_id_of(tx, message)?),
+        )?;
+    }
+    tx.execute_batch("CREATE TEMP TABLE rethread_undo AS
+        SELECT u.token,u.account_id,m.thread_id,u.message_id,u.mailbox,u.unread,u.starred,u.folder,
+            u.snoozed_until,u.remind_after,u.op_id,u.inverse,u.tag_id
+        FROM undo_log u JOIN rethread_map r ON r.message_id=u.message_id JOIN messages m ON m.id=r.message_id
+        WHERE u.message_id IS NOT NULL
+        UNION ALL
+        SELECT DISTINCT u.token,u.account_id,m.thread_id,u.message_id,u.mailbox,u.unread,u.starred,u.folder,
+            u.snoozed_until,u.remind_after,u.op_id,u.inverse,u.tag_id
+        FROM undo_log u JOIN rethread_map r ON r.old_thread=u.thread_id JOIN messages m ON m.id=r.message_id
+        WHERE u.message_id IS NULL
+        UNION ALL SELECT u.* FROM undo_log u
+        WHERE NOT EXISTS (SELECT 1 FROM rethread_map r WHERE r.old_thread=u.thread_id);
+        DELETE FROM undo_log;
+        INSERT INTO undo_log SELECT * FROM rethread_undo;
+        UPDATE drafts SET thread_id=COALESCE((SELECT m.thread_id FROM messages m
+            WHERE m.account_id=drafts.account_id AND (m.remote_id='kite-draft:'||drafts.id OR m.remote_id=drafts.remote_id)), thread_id);
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages);
+        DROP TABLE rethread_undo;")?;
+    let threads = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT m.thread_id FROM messages m JOIN rethread_map r ON r.message_id=m.id",
+        )?;
+        statement
+            .query_map([], |r| r.get::<_, Id>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for thread in threads {
+        refresh_thread(tx, thread)?;
+    }
+    tx.execute_batch("DROP TABLE rethread_map")?;
+    Ok(())
 }
 
 /// Databases created before the split redesign hold the two legacy seeds (`Important`/`Other`).
@@ -503,7 +599,7 @@ impl Store {
 // -------------------------------------------------------------------- deltas
 
 impl Store {
-    /// Applies one sync batch in a single transaction. Batches are ≤ 200 messages (see ARCHITECTURE).
+    /// Applies one sync batch in a single transaction. Batches are Ã¢â€°Â¤ 200 messages (see ARCHITECTURE).
     pub fn apply_deltas(&self, account_id: Id, deltas: &[Delta]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let account_email: String = tx
@@ -626,6 +722,12 @@ fn upsert_message(
     let existing = find_message(tx, account_id, &m.remote_id)?.map(|(id, _)| id);
     let mid = match existing {
         Some(id) => {
+            let had_fallback: bool = tx.query_row(
+                "SELECT m.thread_hint IS NOT NULL AND a.provider='microsoft'
+                FROM messages m JOIN accounts a ON a.id=m.account_id WHERE m.id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
             // While a local change is queued, keep the local placement and flags (?22 = pending).
             tx.execute(
                 "UPDATE messages SET
@@ -641,10 +743,38 @@ fn upsert_message(
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?,
                         m.list_unsubscribe],
             )?;
-            return thread_id_of(tx, id);
+            if had_fallback && m.thread_hint.is_none() {
+                // Full Graph headers arrived after a fallback: rebuild that conversation so
+                // independent roots can separate as well as genuine replies unite.
+                rethread_messages(tx, Some(thread_id_of(tx, id)?))?;
+                return thread_id_of(tx, id);
+            }
+            return resolve_thread(
+                tx,
+                account_id,
+                m.mailbox,
+                &msg_keys(
+                    m.message_id.as_deref(),
+                    m.in_reply_to.as_deref(),
+                    &m.references,
+                ),
+                m.thread_hint.as_deref(),
+                Some(thread_id_of(tx, id)?),
+            );
         }
         None => {
-            let thread_id = resolve_thread(tx, account_id, m, &ns)?;
+            let thread_id = resolve_thread(
+                tx,
+                account_id,
+                m.mailbox,
+                &msg_keys(
+                    m.message_id.as_deref(),
+                    m.in_reply_to.as_deref(),
+                    &m.references,
+                ),
+                m.thread_hint.as_deref(),
+                None,
+            )?;
             tx.execute(
                 "INSERT INTO messages(account_id, thread_id, remote_id, folder, mailbox, thread_hint,
                    message_id, in_reply_to, refs, from_name, from_email, to_json, cc_json, date, subject,
@@ -704,27 +834,44 @@ fn thread_id_of(tx: &Transaction, message_id: Id) -> Result<Id> {
     )?)
 }
 
-/// Graph's `conversationId` wins; otherwise the Message-ID/In-Reply-To/References union; otherwise
-/// normalized subject + overlapping participants within 30 days.
-fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Id> {
-    // Drafts are individual editable messages, even when the provider gives them the
-    // same conversation or References chain as an already sent message.
-    if m.mailbox == Mailbox::Drafts {
-        return new_thread(tx, account_id);
+/// Header identity and References/In-Reply-To form an account-scoped union. Provider
+/// hints are a fallback only for Graph messages whose full headers were unavailable.
+fn resolve_thread(
+    tx: &Transaction,
+    account_id: Id,
+    mailbox: Mailbox,
+    keys: &[String],
+    hint: Option<&str>,
+    existing: Option<Id>,
+) -> Result<Id> {
+    // Drafts remain individual editable messages, including replies to sent mail.
+    if mailbox == Mailbox::Drafts {
+        return match existing {
+            Some(id) => Ok(id),
+            None => new_thread(tx, account_id),
+        };
     }
-    let hint = m.thread_hint.as_deref().filter(|s| !s.is_empty());
-    if let Some(h) = hint {
-        let known = key_thread(tx, account_id, &format!("h:{h}"))?;
-        if let Some(t) = known {
-            return Ok(t);
+    let mut cands: Vec<Id> = existing.into_iter().collect();
+    for key in keys {
+        if let Some(thread) = key_thread(tx, account_id, key)? {
+            cands.push(thread);
         }
     }
-    let keys = msg_keys(m);
-    let mut cands: Vec<Id> = Vec::new();
-    for k in &keys {
-        if let Some(t) = key_thread(tx, account_id, k)? {
-            cands.push(t);
-        }
+    let hint_key = if hint.is_some()
+        && tx.query_row(
+            "SELECT provider='microsoft' FROM accounts WHERE id=?1",
+            [account_id],
+            |r| r.get::<_, bool>(0),
+        )? {
+        hint.filter(|h| !h.is_empty()).map(|h| format!("h:{h}"))
+    } else {
+        None
+    };
+    if let Some(key) = &hint_key
+        && cands.len() == usize::from(existing.is_some())
+        && let Some(thread) = key_thread(tx, account_id, key)?
+    {
+        cands.push(thread);
     }
     cands.sort_unstable();
     cands.dedup();
@@ -735,19 +882,12 @@ fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
             }
             canon
         }
-        None => match subject_thread(tx, account_id, m, ns)? {
-            Some(t) => t,
-            None => new_thread(tx, account_id)?,
-        },
+        None => new_thread(tx, account_id)?,
     };
-    let mut keys = keys;
-    if let Some(h) = hint {
-        keys.push(format!("h:{h}"));
-    }
-    for k in &keys {
+    for key in keys.iter().chain(hint_key.iter()) {
         tx.execute(
             "INSERT OR IGNORE INTO thread_keys(account_id, key, thread_id) VALUES (?1,?2,?3)",
-            params![account_id, k, tid],
+            params![account_id, key, tid],
         )?;
     }
     Ok(tid)
@@ -761,39 +901,6 @@ fn new_thread(tx: &Transaction, account_id: Id) -> Result<Id> {
         [account_id],
     )?;
     Ok(tx.last_insert_rowid())
-}
-
-fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Option<Id>> {
-    let mut emails: Vec<String> = Vec::new();
-    for a in std::iter::once(&m.from)
-        .chain(m.to.iter())
-        .chain(m.cc.iter())
-    {
-        let e = a.email.trim().to_ascii_lowercase();
-        if !e.is_empty() && !emails.contains(&e) {
-            emails.push(e);
-        }
-    }
-    if ns.is_empty() || emails.is_empty() {
-        return Ok(None);
-    }
-    let holes = vec!["?"; emails.len()].join(",");
-    let sql = format!(
-        "SELECT m.thread_id FROM messages m
-         WHERE m.account_id=?1 AND m.mailbox!='drafts' AND m.norm_subject=?2 AND m.date BETWEEN ?3 AND ?4
-           AND EXISTS (SELECT 1 FROM message_people p WHERE p.message_id=m.id AND p.email IN ({holes}))
-         ORDER BY m.date DESC LIMIT 1"
-    );
-    let mut ps: Vec<Value> = vec![
-        Value::Integer(account_id),
-        Value::Text(ns.to_string()),
-        Value::Integer(m.date - 30 * 86_400_000),
-        Value::Integer(m.date + 30 * 86_400_000),
-    ];
-    ps.extend(emails.into_iter().map(Value::Text));
-    Ok(tx
-        .query_row(&sql, params_from_iter(ps), |r| r.get(0))
-        .optional()?)
 }
 
 fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
@@ -817,6 +924,17 @@ fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
             "UPDATE undo_log SET thread_id=?1 WHERE thread_id=?2",
             params![canon, other],
         )?;
+        tx.execute(
+            "UPDATE drafts SET thread_id=?1 WHERE thread_id=?2",
+            params![canon, other],
+        )?;
+        tx.execute(
+            "UPDATE threads SET
+            snoozed_until=(SELECT MAX(snoozed_until) FROM threads WHERE id IN (?1,?2)),
+            remind_after=(SELECT MAX(remind_after) FROM threads WHERE id IN (?1,?2))
+            WHERE id=?1",
+            params![canon, other],
+        )?;
         tx.execute("DELETE FROM threads WHERE id=?1", [other])?;
         refresh_labels(tx, canon)?;
     }
@@ -833,11 +951,15 @@ fn key_thread(tx: &Transaction, account_id: Id, key: &str) -> Result<Option<Id>>
         .optional()?)
 }
 
-fn msg_keys(m: &RemoteMsg) -> Vec<String> {
+fn msg_keys(
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: &[String],
+) -> Vec<String> {
     let mut raw: Vec<&str> = Vec::new();
-    raw.extend(m.message_id.as_deref());
-    raw.extend(m.in_reply_to.as_deref());
-    raw.extend(m.references.iter().map(String::as_str));
+    raw.extend(message_id);
+    raw.extend(in_reply_to);
+    raw.extend(references.iter().map(String::as_str));
     let mut out: Vec<String> = raw
         .into_iter()
         .filter_map(|x| {
@@ -934,7 +1056,10 @@ fn refresh_thread(tx: &Transaction, thread_id: Id) -> Result<()> {
         }
     }
     let participants = if names.len() > 4 {
-        format!("{}, {}, {}, {}…", names[0], names[1], names[2], names[3])
+        format!(
+            "{}, {}, {}, {}Ã¢â‚¬Â¦",
+            names[0], names[1], names[2], names[3]
+        )
     } else {
         names.join(", ")
     };
@@ -2010,7 +2135,10 @@ fn draft_participants(draft: &Draft) -> String {
         }
     }
     if names.len() > 4 {
-        format!("{}, {}, {}, {}…", names[0], names[1], names[2], names[3])
+        format!(
+            "{}, {}, {}, {}Ã¢â‚¬Â¦",
+            names[0], names[1], names[2], names[3]
+        )
     } else {
         names.join(", ")
     }

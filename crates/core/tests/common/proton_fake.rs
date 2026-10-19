@@ -834,7 +834,18 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                     .messages
                     .iter()
                     .rev()
-                    .filter(|message| message.label_ids.iter().any(|id| id == label))
+                    .filter(|message| {
+                        label.is_empty() || message.label_ids.iter().any(|id| id == label)
+                    })
+                    .filter(|message| {
+                        body["ExternalID"].as_str().is_none_or(|external| {
+                            mail_parser::MessageParser::default()
+                                .parse(message.header.as_bytes())
+                                .and_then(|parsed| parsed.message_id().map(str::to_owned))
+                                .as_deref()
+                                == Some(external)
+                        })
+                    })
                     .skip(page * size)
                     .take(size)
                     .map(meta_json)
@@ -844,9 +855,51 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
             let body = request.json();
             world.drafts.push(body.clone());
             let id = format!("draft-{}", world.drafts.len());
+            let subject = body["Message"]["Subject"].as_str().unwrap_or_default();
+            let parent = world
+                .messages
+                .iter()
+                .find(|m| Some(m.id.as_str()) == body["ParentID"].as_str());
+            let reply_headers = parent
+                .map(|parent| {
+                    let parsed = mail_parser::MessageParser::default()
+                        .parse(parent.header.as_bytes())
+                        .expect("parent headers");
+                    let parent_id = parsed.message_id().expect("parent Message-ID");
+                    format!("In-Reply-To: <{parent_id}>\r\nReferences: <{parent_id}>\r\n")
+                })
+                .unwrap_or_default();
+            // Proton can group independent sends by subject, even without a ParentID.
+            let conversation_id = parent
+                .or_else(|| world.messages.iter().find(|m| m.subject == subject))
+                .map(|m| m.conversation_id.clone())
+                .unwrap_or_else(|| format!("conv-{id}"));
+            let external_id = body["Message"]["ExternalID"].as_str().unwrap_or(&id);
+            let header =
+                format!("Message-ID: <{external_id}>\r\nSubject: {subject}\r\n{reply_headers}");
             world.messages.push(FakeMessage {
                 id: id.clone(),
-                conversation_id: format!("conv-{id}"),
+                conversation_id,
+                header,
+                from_name: body["Message"]["Sender"]["Name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                from_address: body["Message"]["Sender"]["Address"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                to: body["Message"]["ToList"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|a| {
+                        (
+                            a["Name"].as_str().unwrap_or_default().into(),
+                            a["Address"].as_str().unwrap_or_default().into(),
+                        )
+                    })
+                    .collect(),
                 label_ids: vec!["1".into(), "8".into()],
                 subject: body["Message"]["Subject"]
                     .as_str()
@@ -863,7 +916,11 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
             });
             world.push_event(&id, 1);
             let last = world.messages.last().expect("draft");
-            ok(json!({ "Message": meta_json(last) }))
+            let mut value = meta_json(last);
+            value["Header"] = json!(last.header);
+            value["Body"] = json!(last.body);
+            value["MIMEType"] = json!(last.mime_type);
+            ok(json!({ "Message": value }))
         }
         ("GET", "/api/core/v4/events/latest") => ok(json!({ "EventID": world.latest_event() })),
         ("GET", path) if path.starts_with("/api/core/v4/events/") => {

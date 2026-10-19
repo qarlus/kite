@@ -280,6 +280,8 @@ fn sending_builds_mime_and_replies_carry_reply_headers() {
     let plain = String::from_utf8_lossy(&world.sent[0].raw).to_string();
     assert!(plain.contains("Subject: Hi there"), "{plain}");
     assert!(plain.contains("hello"), "{plain}");
+    assert!(!plain.contains("In-Reply-To:"), "{plain}");
+    assert!(!plain.contains("References:"), "{plain}");
     assert!(world.sent[0].rcpts.contains(&"bob@example.org".to_string()));
 
     let reply = String::from_utf8_lossy(&world.sent[1].raw).to_string();
@@ -1012,7 +1014,7 @@ fn a_send_without_recipients_is_rejected() {
 }
 
 #[test]
-fn a_forward_starts_a_new_conversation() {
+fn a_linked_forward_joins_the_original_conversation() {
     let rt = runtime();
     let world = Arc::new(Mutex::new(common::world()));
     world
@@ -1020,6 +1022,7 @@ fn a_forward_starts_a_new_conversation() {
         .expect("world")
         .folder("INBOX")
         .push(FIRST, &["\\Seen"]);
+    world.lock().expect("world").files_sent_into_sent = true;
     let server = rt.block_on(serve(world.clone()));
 
     let dir = temp_dir();
@@ -1032,13 +1035,20 @@ fn a_forward_starts_a_new_conversation() {
         .expect("settings");
     let account = engine.add_proton(login(server.ports())).expect("add");
 
-    // A forward carries the quoted original in the body but no threading headers, so it is not a
-    // reply to the original.
+    wait_for("the original conversation", || {
+        !engine
+            .threads(&inbox(account.id), 0, 10)
+            .expect("inbox")
+            .is_empty()
+    });
+    let original = engine.threads(&inbox(account.id), 0, 10).expect("inbox")[0].id;
+    let parent = engine.thread(original).expect("original")[0].id;
     engine
         .send(Draft {
             account_id: account.id,
             to: vec![addr("Dana", "dana@example.org")],
             subject: "Fwd: Quarterly numbers".into(),
+            reply_to: Some(parent),
             body: "fyi\n\n> plain body".into(),
             ..Default::default()
         })
@@ -1049,8 +1059,20 @@ fn a_forward_starts_a_new_conversation() {
     });
     let raw = String::from_utf8_lossy(&world.lock().expect("world").sent[0].raw).to_string();
     assert!(raw.contains("Subject: Fwd: Quarterly numbers"), "{raw}");
-    assert!(!raw.contains("In-Reply-To:"), "{raw}");
-    assert!(!raw.contains("References:"), "{raw}");
+    assert!(raw.contains("In-Reply-To: <abc@example.org>"), "{raw}");
+    assert!(
+        raw.contains("References: <root@example.org> <parent@example.org> <abc@example.org>"),
+        "{raw}"
+    );
+    engine.sync_now();
+    wait_for("the synced forward to join its original", || {
+        engine.thread(original).expect("conversation").len() == 2
+    });
+    let mut sent = inbox(account.id);
+    sent.mailbox = Mailbox::Sent;
+    let rows = engine.threads(&sent, 0, 10).expect("sent");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, original);
 }
 
 #[test]

@@ -142,7 +142,11 @@ fn f_forwards_with_an_empty_to_and_the_original_quote(cx: &mut TestAppContext) {
     assert_eq!(drafts.len(), 1);
     assert_eq!(drafts[0].to, vec![addr("", "dana@example.com")]);
     assert_eq!(drafts[0].subject, "Fwd: Subject 1");
-    assert_eq!(drafts[0].reply_to, None, "a forward starts a new thread");
+    assert_eq!(
+        drafts[0].reply_to,
+        Some(12),
+        "a forward retains its original-message link"
+    );
 }
 
 #[gpui_kit::test]

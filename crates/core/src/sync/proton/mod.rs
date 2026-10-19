@@ -639,8 +639,9 @@ impl Proton {
         // Use the accepted send response and the body we already hold; Sent must not wait
         // for another event poll or body download.
         message.remote_id = sent.meta.id;
-        message.thread_hint =
-            (!sent.meta.conversation_id.is_empty()).then_some(sent.meta.conversation_id);
+        message.message_id = message.message_id.or(draft.message_id.clone());
+        message.in_reply_to = draft.in_reply_to.clone();
+        message.references = draft.references.clone();
         message.date = sent.meta.time.max(0) * 1000;
         message.mailbox = Mailbox::Sent;
         message.folder = SENT.into();
@@ -660,6 +661,26 @@ impl Proton {
 
     async fn build_draft(&mut self, mime: &[u8]) -> Result<Outgoing> {
         let mut outgoing = outgoing(mime, &self.email)?;
+        if let Some(parent) = &outgoing.in_reply_to {
+            // Proton synthesizes reply headers from ParentID, not from the subject.
+            let value = self
+                .api
+                .call_with(
+                    reqwest::Method::POST,
+                    "/mail/v4/messages",
+                    Some(&json!({"ExternalID": parent, "Page": 0, "PageSize": 1})),
+                    &[("X-HTTP-Method-Override", "GET")],
+                )
+                .await?;
+            outgoing.parent_id = value["Messages"]
+                .as_array()
+                .and_then(|messages| messages.first())
+                .and_then(|message| message["ID"].as_str())
+                .map(str::to_owned);
+            if outgoing.parent_id.is_none() {
+                bail!("the original Proton message is no longer available for this reply");
+            }
+        }
         let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
         let address = keys
             .for_sender(&outgoing.from.email)
@@ -808,8 +829,8 @@ fn remote_msg(keys: &Keyring, meta: &api::Meta, message: &api::Message) -> Resul
         remote_id: meta.id.clone(),
         folder,
         mailbox,
-        // Proton groups mail into conversations; the store prefers this over headers.
-        thread_hint: (!meta.conversation_id.is_empty()).then(|| meta.conversation_id.clone()),
+        // Proton also groups unrelated sends by subject; only RFC header links count.
+        thread_hint: None,
         message_id: parsed.as_ref().and_then(|p| p.message_id()).map(bare_id),
         in_reply_to: parsed.as_ref().and_then(|p| match p.in_reply_to() {
             mail_parser::HeaderValue::Text(text) if !text.trim().is_empty() => Some(bare_id(text)),
@@ -921,6 +942,10 @@ fn mailbox_label(mailbox: Mailbox) -> Option<&'static str> {
 
 /// A message built by the engine, ready to become a Proton draft.
 struct Outgoing {
+    message_id: Option<String>,
+    in_reply_to: Option<String>,
+    references: Vec<String>,
+    parent_id: Option<String>,
     from: Addr,
     to: Vec<Addr>,
     cc: Vec<Addr>,
@@ -960,8 +985,9 @@ impl Outgoing {
                 .map(|a| json!({ "Name": a.name, "Address": a.email }))
                 .collect()
         };
-        json!({
+        let mut body = json!({
             "Message": {
+                "ExternalID": self.message_id,
                 "Subject": self.subject,
                 "Sender": { "Name": self.from.name, "Address": self.from.email },
                 "ToList": list(&self.to),
@@ -971,7 +997,16 @@ impl Outgoing {
                 "MIMEType": "text/plain",
                 "Unread": 1,
             }
-        })
+        });
+        if let Some(parent) = &self.parent_id {
+            body["ParentID"] = json!(parent);
+            body["Action"] = json!(if self.subject.to_ascii_lowercase().starts_with("fwd:") {
+                2
+            } else {
+                0
+            });
+        }
+        body
     }
 }
 
@@ -989,7 +1024,16 @@ fn outgoing(mime: &[u8], account_email: &str) -> Result<Outgoing> {
             email: account_email.to_string(),
         });
     let text = body_text(&parsed);
+    let ids = |value: &mail_parser::HeaderValue<'_>| match value {
+        mail_parser::HeaderValue::Text(text) => vec![bare_id(text)],
+        mail_parser::HeaderValue::TextList(list) => list.iter().map(|id| bare_id(id)).collect(),
+        _ => Vec::new(),
+    };
     Ok(Outgoing {
+        message_id: parsed.message_id().map(bare_id),
+        in_reply_to: ids(parsed.in_reply_to()).into_iter().next(),
+        references: ids(parsed.references()),
+        parent_id: None,
         from,
         to: addrs_of(parsed.to()),
         cc: addrs_of(parsed.cc()),

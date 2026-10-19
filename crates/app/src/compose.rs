@@ -23,7 +23,7 @@ pub struct Compose {
     pub account_id: Id,
     /// The saved draft this panel edits, so a later save replaces it.
     pub id: Option<Id>,
-    /// The message being replied to (`None` for new mail and forward).
+    /// The original message for replies and forwards (`None` for new mail).
     pub reply_to: Option<Id>,
     pub show_cc: bool,
     bcc: Vec<Addr>,
@@ -121,7 +121,13 @@ impl Compose {
             Parts {
                 account_id: draft.account_id,
                 id: draft.id,
-                title: "New message",
+                title: if draft.reply_to.is_some()
+                    && draft.subject.to_ascii_lowercase().starts_with("fwd:")
+                {
+                    "Forward"
+                } else {
+                    "New message"
+                },
                 to: draft.to,
                 cc: draft.cc,
                 bcc: draft.bcc,
@@ -260,7 +266,7 @@ impl Kite {
         } else {
             (reply_to(&message, &own), Vec::new())
         };
-        let reply_to = if forward { None } else { Some(message.id) };
+        let reply_to = Some(message.id);
         let body = if forward {
             forward_body(&message)
         } else {
@@ -590,7 +596,7 @@ impl Kite {
         };
         // DESIGN: a reply within a thread takes the full content pane; new mail
         // and forwards float bottom-right at 560×480.
-        let is_reply = compose.reply_to.is_some();
+        let is_reply = compose.reply_to.is_some() && compose.title != "Forward";
         let reply_left = px(crate::sidebar::width(window));
         Some(
             div()

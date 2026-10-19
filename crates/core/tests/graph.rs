@@ -940,3 +940,117 @@ async fn a_rejected_draft_create_is_an_error() {
         "a failed create must not look like success"
     );
 }
+
+#[tokio::test]
+async fn graph_headers_separate_independent_sends_and_unite_only_linked_replies() {
+    use kite_core::model::{Provider, View};
+    use kite_core::store::Store;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let phase = Arc::new(AtomicUsize::new(0));
+    let server_phase = phase.clone();
+    let fake=Fake::start(move |c,base| {
+        let value=if c.path=="/me/mailFolders/sentitems/messages/delta" {
+            vec![
+                json!({"id":"first","internetMessageId":"<first@x>","internetMessageHeaders":[]}),
+                json!({"id":"second","internetMessageId":"<second@x>","internetMessageHeaders":[]}),
+                json!({"id":"reply","internetMessageId":"<reply@x>","internetMessageHeaders":[{"name":"in-reply-to","value":"<first@x>"}]}),
+                json!({"id":"reference","internetMessageId":"<reference@x>","internetMessageHeaders":[{"name":"REFERENCES","value":"<first@x> <reply@x>"}]}),
+                json!({"id":"fallback1"}), json!({"id":"fallback2"}),
+            ].into_iter().enumerate().map(|(i,mut m)| {
+                if m["id"]=="fallback1" && server_phase.load(Ordering::SeqCst)>0 {
+                    m["internetMessageId"]=json!("<fallback1@x>");
+                    m["internetMessageHeaders"]=json!([]);
+                }
+                if m["id"]=="fallback2" && server_phase.load(Ordering::SeqCst)>1 {
+                    m["internetMessageId"]=json!("<fallback2@x>");
+                    m["internetMessageHeaders"]=json!([{"name":"In-Reply-To","value":"<fallback1@x>"}]);
+                }
+                m["subject"]=json!("test");
+                m["bodyPreview"]=m["id"].clone();
+                m["conversationId"]=json!("loose-conversation");
+                m["receivedDateTime"]=json!(format!("2024-05-01T10:00:{i:02}Z"));
+                m["from"]=json!({"emailAddress":{"address":"me@x"}});
+                m["toRecipients"]=json!([{"emailAddress":{"address":"alice@x"}}]);
+                m
+            }).collect::<Vec<_>>()
+        } else {Vec::new()};
+        Reply::json(200,json!({"value":value,"@odata.deltaLink":format!("{base}{}",c.path)}))
+    }).await;
+    let mut graph = graph(&fake);
+    let (deltas, cursor) = graph.sync(None).await.unwrap();
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@x", "Me")
+        .unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let view = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Sent,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let rows = store.threads(&view, 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "two header-backed roots and one fallback conversation"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+        vec![2, 3, 1]
+    );
+    let linked = store.thread(rows[1].id).unwrap();
+    assert_eq!(
+        linked.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+        vec!["first", "reply", "reference"]
+    );
+    let retained = rows[1].id;
+    let label = store
+        .act(
+            &[retained],
+            &kite_core::model::Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
+        .unwrap();
+    phase.store(1, Ordering::SeqCst);
+    let (deltas, cursor) = graph.sync(Some(cursor)).await.unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let rows = store.threads(&view, 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "full headers split a previously loose fallback conversation"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+        vec![1, 1, 3, 1]
+    );
+    phase.store(2, Ordering::SeqCst);
+    let (deltas, _) = graph.sync(Some(cursor)).await.unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let rows = store.threads(&view, 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "a newly available reply header reconnects the actual chain"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.count).collect::<Vec<_>>(),
+        vec![2, 3, 1]
+    );
+    assert_eq!(
+        store.thread(retained).unwrap().len(),
+        3,
+        "unrelated conversations retain their IDs"
+    );
+    store.undo(label).unwrap();
+    assert!(
+        store
+            .threads(&view, 0, 10)
+            .unwrap()
+            .iter()
+            .all(|r| r.labels.is_empty())
+    );
+}
