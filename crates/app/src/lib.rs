@@ -25,11 +25,19 @@ gpui_kit::assets::icon_assets!(
         FolderInput,
         Paperclip,
         Settings,
-        ChevronsUpDown
+        ChevronsUpDown,
+        Reply,
+        ReplyAll,
+        Forward,
+        Keyboard,
+        MailOpen,
+        X,
+        SquarePen
     ]
 );
 
-/// Component icons plus the two toolbar icons outside the default bundle.
+/// Component icons plus the ones Kite uses from outside the default bundle (an icon that is in
+/// neither renders blank; `tests/icons.rs` checks every one Kite names).
 pub struct Assets;
 
 impl gpui_kit::AssetSource for Assets {

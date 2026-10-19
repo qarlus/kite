@@ -177,10 +177,15 @@ impl Kite {
                     .id("thread-scroll")
                     .test_support()
                     .flex_1()
+                    // Without it a flex item is never shorter than its content, so nothing scrolls.
+                    .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&scroll)
+                    // A column, not a row: in a row the conversation would be stretched to the
+                    // pane's height and overflow itself instead of the scroll area.
                     .flex()
-                    .justify_center()
+                    .flex_col()
+                    .items_center()
                     .child(column),
             )
             .into_any_element()

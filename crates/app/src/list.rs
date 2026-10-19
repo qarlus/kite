@@ -470,7 +470,9 @@ fn row_element(
                         .flex_row()
                         .gap_2()
                         .px_3()
-                        .py_2()
+                        // Tight enough that sender, subject and a two-line snippet fit the fixed
+                        // row height instead of clipping the snippet's second line.
+                        .py_1p5()
                         .rounded(px(RADIUS_SM))
                         .overflow_hidden()
                         .when(selected, |d| d.bg(t.sel))
@@ -527,7 +529,7 @@ fn row_element(
                                 .flex()
                                 .flex_col()
                                 .justify_center()
-                                .gap_1()
+                                .gap_0p5()
                                 .child(
                                     div()
                                         .flex()

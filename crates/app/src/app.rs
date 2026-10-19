@@ -1627,7 +1627,7 @@ impl Kite {
                                     this.run(cmd::COMPOSE, window, cx)
                                 }),
                             )
-                            .child(Icon::new(IconName::FileText).with_size(px(16.))),
+                            .child(Icon::new(IconName::SquarePen).with_size(px(16.))),
                     ),
             )
             .child(

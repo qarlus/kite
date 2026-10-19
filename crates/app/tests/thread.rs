@@ -151,3 +151,46 @@ fn the_thread_toolbar_replies_by_click(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn a_conversation_taller_than_the_pane_scrolls(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let (window, _) = common::open_window(
+        cx,
+        Some(gpui_kit::size(gpui_kit::px(900.), gpui_kit::px(340.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(Fixture::new(2), window, cx)),
+    );
+    cx.simulate_keystrokes(window.into(), "j enter");
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("html-22").is_some()
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let before = window.find("html-22").bounds();
+        let window_bottom = gpui_kit::px(340.);
+        assert!(
+            before.bottom() > window_bottom,
+            "the fixture conversation must overflow a 340px window for this test to mean anything: body {:?}",
+            before
+        );
+        assert!(
+            window.find("thread-scroll").bounds().bottom() <= window_bottom,
+            "the scroll area ends at the window instead of growing to the conversation"
+        );
+        window.scroll(
+            "thread-scroll",
+            gpui_kit::ScrollDelta::Pixels(gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(-200.))),
+            cx,
+        );
+        window.render_frame(cx);
+        let after = window.find("html-22").bounds();
+        assert!(
+            after.origin.y < before.origin.y,
+            "scrolling moves the body up ({:?} -> {:?})",
+            before.origin.y,
+            after.origin.y
+        );
+    })
+    .unwrap();
+}
