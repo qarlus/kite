@@ -134,6 +134,8 @@ pub(crate) struct Inner {
     wake: Sender<()>,
     secrets: Secrets,
     opts: Options,
+    /// Every `Event::Error`, so a failure that only flashed by as a toast can be read later.
+    errors_log: PathBuf,
 }
 
 impl Inner {
@@ -146,10 +148,33 @@ impl Inner {
     }
 
     pub(crate) fn emit(&self, event: Event) {
+        if let Event::Error(message) = &event {
+            self.log_error(message);
+        }
         let mut senders = lock(&self.senders);
         senders.retain(|s| !s.is_closed());
         for s in senders.iter() {
             let _ = s.try_send(event.clone());
+        }
+    }
+
+    /// Best effort: logging must never turn into a second failure. Rolls over at 1 MB.
+    fn log_error(&self, message: &str) {
+        use std::io::Write as _;
+        let path = &self.errors_log;
+        if std::fs::metadata(path).is_ok_and(|m| m.len() > 1 << 20) {
+            let _ = std::fs::rename(path, path.with_extension("log.old"));
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{}  {message}",
+                Local::now().format("%Y-%m-%d %H:%M:%S")
+            );
         }
     }
 }
@@ -178,6 +203,7 @@ impl Engine {
             wake,
             secrets,
             opts,
+            errors_log: dir.join("errors.log"),
         });
         let _ = std::thread::Builder::new()
             .name("kite-engine".into())

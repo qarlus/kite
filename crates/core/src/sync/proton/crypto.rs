@@ -138,12 +138,6 @@ impl Keyring {
         }
         Err(last.unwrap_or_else(|| anyhow!("no Proton key could decrypt this attachment")))
     }
-
-    /// Decrypts the armored header block Proton keeps next to the body.
-    pub fn decrypt_header(&self, armored: &str) -> Result<String> {
-        let plain = self.decrypt(armored)?;
-        Ok(String::from_utf8_lossy(&plain).into_owned())
-    }
 }
 
 /// The passphrase of an address key on a current Proton account: its `Token` is encrypted
@@ -193,13 +187,14 @@ pub fn encrypt_body(signer: &SecretKey, plaintext: &str) -> Result<Package> {
     })
 }
 
-/// Encrypts `plaintext` to `recipient` and armors it: the body a Proton draft stores,
-/// which only we can read back.
-pub fn encrypt_armored(recipient: &SignedPublicKey, plaintext: &str) -> Result<String> {
+/// The body a Proton draft stores: encrypted to the sending address's own key and signed
+/// by it. Proton rejects an unsigned draft ("Invalid or missing message signature").
+pub fn encrypt_draft(signer: &SecretKey, plaintext: &str) -> Result<String> {
     let mut rng = rand::thread_rng();
     let mut builder = MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-    match &Recipient::of(recipient)? {
+    builder.sign(signer.signing(), signer.passphrase(), HashAlgorithm::Sha256);
+    match &Recipient::of(&signer.key.to_public_key())? {
         Recipient::Primary(key) => {
             builder.encrypt_to_key(&mut rng, key)?;
         }

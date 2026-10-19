@@ -215,6 +215,25 @@ pub fn decrypt(key: &TestKey, armored: &str) -> Vec<u8> {
     out
 }
 
+/// Whether `armored` decrypts with `key` and carries a valid signature by it.
+fn signed_by(key: &TestKey, armored: &str) -> bool {
+    use std::io::Read as _;
+    let Ok((message, _)) = Message::from_string(armored) else {
+        return false;
+    };
+    let Ok(mut message) = message.decrypt(&Password::from(key.passphrase.as_str()), &key.secret)
+    else {
+        return false;
+    };
+    let mut plain = Vec::new();
+    if message.read_to_end(&mut plain).is_err() {
+        return false;
+    }
+    message
+        .verify(&key.secret.to_public_key().primary_key)
+        .is_ok()
+}
+
 /// Reads raw packets (`PKESK || SEIPD`) with a secret key.
 pub fn decrypt_packets(key: &TestKey, packets: &[u8]) -> Vec<u8> {
     use std::io::Read as _;
@@ -370,7 +389,7 @@ impl World {
             cc: Vec::new(),
             time: 1_746_525_600,
             unread: true,
-            header: encrypt_to(&public, &header),
+            header,
             body: encrypt_to(&public, body),
             mime_type: "text/plain".into(),
             attachments: Vec::new(),
@@ -406,7 +425,7 @@ impl World {
             cc: Vec::new(),
             time: 1_746_529_200,
             unread: false,
-            header: encrypt_to(&public, &header),
+            header,
             body: encrypt_to(&public, body),
             mime_type: "text/plain".into(),
             attachments: Vec::new(),
@@ -777,6 +796,11 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 return ok(json!({ "Messages": list, "Stale": 0 }));
             }
             let body = request.json();
+            // Like Proton: the draft body must be signed by the sending address's key.
+            let draft_body = body["Message"]["Body"].as_str().unwrap_or_default();
+            if !signed_by(&world.address_keys[0], draft_body) {
+                return error(400, 2001, "Invalid or missing message signature");
+            }
             world.drafts.push(body.clone());
             let id = format!("draft-{}", world.drafts.len());
             world.messages.push(FakeMessage {

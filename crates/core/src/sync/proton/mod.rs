@@ -625,15 +625,13 @@ impl Proton {
         let address = keys
             .for_sender(&outgoing.from.email)
             .with_context(|| format!("no Proton address for {}", outgoing.from.email))?;
-        if outgoing.from.email.is_empty() {
-            outgoing.from.email = address.email.clone();
-        }
+        // Proton checks Sender.Address against the address exactly as it stores it.
+        outgoing.from.email = address.email.clone();
         if outgoing.from.name.is_empty() {
             outgoing.from.name = outgoing.from.email.clone();
         }
         let signer = Keyring::signing_key(address)?;
-        outgoing.armored_body =
-            crypto::encrypt_armored(&signer.key.to_public_key(), &outgoing.text)?;
+        outgoing.armored_body = crypto::encrypt_draft(signer, &outgoing.text)?;
         Ok(outgoing)
     }
 
@@ -702,11 +700,8 @@ async fn fetch_delta(mut client: Api, keys: &Keyring, meta: &api::Meta) -> Resul
 }
 
 fn remote_msg(keys: &Keyring, meta: &api::Meta, message: &api::Message) -> Result<RemoteMsg> {
-    let header = if message.header.is_empty() {
-        String::new()
-    } else {
-        keys.decrypt_header(&message.header)?
-    };
+    // Proton keeps the RFC 822 header block in clear; only the body is encrypted.
+    let header = message.header.trim_end().to_string();
     let body = if message.body.trim_start().starts_with("-----BEGIN PGP") {
         String::from_utf8_lossy(&keys.decrypt(&message.body)?).into_owned()
     } else {
