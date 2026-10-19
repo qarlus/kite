@@ -397,6 +397,14 @@ impl Api {
         Ok(())
     }
 
+    /// The account's "Sign external messages" setting (`MailSettings.Sign`).
+    pub async fn signs_external_mail(&mut self) -> Result<bool> {
+        let value = self
+            .call(reqwest::Method::GET, "/mail/v4/settings", None)
+            .await?;
+        Ok(value["MailSettings"]["Sign"].as_i64().unwrap_or(0) > 0)
+    }
+
     pub async fn delete_messages(&mut self, ids: &[String]) -> Result<()> {
         let body = json!({ "IDs": ids });
         self.call(

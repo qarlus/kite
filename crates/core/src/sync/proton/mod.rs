@@ -611,11 +611,24 @@ impl Proton {
     /// Proton's send flow: save the draft, then hand it the encrypted packages.
     async fn send(&mut self, mime: &[u8]) -> Result<Option<String>> {
         let draft = self.build_draft(mime).await?;
-        let saved = self.api.create_draft(&draft.body()).await?;
-        let packages = self.packages(&draft).await?;
-        self.api
-            .send_draft(&saved.meta.id, &json!({ "Packages": packages }))
-            .await?;
+        let saved = self
+            .api
+            .create_draft(&draft.body())
+            .await
+            .context("create the Proton draft")?;
+        let sent = match self.packages(&draft).await {
+            Ok(packages) => self
+                .api
+                .send_draft(&saved.meta.id, &json!({ "Packages": packages }))
+                .await
+                .context("send the Proton draft"),
+            Err(error) => Err(error),
+        };
+        if sent.is_err() {
+            // The outbox retries with a fresh draft, so this one would only pile up in Drafts.
+            let _ = self.api.delete_messages(&[saved.meta.id.clone()]).await;
+        }
+        sent?;
         Ok(None)
     }
 
@@ -642,6 +655,9 @@ impl Proton {
             .with_context(|| format!("no Proton address for {}", outgoing.from.email))?;
         let signer = Keyring::signing_key(address)?;
         let package = crypto::encrypt_body(signer, &outgoing.text)?;
+        // As Bridge does: an external copy declares the signature the account's "Sign external
+        // messages" setting asks for (the body always carries it), or Proton refuses the send.
+        let sign_external = self.api.signs_external_mail().await?;
         let mut addresses = Map::new();
         let mut schemes = 0i64;
         let mut clear = false;
@@ -670,7 +686,10 @@ impl Proton {
                 // session key below and delivers plain text.
                 addresses.insert(
                     recipient.email.clone(),
-                    json!({ "Type": SCHEME_CLEAR, "Signature": SIGNATURE_NONE }),
+                    json!({
+                        "Type": SCHEME_CLEAR,
+                        "Signature": if sign_external { SIGNATURE_DETACHED } else { SIGNATURE_NONE },
+                    }),
                 );
                 schemes |= SCHEME_CLEAR;
                 clear = true;

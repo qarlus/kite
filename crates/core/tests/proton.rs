@@ -424,6 +424,10 @@ fn sending_encrypts_for_proton_recipients_and_sends_cleartext_outside() {
     let world = server.world();
     let plaintext = fake::decrypt_packets(&world.address_keys[0], &packets);
     assert_eq!(String::from_utf8_lossy(&plaintext), "Plain text body");
+    // Proton refuses a package whose body is not signed by the sending address
+    // ("Invalid or missing message signature").
+    fake::packets_signed_by(&world.address_keys[0], &world.address_keys[0], &packets)
+        .expect("the body is signed by the sending address");
     // The clear-scheme recipient needs the session key in the clear.
     assert!(
         package["BodyKey"]["Key"]

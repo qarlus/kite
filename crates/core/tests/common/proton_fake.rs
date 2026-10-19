@@ -215,6 +215,29 @@ pub fn decrypt(key: &TestKey, armored: &str) -> Vec<u8> {
     out
 }
 
+/// Whether raw packets (`PKESK || SEIPD`) decrypt with `key` and are signed by `signer`, the
+/// check Proton makes before it delivers a clear-scheme copy.
+pub fn packets_signed_by(key: &TestKey, signer: &TestKey, packets: &[u8]) -> Result<(), String> {
+    use std::io::Read as _;
+    let message = Message::from_bytes(packets).map_err(|e| format!("parse: {e}"))?;
+    let mut message = message
+        .decrypt(&Password::from(key.passphrase.as_str()), &key.secret)
+        .map_err(|e| format!("decrypt: {e}"))?;
+    if message.is_compressed() {
+        message = message
+            .decompress()
+            .map_err(|e| format!("decompress: {e}"))?;
+    }
+    let mut plain = Vec::new();
+    message
+        .read_to_end(&mut plain)
+        .map_err(|e| format!("read: {e}"))?;
+    message
+        .verify(&signer.secret.to_public_key().primary_key)
+        .map(|_| ())
+        .map_err(|e| format!("verify: {e}"))
+}
+
 /// Whether `armored` decrypts with `key` and carries a valid signature by it.
 fn signed_by(key: &TestKey, armored: &str) -> bool {
     use std::io::Read as _;
@@ -274,6 +297,8 @@ pub struct FakeAttachment {
 }
 
 pub struct World {
+    /// The account's "Sign external messages" mail setting; on for new Proton accounts.
+    pub sign_external: bool,
     pub email: String,
     pub password: String,
     /// Set for two-password accounts; keys unlock with this one.
@@ -322,6 +347,7 @@ impl World {
             human_verification: false,
             hv_challenge: "hv-challenge-token".into(),
             hv_solved: false,
+            sign_external: true,
             user_keys: vec![cached_key("user-key")],
             address_keys: vec![cached_key("address-key")],
             messages: Vec::new(),
@@ -734,6 +760,9 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
             )
         }
         // Like Proton: only user keys have a salt; token-unlocked address keys get `null`.
+        ("GET", "/api/mail/v4/settings") => ok(json!({
+            "MailSettings": { "Sign": i64::from(world.sign_external), "PGPScheme": 16 }
+        })),
         ("GET", "/api/core/v4/keys/salts") => ok(json!({
             "KeySalts": world
                 .user_keys
@@ -911,7 +940,30 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
         }
         ("POST", path) if path.starts_with("/api/mail/v4/messages/") => {
             let id = path.rsplit('/').next().unwrap_or_default().to_string();
-            world.sends.push(request.json());
+            // Like Proton: with "Sign external messages" on, an external (clear) copy must
+            // declare its signature.
+            let body = request.json();
+            let unsigned_clear =
+                body["Packages"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|package| {
+                        package["Addresses"].as_object().into_iter().flatten().any(
+                            |(_, recipient)| {
+                                recipient["Type"].as_i64() == Some(4)
+                                    && recipient["Signature"].as_i64() != Some(1)
+                            },
+                        )
+                    });
+            if world.sign_external && unsigned_clear {
+                return error(
+                    400,
+                    2001,
+                    "Invalid or missing message signature, please sign out and back in again",
+                );
+            }
+            world.sends.push(body);
             // Sending turns the draft into the sent message, as Proton does.
             let found = world.messages.iter_mut().find(|message| message.id == id);
             match found {

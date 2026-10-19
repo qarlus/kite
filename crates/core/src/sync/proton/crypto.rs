@@ -14,7 +14,7 @@ use pgp::composed::{
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{PacketTrait as _, PublicKeyEncryptedSessionKey};
+use pgp::packet::{DataMode, PacketTrait as _, PublicKeyEncryptedSessionKey};
 use pgp::types::{KeyDetails as _, Password, SigningKey};
 
 /// Proton's session-key algorithm for every message it stores or sends.
@@ -170,12 +170,26 @@ pub struct Package {
     pub session_key: String,
 }
 
+/// A body the way gopenpgp's `NewPlainMessageFromString` makes one, which is what Proton's own
+/// clients send: CRLF line endings, a UTF-8 literal packet and a text-mode signature. Proton
+/// refuses a binary signature on a text body ("Invalid or missing message signature").
+fn canonical_text(plaintext: &str) -> Vec<u8> {
+    plaintext
+        .replace("\r\n", "\n")
+        .replace('\n', "\r\n")
+        .into_bytes()
+}
+
 /// Encrypts `plaintext` with a fresh session key, signing it with `signer`.
 pub fn encrypt_body(signer: &SecretKey, plaintext: &str) -> Result<Package> {
     let mut rng = rand::thread_rng();
-    let mut builder = MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
+    let mut builder = MessageBuilder::from_bytes("", canonical_text(plaintext))
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-    builder.sign(signer.signing(), signer.passphrase(), HashAlgorithm::Sha256);
+    builder.data_mode(DataMode::Utf8)?.sign_text().sign(
+        signer.signing(),
+        signer.passphrase(),
+        HashAlgorithm::Sha256,
+    );
     let session_key = builder.session_key().as_ref().to_vec();
     // No recipients were added, so the output is exactly one encrypted data packet.
     let data = builder
@@ -187,13 +201,17 @@ pub fn encrypt_body(signer: &SecretKey, plaintext: &str) -> Result<Package> {
     })
 }
 
-/// The body a Proton draft stores: encrypted to the sending address's own key and signed
-/// by it. Proton rejects an unsigned draft ("Invalid or missing message signature").
+/// The body a Proton draft stores: encrypted to the sending address's own key, in the same
+/// text form and signed the same way as the body that is sent.
 pub fn encrypt_draft(signer: &SecretKey, plaintext: &str) -> Result<String> {
     let mut rng = rand::thread_rng();
-    let mut builder = MessageBuilder::from_bytes("", plaintext.as_bytes().to_vec())
+    let mut builder = MessageBuilder::from_bytes("", canonical_text(plaintext))
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-    builder.sign(signer.signing(), signer.passphrase(), HashAlgorithm::Sha256);
+    builder.data_mode(DataMode::Utf8)?.sign_text().sign(
+        signer.signing(),
+        signer.passphrase(),
+        HashAlgorithm::Sha256,
+    );
     match &Recipient::of(&signer.key.to_public_key())? {
         Recipient::Primary(key) => {
             builder.encrypt_to_key(&mut rng, key)?;
