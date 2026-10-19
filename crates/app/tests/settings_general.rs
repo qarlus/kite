@@ -136,3 +136,24 @@ fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
         "typing in General must never run mail shortcuts"
     );
 }
+
+#[gpui_kit::test]
+fn the_input_mode_choice_is_shown_and_saved(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    open_section(window, cx, 4);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("input-mode-keyboard").selected(),
+            Some(true),
+            "keyboard-first is the default"
+        );
+        window.click("input-mode-classic", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("input-mode-classic").selected(), Some(true));
+        assert_eq!(window.find("input-mode-keyboard").selected(), Some(false));
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().input_mode, "classic");
+}

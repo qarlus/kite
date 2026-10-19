@@ -6,6 +6,14 @@ use gpui_kit::{AppContext, TestAppContext};
 use kite_core::model::{Action, Mailbox};
 use std::time::Duration;
 
+/// Custom folders live in the mailbox picker, so every folder visit starts there.
+fn open_folder(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App, account: &str, folder: &str) {
+    window.click("mailbox-picker", cx);
+    window.render_frame(cx);
+    window.click(format!("folder-{account}-{folder}"), cx);
+    window.render_frame(cx);
+}
+
 #[gpui_kit::test]
 fn account_scope_survives_splits_and_mailboxes_and_combines_again(cx: &mut TestAppContext) {
     let (window, kite) = mount(cx, Fixture::showcase());
@@ -15,9 +23,7 @@ fn account_scope_survives_splits_and_mailboxes_and_combines_again(cx: &mut TestA
             window.find(("row-account", 0usize)).label(),
             Some("karl@proton.me")
         );
-        window.click("account-switcher", cx);
-        window.render_frame(cx);
-        window.click("account-2", cx);
+        window.click(("rail-account", 2usize), cx);
     })
     .unwrap();
     update_content(window, &kite, cx, |kite, _, _| {
@@ -31,9 +37,7 @@ fn account_scope_survives_splits_and_mailboxes_and_combines_again(cx: &mut TestA
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("account-switcher", cx);
-        window.render_frame(cx);
-        window.click("account-0", cx);
+        window.click("all-inboxes", cx);
         window.render_frame(cx);
         assert_eq!(window.find("inbox-header").label(), Some("Inbox"));
     })
@@ -83,9 +87,7 @@ fn a_single_click_opens_with_full_headers_and_the_sidebar_remains(cx: &mut TestA
             window.find("attachment-501").label(),
             Some("Next chapter.pdf (34567 bytes)")
         );
-        window.click("account-switcher", cx);
-        window.render_frame(cx);
-        window.click("account-2", cx);
+        window.click(("rail-account", 2usize), cx);
         window.render_frame(cx);
         assert!(window.try_find("thread-subject").is_none());
     })
@@ -105,7 +107,7 @@ fn moving_to_a_custom_folder_and_undoing_changes_the_visible_mail(cx: &mut TestA
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("folder-1-work", cx);
+        open_folder(window, cx, "1", "work");
         window.render_frame(cx);
         assert_eq!(window.find("inbox-header").label(), Some("Work"));
         assert_eq!(
@@ -125,6 +127,8 @@ fn moving_to_a_custom_folder_and_undoing_changes_the_visible_mail(cx: &mut TestA
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("inbox-zero").label(), Some("Work is empty"));
+        window.click("mailbox-picker", cx);
+        window.render_frame(cx);
         window.click(("mailbox", Mailbox::Inbox as usize), cx);
     })
     .unwrap();
@@ -152,11 +156,9 @@ fn identical_provider_folder_ids_in_two_accounts_do_not_mix_conversations(cx: &m
     let (window, kite) = mount(cx, fixture);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("account-switcher", cx);
+        window.click(("rail-account", 2usize), cx);
         window.render_frame(cx);
-        window.click("account-2", cx);
-        window.render_frame(cx);
-        window.click("folder-2-work", cx);
+        open_folder(window, cx, "2", "work");
         window.render_frame(cx);
         assert_eq!(
             window.find(("row", 0usize)).label(),
@@ -187,6 +189,8 @@ async fn creating_a_folder_in_the_chosen_account_then_moving_mail_into_it(cx: &m
     let (window, kite) = mount(cx, fixture.clone());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click("mailbox-picker", cx);
+        window.render_frame(cx);
         window.click("new-folder", cx);
         window.render_frame(cx);
         window.input("Travel", cx);
@@ -194,13 +198,18 @@ async fn creating_a_folder_in_the_chosen_account_then_moving_mail_into_it(cx: &m
     .unwrap();
     cx.simulate_keystrokes(window.into(), "down enter");
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
-        window.try_find("folder-2-folder-3").is_some()
+        window.try_find("folder-dialog").is_none()
     })
     .await;
     cx.update_window(window.into(), |_, window, cx| {
-        window.click("account-switcher", cx);
+        // The new folder belongs to the second account, so the picker must offer it there.
         window.render_frame(cx);
-        window.click("account-2", cx);
+        window.click("mailbox-picker", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("folder-2-folder-3").is_some());
+        window.press("escape", cx);
+        window.render_frame(cx);
+        window.click(("rail-account", 2usize), cx);
     })
     .unwrap();
     cx.simulate_keystrokes(window.into(), "l down down down down enter");
@@ -215,7 +224,7 @@ async fn creating_a_folder_in_the_chosen_account_then_moving_mail_into_it(cx: &m
     );
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("folder-2-folder-3", cx);
+        open_folder(window, cx, "2", "folder-3");
         window.render_frame(cx);
         assert_eq!(window.find("inbox-header").label(), Some("Travel"));
         assert_eq!(
@@ -235,6 +244,8 @@ async fn creation_errors_are_visible_and_do_not_add_a_fake_folder(cx: &mut TestA
     *fixture.folder_error.lock().unwrap() = Some("Account is offline".into());
     let (window, _) = mount(cx, fixture.clone());
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("mailbox-picker", cx);
         window.render_frame(cx);
         window.click("new-folder", cx);
         window.render_frame(cx);
@@ -278,9 +289,7 @@ fn standard_mailboxes_show_moved_mail_and_preserve_account_scope(cx: &mut TestAp
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("account-switcher", cx);
-        window.render_frame(cx);
-        window.click("account-2", cx);
+        window.click(("rail-account", 2usize), cx);
         window.render_frame(cx);
         assert_eq!(window.find("inbox-header").label(), Some("Trash"));
     })
@@ -301,7 +310,7 @@ fn incoming_mail_does_not_retarget_a_move_already_being_chosen(cx: &mut TestAppC
     cx.simulate_keystrokes(window.into(), "down down down enter");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("folder-1-work", cx);
+        open_folder(window, cx, "1", "work");
         window.render_frame(cx);
         assert_eq!(
             window.find(("row", 0usize)).label(),
@@ -331,7 +340,7 @@ fn opening_a_different_conversation_clears_the_old_multi_selection(cx: &mut Test
     cx.simulate_keystrokes(window.into(), "l down down down enter");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click("folder-2-receipts", cx);
+        open_folder(window, cx, "2", "receipts");
         window.render_frame(cx);
         assert_eq!(
             window.find(("row", 0usize)).label(),
@@ -349,6 +358,8 @@ fn duplicate_folder_names_show_validation_without_creating_another(cx: &mut Test
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
     cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("mailbox-picker", cx);
         window.render_frame(cx);
         window.click("new-folder", cx);
         window.render_frame(cx);

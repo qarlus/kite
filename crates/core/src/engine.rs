@@ -19,10 +19,16 @@ use crate::model::*;
 use crate::store::Store;
 use crate::sync::graph::Graph;
 use crate::sync::imap::{Imap, ImapConfig};
+use crate::sync::proton::{Credentials as ProtonSession, Proton, SignIn, Step as ProtonStep};
 use crate::sync::{Delta, Op};
 
 const DEFAULT_GRAPH: &str = "https://graph.microsoft.com/v1.0";
 const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com/common";
+/// Proton's API. The native backend talks to it directly, so free accounts work.
+const DEFAULT_PROTON_API: &str = "https://mail.proton.me/api";
+/// Kite's own client identifier. Proton's API takes the app version as free text and
+/// pretending to be Proton Bridge or one of Proton's apps would be impersonation.
+const PROTON_APP_VERSION: &str = "kite-mail@0.1.0";
 /// Messages per transaction: a UI write never waits behind a long first sync (see ARCHITECTURE).
 const APPLY_CHUNK: usize = 200;
 /// Sync calls per account per tick, so one huge mailbox cannot monopolise the loop.
@@ -92,6 +98,7 @@ impl Secrets {
 pub struct Options {
     pub graph_base_url: Option<String>,
     pub graph_authority: Option<String>,
+    pub proton_api_url: Option<String>,
     pub poll: Duration,
     /// Send STARTTLS on Proton connections. Tests set false to reach a local plaintext fake server.
     pub proton_tls: bool,
@@ -102,6 +109,7 @@ impl Default for Options {
         Self {
             graph_base_url: None,
             graph_authority: None,
+            proton_api_url: None,
             poll: Duration::from_secs(30),
             proton_tls: true,
         }
@@ -116,6 +124,8 @@ pub(crate) struct Inner {
     reader: Mutex<Store>,
     writer: Mutex<Store>,
     senders: Mutex<Vec<Sender<Event>>>,
+    /// The native Proton sign-in between calls, so the UI only has to answer one step.
+    sign_in: Mutex<Option<SignIn>>,
     wake: Sender<()>,
     secrets: Secrets,
     opts: Options,
@@ -159,6 +169,7 @@ impl Engine {
             reader: Mutex::new(reader),
             writer: Mutex::new(writer),
             senders: Mutex::new(Vec::new()),
+            sign_in: Mutex::new(None),
             wake,
             secrets,
             opts,
@@ -195,6 +206,37 @@ impl Engine {
             .collect();
         self.inner.emit(Event::Changed(ids));
         Ok(())
+    }
+
+    /// Turns a sign-in step into a `ProtonAuth`, keeping the half-finished handshake when
+    /// the caller has more to answer.
+    fn settle(&self, mut sign_in: SignIn, step: ProtonStep) -> Result<ProtonAuth> {
+        match step {
+            ProtonStep::TwoFactor => {
+                *lock(&self.inner.sign_in) = Some(sign_in);
+                Ok(ProtonAuth::TwoFactor)
+            }
+            ProtonStep::MailboxPassword => {
+                *lock(&self.inner.sign_in) = Some(sign_in);
+                Ok(ProtonAuth::MailboxPassword)
+            }
+            ProtonStep::HumanVerification { url } => {
+                *lock(&self.inner.sign_in) = Some(sign_in);
+                Ok(ProtonAuth::HumanVerification { url })
+            }
+            ProtonStep::Done => {
+                let signed = sign_in.take().context("Proton sign-in returned no session")?;
+                let account = self.inner.write(|s| {
+                    s.add_account(Provider::Proton, &signed.email, &signed.name)
+                })?;
+                let key = format!("proton:{}", account.id);
+                self.inner
+                    .secrets
+                    .set(&key, &serde_json::to_string(&signed.credentials)?)?;
+                self.wake();
+                Ok(ProtonAuth::Done(account))
+            }
+        }
     }
 }
 
@@ -347,6 +389,15 @@ async fn sync_account(
             break;
         }
     }
+
+    // Proton's custom labels are folders and exist before Kite ever created one, so the
+    // sidebar catalog is refreshed from the API (cached after the first call).
+    let backend = backend_mut(backends, account.id)?;
+    if let Ok(folders) = backend.folders().await {
+        for (id, name) in folders {
+            inner.write(|s| s.ensure_folder(account.id, &id, &name))?;
+        }
+    }
     Ok(changed)
 }
 
@@ -443,6 +494,11 @@ enum Backend {
         client: Box<Graph>,
         saved: String,
     },
+    /// Native Proton (API, not Bridge). Same reason for `saved`.
+    Proton {
+        client: Box<Proton>,
+        saved: String,
+    },
 }
 
 impl Backend {
@@ -450,6 +506,7 @@ impl Backend {
         match self {
             Backend::Imap(imap) => imap.sync(cursor).await,
             Backend::Graph { client, .. } => client.sync(cursor).await,
+            Backend::Proton { client, .. } => client.sync(cursor).await,
         }
     }
 
@@ -457,6 +514,7 @@ impl Backend {
         match self {
             Backend::Imap(imap) => imap.apply(op).await,
             Backend::Graph { client, .. } => client.apply(op).await,
+            Backend::Proton { client, .. } => client.apply(op).await,
         }
     }
 
@@ -464,6 +522,16 @@ impl Backend {
         match self {
             Backend::Imap(imap) => imap.attachment(message, attachment).await,
             Backend::Graph { client, .. } => client.attachment(message, attachment).await,
+            Backend::Proton { client, .. } => client.attachment(message, attachment).await,
+        }
+    }
+
+    /// Folders only the provider can enumerate. IMAP and Graph folders reach the store
+    /// through `create_folder`, so only Proton has anything to add.
+    async fn folders(&mut self) -> Result<Vec<(String, String)>> {
+        match self {
+            Backend::Proton { client, .. } => client.folders().await,
+            Backend::Imap(_) | Backend::Graph { .. } => Ok(Vec::new()),
         }
     }
 }
@@ -482,6 +550,20 @@ fn backend_for(inner: &Inner, account: &Account) -> Result<Backend> {
                 .secrets
                 .get(&key)?
                 .with_context(|| format!("no Proton credentials for {}", account.email))?;
+            // The same keychain entry holds either native-API credentials or a Bridge
+            // login; `kind` tells them apart, and Bridge entries have no `kind` at all.
+            if let Some(session) = ProtonSession::parse(&raw)? {
+                let client = Proton::new(
+                    &proton_api_url(inner),
+                    PROTON_APP_VERSION,
+                    &account.email,
+                    &session,
+                );
+                return Ok(Backend::Proton {
+                    client: Box::new(client),
+                    saved: raw,
+                });
+            }
             let creds: ProtonCreds = serde_json::from_str(&raw).context("Proton credentials")?;
             Ok(Backend::Imap(Box::new(Imap::new(creds.imap()))))
         }
@@ -500,12 +582,32 @@ fn backend_for(inner: &Inner, account: &Account) -> Result<Backend> {
     }
 }
 
+fn proton_api_url(inner: &Inner) -> String {
+    inner
+        .opts
+        .proton_api_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_PROTON_API.to_string())
+}
+
 fn persist_tokens(inner: &Inner, account: Id, backend: &mut Backend) -> Result<()> {
-    if let Backend::Graph { client, saved } = backend {
-        let current = serde_json::to_string(client.tokens())?;
-        if current != *saved {
-            inner.secrets.set(&format!("ms:{account}"), &current)?;
-            *saved = current;
+    match backend {
+        Backend::Imap(_) => {}
+        Backend::Graph { client, saved } => {
+            let current = serde_json::to_string(client.tokens())?;
+            if current != *saved {
+                inner.secrets.set(&format!("ms:{account}"), &current)?;
+                *saved = current;
+            }
+        }
+        Backend::Proton { client, saved } => {
+            // `Credentials` serialises field by field (its map is ordered), so a token
+            // refresh shows up as a different string exactly once.
+            let current = serde_json::to_string(&client.credentials())?;
+            if current != *saved {
+                inner.secrets.set(&format!("proton:{account}"), &current)?;
+                *saved = current;
+            }
         }
     }
     Ok(())
@@ -666,11 +768,60 @@ impl Mail for Engine {
             None => None,
         };
         if let Some(key) = key {
+            // A native Proton session must be revoked, not just forgotten locally.
+            if let Some(raw) = self.inner.secrets.get(&key)?
+                && let Some(session) = ProtonSession::parse(&raw)?
+                && let Ok(account) = self
+                    .inner
+                    .read(Store::accounts)
+                    .map(|all| all.into_iter().find(|a| a.id == id))
+                && let Some(account) = account
+            {
+                let mut client = Proton::new(
+                    &proton_api_url(&self.inner),
+                    PROTON_APP_VERSION,
+                    &account.email,
+                    &session,
+                );
+                let _ = run_async(async {
+                    client.logout().await;
+                    Ok(())
+                });
+            }
             self.inner.secrets.del(&key)?;
         }
         self.inner.write(|s| s.remove_account(id))?;
         self.wake();
         Ok(())
+    }
+
+    fn proton_sign_in(&self, email: &str, password: &str) -> Result<ProtonAuth> {
+        anyhow::ensure!(!email.trim().is_empty(), "Enter your Proton address.");
+        anyhow::ensure!(!password.is_empty(), "Enter your Proton password.");
+        let mut sign_in = SignIn::new(
+            &proton_api_url(&self.inner),
+            PROTON_APP_VERSION,
+            email,
+            password,
+        );
+        let step = run_async(sign_in.start())?;
+        self.settle(sign_in, step)
+    }
+
+    fn proton_sign_in_step(&self, answer: &str) -> Result<ProtonAuth> {
+        let mut sign_in = lock(&self.inner.sign_in)
+            .take()
+            .context("No Proton sign-in in progress")?;
+        let step = match run_async(sign_in.step(answer)) {
+            Ok(step) => step,
+            Err(error) => {
+                // The answer was wrong, but the rest of the handshake is still valid: the
+                // next answer resumes at the same step instead of starting over.
+                *lock(&self.inner.sign_in) = Some(sign_in);
+                return Err(error);
+            }
+        };
+        self.settle(sign_in, step)
     }
 
     fn folders(&self) -> Result<Vec<Folder>> {
@@ -701,6 +852,7 @@ impl Mail for Engine {
             match &mut backend {
                 Backend::Imap(imap) => imap.create_folder(name).await,
                 Backend::Graph { client, .. } => client.create_folder(name).await,
+                Backend::Proton { client, .. } => client.create_folder(name).await,
             }
         })?;
         persist_tokens(&self.inner, account, &mut backend)?;
@@ -886,7 +1038,7 @@ impl Mail for Engine {
         let events = run_async(async {
             match &mut backend {
                 Backend::Graph { client, .. } => client.calendar_today(offset).await,
-                Backend::Imap(_) => Ok(Vec::new()),
+                Backend::Imap(_) | Backend::Proton { .. } => Ok(Vec::new()),
             }
         })?;
         // A calendar call can refresh the access token; keep the keychain current.

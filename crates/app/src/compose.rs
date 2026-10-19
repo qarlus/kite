@@ -1,14 +1,14 @@
 //! Compose: a floating panel for new mail, reply, reply-all and forward.
-//! Phase 1 keeps the draft in memory; closing the panel without sending keeps it.
-use crate::app::Kite;
+//! Drafts save through `Mail::save_draft`: debounced while typing, and on close.
+use crate::app::{Kite, Overlay};
 use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::input::{Input, InputState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Addr, Draft, Id, Message, Ms};
+use kite_core::model::{Action as MailAction, Addr, Draft, Id, Message, Ms};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -20,6 +20,8 @@ pub struct Compose {
     pub subject: Entity<InputState>,
     pub body: Entity<TextareaState>,
     pub account_id: Id,
+    /// The saved draft this panel edits, so a later save replaces it.
+    pub id: Option<Id>,
     /// The message being replied to (`None` for new mail and forward).
     pub reply_to: Option<Id>,
     pub show_cc: bool,
@@ -27,11 +29,19 @@ pub struct Compose {
     send_at: Option<Ms>,
     remind_at: Option<Ms>,
     title: &'static str,
+    /// Unsaved edits exist since the last successful save.
+    dirty: bool,
+    /// The draft has been saved at least once, so the panel can say "Saved".
+    saved: bool,
+    /// Bumped on every edit and save, so a stale debounce cannot save newer state.
+    save_gen: u64,
+    _subs: Vec<Subscription>,
 }
 
 /// Everything a new panel starts with. Keeps the constructor readable.
 struct Parts {
     account_id: Id,
+    id: Option<Id>,
     title: &'static str,
     to: Vec<Addr>,
     cc: Vec<Addr>,
@@ -65,18 +75,41 @@ impl Compose {
                 .placeholder("Write a message")
                 .default_value(parts.body)
         });
+        // Autosave is driven by real edits, so a keystroke never waits on the store.
+        let mut subs = Vec::with_capacity(4);
+        for input in [&to, &cc, &subject] {
+            subs.push(
+                cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.compose_changed(cx);
+                    }
+                }),
+            );
+        }
+        subs.push(
+            cx.subscribe_in(&body, window, |this, _, event: &InputEvent, _, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.compose_changed(cx);
+                }
+            }),
+        );
         Self {
             to,
             cc,
             subject,
             body,
             account_id: parts.account_id,
+            id: parts.id,
             reply_to: parts.reply_to,
             show_cc: !parts.cc.is_empty(),
             bcc: parts.bcc,
             send_at: parts.send_at,
             remind_at: parts.remind_at,
             title: parts.title,
+            dirty: false,
+            saved: parts.id.is_some(),
+            save_gen: 0,
+            _subs: subs,
         }
     }
 
@@ -86,6 +119,7 @@ impl Compose {
             cx,
             Parts {
                 account_id: draft.account_id,
+                id: draft.id,
                 title: "New message",
                 to: draft.to,
                 cc: draft.cc,
@@ -101,6 +135,7 @@ impl Compose {
 
     fn draft(&self, cx: &App) -> Draft {
         Draft {
+            id: self.id,
             account_id: self.account_id,
             to: parse_addrs(&self.to.read(cx).value()),
             cc: parse_addrs(&self.cc.read(cx).value()),
@@ -118,6 +153,7 @@ impl Compose {
             && self.cc.read(cx).value().trim().is_empty()
             && self.subject.read(cx).value().trim().is_empty()
             && self.body.read(cx).value().trim().is_empty()
+            && self.bcc.is_empty()
     }
 }
 
@@ -147,7 +183,7 @@ impl Kite {
             .unwrap_or_default()
     }
 
-    fn has_draft(&self, cx: &App) -> bool {
+    pub(crate) fn has_draft(&self, cx: &App) -> bool {
         match &self.compose {
             Some(compose) => !compose.is_empty(cx),
             None => false,
@@ -166,6 +202,7 @@ impl Kite {
                 cx,
                 Parts {
                     account_id,
+                    id: None,
                     title: "New message",
                     to: Vec::new(),
                     cc: Vec::new(),
@@ -220,20 +257,26 @@ impl Kite {
         } else if all {
             reply_all(&message, &own)
         } else {
-            (vec![message.from.clone()], Vec::new())
+            (reply_to(&message, &own), Vec::new())
         };
         let reply_to = if forward { None } else { Some(message.id) };
+        let body = if forward {
+            forward_body(&message)
+        } else {
+            quote(&message)
+        };
         self.compose = Some(Compose::new(
             window,
             cx,
             Parts {
                 account_id,
+                id: None,
                 title,
                 to,
                 cc,
                 bcc: Vec::new(),
                 subject: prefixed(&message.subject, prefix),
-                body: quote(&message),
+                body,
                 reply_to,
                 send_at: None,
                 remind_at: None,
@@ -245,7 +288,130 @@ impl Kite {
     }
 
     pub(crate) fn close_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_compose(cx);
         self.compose_open = false;
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// A keystroke in any field: paint the edit, then schedule a save after a quiet pause.
+    pub(crate) fn compose_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        compose.dirty = true;
+        compose.save_gen = compose.save_gen.wrapping_add(1);
+        let generation = compose.save_gen;
+        let timer = cx.background_executor().timer(Duration::from_millis(1500));
+        cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                if this
+                    .compose
+                    .as_ref()
+                    .is_some_and(|compose| compose.save_gen == generation)
+                {
+                    this.save_compose(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Saves the draft now. An empty draft is never written; one that was saved and
+    /// then emptied is discarded instead.
+    pub(crate) fn save_compose(&mut self, cx: &mut Context<Self>) {
+        let empty = self
+            .compose
+            .as_mut()
+            .map(|compose| {
+                compose.save_gen = compose.save_gen.wrapping_add(1);
+                compose.is_empty(cx)
+            })
+            .unwrap_or(true);
+        if empty {
+            let id = self.compose.as_mut().and_then(|compose| compose.id.take());
+            if let Some(id) = id {
+                self.mail.discard_draft(id).ok();
+            }
+            // Keep the panel open: an emptied editor can be typed into again.
+            if let Some(compose) = &mut self.compose {
+                compose.dirty = false;
+                compose.saved = false;
+            }
+            cx.notify();
+            return;
+        }
+        let draft = self.compose.as_ref().map(|compose| compose.draft(cx));
+        let Some(draft) = draft else {
+            return;
+        };
+        match self.mail.save_draft(draft) {
+            Ok(id) => {
+                if let Some(compose) = &mut self.compose {
+                    compose.id = Some(id);
+                    compose.dirty = false;
+                    compose.saved = true;
+                }
+            }
+            Err(error) => self.toast(format!("Could not save draft: {error}"), cx),
+        }
+        cx.notify();
+    }
+
+    fn flush_compose(&mut self, cx: &mut Context<Self>) {
+        if self.compose.as_ref().is_some_and(|compose| compose.dirty) {
+            self.save_compose(cx);
+            return;
+        }
+        if self
+            .compose
+            .as_ref()
+            .is_some_and(|compose| compose.is_empty(cx))
+        {
+            self.compose = None;
+        }
+    }
+
+    /// Runs when the user confirms the shared snooze picker: it either snoozes the thread
+    /// or, when opened from compose, schedules the send at the chosen time.
+    pub(crate) fn confirm_snooze(&mut self, at: Ms, window: &mut Window, cx: &mut Context<Self>) {
+        self.overlay = Overlay::None;
+        if std::mem::take(&mut self.send_later) {
+            if let Some(compose) = &mut self.compose {
+                compose.send_at = Some(at);
+            }
+            if self.compose.is_some() {
+                self.send_compose(window, cx);
+            }
+        } else {
+            self.act(MailAction::Snooze { until: at }, true, "Snoozed", cx);
+        }
+    }
+
+    /// Cmd/Ctrl+Shift+Enter: pick when to send, reusing the snooze presets and parser.
+    pub(crate) fn schedule_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.compose_open {
+            return;
+        }
+        self.send_later = true;
+        self.overlay = Overlay::Snooze(crate::snooze::Snooze::new(Local::now()));
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// Throws the draft away, on the provider too when it was saved.
+    pub(crate) fn discard_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let id = self.compose.as_mut().and_then(|compose| compose.id.take());
+        self.compose = None;
+        self.compose_open = false;
+        let error = id.and_then(|id| self.mail.discard_draft(id).err());
+        match error {
+            Some(error) => self.toast(format!("Could not discard draft: {error}"), cx),
+            None => self.toast("Draft discarded", cx),
+        }
         window.focus(&self.focus, cx);
         cx.notify();
     }
@@ -258,7 +424,7 @@ impl Kite {
             return;
         };
         let draft = compose.draft(cx);
-        if draft.to.is_empty() {
+        if draft.to.is_empty() && draft.cc.is_empty() && draft.bcc.is_empty() {
             self.toast("Add a recipient", cx);
             return;
         }
@@ -266,19 +432,28 @@ impl Kite {
             .to
             .iter()
             .chain(&draft.cc)
+            .chain(&draft.bcc)
             .map(|addr| addr.email.trim())
             .find(|&email| !valid_email(email))
         {
             self.toast(format!("Invalid address: {invalid}"), cx);
             return;
         }
+        let scheduled = draft.send_at.is_some();
         match self.mail.send(draft) {
             Ok(id) => {
                 self.record_sent(id);
                 self.compose = None;
                 self.compose_open = false;
                 window.focus(&self.focus, cx);
-                self.toast("Sending…", cx);
+                self.toast(
+                    if scheduled {
+                        "Send scheduled"
+                    } else {
+                        "Sending…"
+                    },
+                    cx,
+                );
                 // The send is undoable only for the configured window.
                 let delay = Duration::from_secs(self.settings.undo_send_secs as u64);
                 let timer = cx.background_executor().timer(delay);
@@ -321,12 +496,13 @@ impl Kite {
         true
     }
 
-    /// The latest message of the open thread, or of the selected row.
+    /// The expanded message of the open thread (the latest by default), or of the selected row.
     fn reply_target(&self) -> Option<(Id, Message)> {
         if let Some(open) = &self.open {
+            let ix = open.expanded.min(open.messages.len().saturating_sub(1));
             return open
                 .messages
-                .last()
+                .get(ix)
                 .map(|message| (open.account_id, message.clone()));
         }
         let row = self.rows.get(self.sel)?;
@@ -356,6 +532,14 @@ impl Kite {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        // A draft picked in the Drafts mailbox needs a window to build its fields, so it
+        // is opened here rather than inside `open_thread`.
+        if let Some(draft) = self.open_draft.take() {
+            self.open = None;
+            self.compose = Some(Compose::from_draft(window, cx, draft));
+            self.compose_open = true;
+            self.focus_compose(window, cx, false);
+        }
         if !self.compose_open {
             return None;
         }
@@ -367,6 +551,13 @@ impl Kite {
         let body = compose.body.clone();
         let show_cc = compose.show_cc;
         let title = compose.title;
+        let status = if compose.dirty {
+            "Saving…"
+        } else if compose.saved {
+            "Saved"
+        } else {
+            ""
+        };
         // DESIGN: a reply within a thread takes the full content pane; new mail
         // and forwards float bottom-right at 560×480.
         let is_reply = compose.reply_to.is_some();
@@ -422,14 +613,12 @@ impl Kite {
                                 .rounded(px(RADIUS_SM))
                                 .cursor_pointer()
                                 .hover(|s| s.bg(t.bg3))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_compose(window, cx)
-                                }))
-                                .child(
-                                    Icon::new(IconName::X)
-                                        .with_size(px(14.))
-                                        .text_color(t.fg2),
-                                ),
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| {
+                                        this.close_compose(window, cx)
+                                    }),
+                                )
+                                .child(Icon::new(IconName::X).with_size(px(14.)).text_color(t.fg2)),
                         ),
                 )
                 .child(field_row(&t, "To", &to, "compose-to", "To"))
@@ -462,7 +651,13 @@ impl Kite {
                             )
                         }),
                 )
-                .child(field_row(&t, "Subject", &subject, "compose-subject", "Subject"))
+                .child(field_row(
+                    &t,
+                    "Subject",
+                    &subject,
+                    "compose-subject",
+                    "Subject",
+                ))
                 .child(
                     div()
                         .id("compose-body")
@@ -498,35 +693,79 @@ impl Kite {
                         .border_color(t.line)
                         .child(
                             div()
-                                .text_size(t.px(11.))
-                                .text_color(t.fg3)
-                                .child("Esc keeps this draft"),
-                        )
-                        .child(
-                            div()
-                                .id("compose-send")
-                                .test_support()
-                                .aria_label("Send")
                                 .flex()
                                 .items_center()
-                                .gap_2()
-                                .px_3()
-                                .py_2()
-                                .rounded(px(RADIUS_SM))
-                                .cursor_pointer()
-                                .bg(theme::accent_glow(&t))
-                                .text_color(t.fg)
-                                .text_size(t.px(13.))
-                                .font_weight(FontWeight(600.))
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.send_compose(window, cx)
-                                }))
-                                .child("Send")
+                                .gap_3()
                                 .child(
                                     div()
                                         .text_size(t.px(11.))
+                                        .text_color(t.fg3)
+                                        .child("Esc keeps this draft"),
+                                )
+                                .child(
+                                    div()
+                                        .id("compose-status")
+                                        .test_support()
+                                        .aria_label(status.to_string())
+                                        .text_size(t.px(11.))
+                                        .text_color(t.fg3)
+                                        .child(status),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(
+                                    div()
+                                        .id("compose-discard")
+                                        .test_support()
+                                        .aria_label("Discard draft")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded(px(RADIUS_SM))
+                                        .cursor_pointer()
+                                        .text_size(t.px(13.))
+                                        .text_color(t.fg2)
+                                        .hover(|s| s.bg(t.bg3).text_color(t.danger))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.discard_compose(window, cx)
+                                        }))
+                                        .child("Discard")
+                                        .child(
+                                            div()
+                                                .text_size(t.px(11.))
+                                                .text_color(t.fg3)
+                                                .child("⌘⇧D"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("compose-send")
+                                        .test_support()
+                                        .aria_label("Send")
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .px_3()
+                                        .py_2()
+                                        .rounded(px(RADIUS_SM))
+                                        .cursor_pointer()
+                                        .bg(theme::accent_glow(&t))
                                         .text_color(t.fg)
-                                        .child("⌘↵"),
+                                        .text_size(t.px(13.))
+                                        .font_weight(FontWeight(600.))
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.send_compose(window, cx)
+                                        }))
+                                        .child("Send")
+                                        .child(
+                                            div().text_size(t.px(11.)).text_color(t.fg).child("⌘↵"),
+                                        ),
                                 ),
                         ),
                 )
@@ -590,8 +829,12 @@ fn format_addr(addr: &Addr) -> String {
 }
 
 fn name_needs_quotes(name: &str) -> bool {
-    name.chars()
-        .any(|c| matches!(c, ',' | ';' | '<' | '>' | '"' | '@' | '\\' | '(' | ')' | ':'))
+    name.chars().any(|c| {
+        matches!(
+            c,
+            ',' | ';' | '<' | '>' | '"' | '@' | '\\' | '(' | ')' | ':'
+        )
+    })
 }
 
 /// Accepts comma or semicolon separated `Name <email>` and bare addresses,
@@ -684,36 +927,79 @@ fn reply_all(message: &Message, own: &str) -> (Vec<Addr>, Vec<Addr>) {
     (to, cc)
 }
 
-/// Adds a prefix once, so replies and forwards never stack their own marker.
-fn prefixed(subject: &str, prefix: &str) -> String {
-    let lower = subject.trim_start().to_lowercase();
-    let already = if prefix.starts_with("Re") {
-        lower.starts_with("re:")
-    } else {
-        lower.starts_with("fwd:") || lower.starts_with("fw:")
-    };
-    if already {
-        subject.to_string()
-    } else {
-        format!("{prefix}{subject}")
+/// A plain reply goes to the sender, unless I wrote the message: then it goes to the
+/// people I originally addressed, deduped and without my own address.
+fn reply_to(message: &Message, own: &str) -> Vec<Addr> {
+    if !message.from.email.eq_ignore_ascii_case(own) {
+        return vec![message.from.clone()];
     }
+    let mut seen = HashSet::new();
+    message
+        .to
+        .iter()
+        .filter(|addr| {
+            let email = addr.email.trim();
+            !email.is_empty()
+                && !email.eq_ignore_ascii_case(own)
+                && seen.insert(email.to_ascii_lowercase())
+        })
+        .cloned()
+        .collect()
+}
+
+/// Adds a prefix once: any leading `Re:`/`Fwd:`/`Fw:` chain (in any case) is replaced
+/// by the single marker the action wants, so subjects never stack.
+fn prefixed(subject: &str, prefix: &str) -> String {
+    let mut rest = subject.trim_start();
+    loop {
+        let next = ["re:", "fwd:", "fw:"].iter().find_map(|marker| {
+            (rest.len() >= marker.len()
+                && rest.as_bytes()[..marker.len()].eq_ignore_ascii_case(marker.as_bytes()))
+            .then(|| &rest[marker.len()..])
+        });
+        match next {
+            Some(next) => rest = next.trim_start(),
+            None => break,
+        }
+    }
+    format!("{prefix}{rest}")
+}
+
+fn format_date(ms: Ms) -> String {
+    Local
+        .timestamp_millis_opt(ms)
+        .single()
+        .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+fn quote_lines(text: &str) -> String {
+    text.lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// The original plain text under a one-line attribution.
 fn quote(message: &Message) -> String {
-    let date = Local
-        .timestamp_millis_opt(message.date)
-        .single()
-        .map(|date| date.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_default();
+    let date = format_date(message.date);
     let from = format_addr(&message.from);
-    let quoted = message
-        .text
-        .lines()
-        .map(|line| format!("> {line}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("\n\nOn {date}, {from} wrote:\n{quoted}")
+    format!(
+        "\n\nOn {date}, {from} wrote:\n{}",
+        quote_lines(&message.text)
+    )
+}
+
+/// A forward carries the original headers above the quoted body.
+fn forward_body(message: &Message) -> String {
+    let mut out = String::from("\n\n---------- Forwarded message ----------\n");
+    out.push_str(&format!("From: {}\n", format_addr(&message.from)));
+    out.push_str(&format!("Date: {}\n", format_date(message.date)));
+    out.push_str(&format!("Subject: {}\n", message.subject));
+    out.push_str(&format!("To: {}\n", format_addrs(&message.to)));
+    out.push('\n');
+    out.push_str(&quote_lines(&message.text));
+    out
 }
 
 /// A plausible `local@domain` shape for sending; not a full RFC 5322 validator.

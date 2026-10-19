@@ -203,6 +203,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         ("light", "Paper", theme::PAPER),
         ("midnight", "Midnight", theme::preset("midnight")),
         ("linen", "Linen", theme::preset("linen")),
+        ("ember", "Ember", theme::preset("ember")),
     ];
     if let Some(custom) = &kite.settings.custom_theme
         && let Ok(palette) = theme::custom(custom)
@@ -358,5 +359,53 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                 .child(grid)
                 .child(div().pt_3().child(theme_actions)),
         )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(heading(
+                    t,
+                    "Layout",
+                    "How much of the window the conversation gets.",
+                ))
+                .child(card(
+                    t,
+                    vec![row(
+                        t,
+                        "Reading pane",
+                        "Read beside the list; off opens a conversation across the window.",
+                        switch("reading-pane", kite.settings.reading_pane, t).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                let mut settings = this.settings.clone();
+                                settings.reading_pane = !settings.reading_pane;
+                                this.save_preferences(settings, window, cx);
+                            }),
+                        ),
+                    )],
+                )),
+        )
         .into_any_element()
+}
+
+/// An on/off setting drawn as a switch: a filled track when on.
+fn switch(id: &'static str, on: bool, t: Theme) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label("Reading pane")
+        .aria_selected(on)
+        .w(px(36.))
+        .h(px(20.))
+        .flex()
+        .items_center()
+        .p(px(2.))
+        .when(on, |d| d.justify_end())
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if on {
+            t.accent.into()
+        } else {
+            Theme::alpha(t.fg3, 0.45)
+        })
+        .child(div().size(px(16.)).rounded_full().bg(t.bg))
 }

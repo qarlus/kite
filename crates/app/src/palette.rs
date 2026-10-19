@@ -112,7 +112,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         .skip(palette.sel.saturating_sub(8))
         .take(9)
         .filter_map(|(ix, id)| {
-            let cmd: &Cmd = keys::COMMANDS.iter().find(|c| c.id == *id)?;
+            let cmd: &Cmd = keys::command(*id)?;
+            let keys = keys::bound(&kite.settings, cmd);
             let selected = ix == palette.sel;
             let command_id = *id;
             Some(
@@ -140,15 +141,28 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     })
                     .child(
                         div()
-                            .text_size(t.px(14.))
-                            .when(selected, |d| d.text_color(t.fg))
-                            .child(cmd.title),
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(t.px(14.))
+                                    .when(selected, |d| d.text_color(t.fg))
+                                    .child(cmd.title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.px(11.))
+                                    .text_color(t.fg3)
+                                    .child(cmd.group.label()),
+                            ),
                     )
                     .when(selected, |d| {
                         // DESIGN › Layout: the selected row glows accent on its left edge.
                         d.child(crate::list::selection_edge(&t))
                     })
-                    .child(keys_pills(&t, cmd.keys[0]))
+                    .child(keys_pills(&t, &keys.join(" ")))
                     .into_any_element(),
             )
         })

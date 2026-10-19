@@ -8,7 +8,7 @@ use gpui_kit::{
 use kite_core::api::Mail;
 use kite_core::model::{
     Account, Action, Addr, Attachment, CalEvent, ChatMsg, Draft, Event, Folder, Id, Mailbox,
-    Message, Ms, ProtonLogin, Settings, Split, ThreadSummary, View,
+    Message, Ms, ProtonAuth, ProtonLogin, Settings, Split, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -41,6 +41,12 @@ pub struct Fixture {
     pub bridge_started: Mutex<usize>,
     /// Accounts that become discoverable once Bridge has been started.
     pub bridge_accounts: Mutex<Vec<ProtonLogin>>,
+    /// What `proton_sign_in` answers instead of an account (2FA, mailbox password, HV).
+    pub proton_step: Mutex<Option<ProtonAuth>>,
+    /// Address and password the native Proton form submitted.
+    pub proton_attempts: Mutex<Vec<(String, String)>>,
+    /// Answers passed to `proton_sign_in_step`.
+    pub proton_answers: Mutex<Vec<String>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
     pub settings: Mutex<Settings>,
@@ -63,6 +69,13 @@ pub struct Fixture {
     outbox: Mutex<HashMap<Id, Draft>>,
     cancelled: Mutex<Vec<Id>>,
     send_seq: AtomicI64,
+    /// Drafts written by `save_draft`, each with its returned id.
+    saved_drafts: Mutex<Vec<Draft>>,
+    /// draft id -> the Drafts-mailbox thread that shows it.
+    draft_threads: Mutex<HashMap<Id, Id>>,
+    /// Draft ids passed to `discard_draft`.
+    discarded: Mutex<Vec<Id>>,
+    draft_seq: AtomicI64,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
 }
@@ -125,6 +138,9 @@ impl Fixture {
             bridge_installed: Mutex::new(false),
             bridge_started: Mutex::new(0),
             bridge_accounts: Mutex::new(Vec::new()),
+            proton_step: Mutex::new(None),
+            proton_attempts: Mutex::new(Vec::new()),
+            proton_answers: Mutex::new(Vec::new()),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
             settings: Mutex::new(Settings {
@@ -150,6 +166,10 @@ impl Fixture {
             outbox: Mutex::new(HashMap::new()),
             cancelled: Mutex::new(Vec::new()),
             send_seq: AtomicI64::new(9001),
+            saved_drafts: Mutex::new(Vec::new()),
+            draft_threads: Mutex::new(HashMap::new()),
+            discarded: Mutex::new(Vec::new()),
+            draft_seq: AtomicI64::new(1),
             senders: Mutex::new(Vec::new()),
             next_token: AtomicI64::new(1),
         })
@@ -186,6 +206,16 @@ impl Fixture {
         self.cancelled.lock().unwrap().clone()
     }
 
+    /// Drafts written through `save_draft`, newest last, each carrying its id.
+    pub fn saved_drafts(&self) -> Vec<Draft> {
+        self.saved_drafts.lock().unwrap().clone()
+    }
+
+    /// Draft ids the UI threw away through `discard_draft`.
+    pub fn discarded(&self) -> Vec<Id> {
+        self.discarded.lock().unwrap().clone()
+    }
+
     /// Replaces the latest message's To and Cc lists, so reply-all has addresses to filter.
     pub fn set_message_recipients(&self, thread: Id, to: Vec<Addr>, cc: Vec<Addr>) {
         if let Some(message) = self
@@ -210,6 +240,19 @@ impl Fixture {
             .and_then(|messages| messages.last_mut())
         {
             message.from = from;
+        }
+    }
+
+    /// Replaces the latest message's subject, so subject prefixes can be exercised.
+    pub fn set_message_subject(&self, thread: Id, subject: &str) {
+        if let Some(message) = self
+            .messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+        {
+            message.subject = subject.into();
         }
     }
 
@@ -411,6 +454,19 @@ impl Fixture {
             .unwrap_or_default()
     }
 
+    /// Moves a conversation onto a specific date, so the day gutter's groups can be exercised.
+    pub fn set_thread_date(&self, thread: Id, date: Ms) {
+        if let Some(row) = self
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row.id == thread)
+        {
+            row.date = date;
+        }
+    }
+
     /// Adds a thread and tells the UI the store changed.
     pub fn push_thread(&self) -> Id {
         let id = self.next_id();
@@ -480,6 +536,41 @@ fn message(
         text: text.into(),
         attachments: Vec::new(),
         unread: false,
+    }
+}
+
+/// The Drafts-list display name: its recipients, since the sender is always us.
+fn draft_participants(draft: &Draft) -> String {
+    let names: Vec<String> = draft
+        .to
+        .iter()
+        .chain(&draft.cc)
+        .map(|addr| {
+            if addr.name.trim().is_empty() {
+                addr.email.clone()
+            } else {
+                addr.name.clone()
+            }
+        })
+        .filter(|name| !name.is_empty())
+        .collect();
+    if names.is_empty() {
+        "(no recipients)".into()
+    } else {
+        names.join(", ")
+    }
+}
+
+impl Fixture {
+    /// The account a finished native Proton sign-in creates.
+    fn add_native_proton(&self, email: &str, password: &str) -> anyhow::Result<ProtonAuth> {
+        Ok(ProtonAuth::Done(self.add_proton(ProtonLogin {
+            email: email.to_string(),
+            password: password.to_string(),
+            host: None,
+            imap_port: None,
+            smtp_port: None,
+        })?))
     }
 }
 
@@ -727,6 +818,128 @@ impl Mail for Fixture {
         Ok(self.outbox.lock().unwrap().remove(&id))
     }
 
+    fn save_draft(&self, draft: Draft) -> anyhow::Result<Id> {
+        let id = match draft.id {
+            Some(id) => id,
+            None => self.draft_seq.fetch_add(1, Ordering::SeqCst),
+        };
+        let content = Draft {
+            id: Some(id),
+            ..draft
+        };
+        let now = chrono::Local::now().timestamp_millis();
+        if let Some(thread) = self.draft_threads.lock().unwrap().get(&id).copied() {
+            if let Some(row) = self
+                .threads
+                .lock()
+                .unwrap()
+                .iter_mut()
+                .find(|row| row.id == thread)
+            {
+                row.subject = content.subject.clone();
+                row.snippet = content.body.lines().next().unwrap_or_default().to_string();
+                row.participants = draft_participants(&content);
+                row.date = now;
+            }
+        } else {
+            let thread = self.next_id();
+            self.threads.lock().unwrap().insert(
+                0,
+                ThreadSummary {
+                    id: thread,
+                    account_id: content.account_id,
+                    subject: content.subject.clone(),
+                    snippet: content.body.lines().next().unwrap_or_default().to_string(),
+                    participants: draft_participants(&content),
+                    date: now,
+                    unread: false,
+                    starred: false,
+                    important: false,
+                    attachments: false,
+                    labels: Vec::new(),
+                    count: 1,
+                    snoozed_until: None,
+                },
+            );
+            self.messages.lock().unwrap().insert(
+                thread,
+                vec![Message {
+                    id: thread * 10 + 1,
+                    thread_id: thread,
+                    from: Addr {
+                        name: String::new(),
+                        email: content
+                            .to
+                            .first()
+                            .map(|addr| addr.email.clone())
+                            .unwrap_or_default(),
+                    },
+                    to: content.to.clone(),
+                    cc: content.cc.clone(),
+                    date: now,
+                    subject: content.subject.clone(),
+                    html: None,
+                    text: content.body.clone(),
+                    attachments: Vec::new(),
+                    unread: false,
+                }],
+            );
+            self.locations
+                .lock()
+                .unwrap()
+                .insert(thread, (Mailbox::Drafts, None));
+            self.draft_threads.lock().unwrap().insert(id, thread);
+        }
+        let mut saved = self.saved_drafts.lock().unwrap();
+        saved.retain(|draft| draft.id != Some(id));
+        saved.push(content.clone());
+        drop(saved);
+        self.emit(Event::Changed(vec![content.account_id]));
+        Ok(id)
+    }
+
+    fn draft(&self, thread: Id) -> anyhow::Result<Option<Draft>> {
+        let id = self
+            .draft_threads
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, shown)| **shown == thread)
+            .map(|(id, _)| *id);
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        Ok(self
+            .saved_drafts
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|draft| draft.id == Some(id))
+            .cloned())
+    }
+
+    fn discard_draft(&self, id: Id) -> anyhow::Result<()> {
+        self.discarded.lock().unwrap().push(id);
+        let account = {
+            let mut saved = self.saved_drafts.lock().unwrap();
+            let account = saved
+                .iter()
+                .find(|draft| draft.id == Some(id))
+                .map(|draft| draft.account_id);
+            saved.retain(|draft| draft.id != Some(id));
+            account
+        };
+        if let Some(thread) = self.draft_threads.lock().unwrap().remove(&id) {
+            self.threads.lock().unwrap().retain(|row| row.id != thread);
+            self.messages.lock().unwrap().remove(&thread);
+            self.locations.lock().unwrap().remove(&thread);
+        }
+        if let Some(account) = account {
+            self.emit(Event::Changed(vec![account]));
+        }
+        Ok(())
+    }
+
     fn contacts(&self, _: &str) -> anyhow::Result<Vec<Addr>> {
         Ok(Vec::new())
     }
@@ -799,6 +1012,36 @@ impl Mail for Fixture {
         let (tx, rx) = async_channel::unbounded();
         self.senders.lock().unwrap().push(tx);
         rx
+    }
+
+    fn proton_sign_in(&self, email: &str, password: &str) -> anyhow::Result<ProtonAuth> {
+        self.proton_attempts
+            .lock()
+            .unwrap()
+            .push((email.to_string(), password.to_string()));
+        if let Some(error) = self.account_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        if let Some(step) = self.proton_step.lock().unwrap().clone() {
+            return Ok(step);
+        }
+        self.add_native_proton(email, password)
+    }
+
+    fn proton_sign_in_step(&self, answer: &str) -> anyhow::Result<ProtonAuth> {
+        self.proton_answers.lock().unwrap().push(answer.to_string());
+        if let Some(error) = self.account_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        self.proton_step.lock().unwrap().take();
+        let email = self
+            .proton_attempts
+            .lock()
+            .unwrap()
+            .last()
+            .map(|(email, _)| email.clone())
+            .unwrap_or_default();
+        self.add_native_proton(&email, answer)
     }
 }
 

@@ -52,7 +52,7 @@ async fn opening_a_thread_renders_its_html_body_at_the_rendered_height(cx: &mut 
 }
 
 #[gpui_kit::test]
-async fn compact_html_uses_only_the_space_remaining_beside_the_sidebar(cx: &mut TestAppContext) {
+async fn compact_html_uses_only_the_space_remaining_in_the_reading_pane(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (window, _) = common::open_window(
         cx,
@@ -66,10 +66,14 @@ async fn compact_html_uses_only_the_space_remaining_beside_the_sidebar(cx: &mut 
     .await;
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let sidebar = window.find("sidebar").bounds();
+        let list = window.find("list-column").bounds();
         let body = window.find("html-22").bounds();
-        assert_eq!(body.size.width, gpui_kit::px(460.));
-        assert!(body.origin.x >= sidebar.right());
+        // The body is laid out for the pane, inside its padding, less the indent it hangs under.
+        let expected = gpui_kit::px(
+            720. - list.right().as_f32() - 2. * kite::thread::PANE_PAD - kite::thread::BODY_INDENT,
+        );
+        assert_eq!(body.size.width, expected);
+        assert!(body.origin.x >= list.right());
         assert!(body.right() <= gpui_kit::px(720.));
     })
     .unwrap();
@@ -115,6 +119,34 @@ fn older_messages_collapse_until_clicked(cx: &mut TestAppContext) {
             window.find("text-21").label(),
             Some("Earlier plain text"),
             "clicking the collapsed header expands it"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_thread_toolbar_replies_by_click(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("thread-toolbar").label(),
+            Some("Thread actions")
+        );
+        assert_eq!(
+            window
+                .find(("action", kite::keys::cmd::REPLY as usize))
+                .label(),
+            Some("Reply (r)"),
+            "a toolbar button names the key that runs it"
+        );
+        window.click(("action", kite::keys::cmd::REPLY as usize), cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose").is_some(),
+            "the reply panel opened"
         );
     })
     .unwrap();

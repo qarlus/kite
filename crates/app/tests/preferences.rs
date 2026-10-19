@@ -31,7 +31,7 @@ impl Drop for TempFile {
 }
 
 #[gpui_kit::test]
-fn short_sidebar_keeps_the_account_switcher_anchored_and_switches_by_keyboard(
+fn a_short_window_keeps_the_rail_actions_and_switches_accounts_by_keyboard(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_kit::init);
@@ -52,18 +52,16 @@ fn short_sidebar_keeps_the_account_switcher_anchored_and_switches_by_keyboard(
     );
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let switcher = window.find("account-switcher").bounds();
-        assert!(switcher.bottom() <= px(480.));
-        assert!(switcher.origin.y > px(350.));
-        assert!(window.try_find("account-2").is_none());
-        window.scroll(
-            "sidebar-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-600.))),
-            cx,
-        );
-        window.render_frame(cx);
-        assert_eq!(window.find("account-switcher").bounds(), switcher);
-        window.click("account-switcher", cx);
+        // The window actions stay anchored at the bottom of the rail.
+        let settings = window.find("open-settings").bounds();
+        assert!(settings.bottom() <= px(480.));
+        assert!(settings.origin.y > px(350.));
+        // The account menu is a key away in any window size.
+        assert!(window.try_find("account-menu").is_none());
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-shift-a");
+    cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("account-menu").label(), Some("Switch account"));
     })
@@ -74,11 +72,12 @@ fn short_sidebar_keeps_the_account_switcher_anchored_and_switches_by_keyboard(
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(
-            window.find("account-switcher").label(),
-            Some("Switch account: karl@outlook.com")
-        );
         assert!(window.try_find("account-menu").is_none());
+        assert_eq!(
+            window.find(("rail-account", 2usize)).selected(),
+            Some(true),
+            "the rail marks the scoped account"
+        );
     })
     .unwrap();
 }
@@ -93,11 +92,9 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("search").is_none());
-        assert_eq!(
-            window
-                .find(("mailbox", kite_core::model::Mailbox::Inbox as usize))
-                .selected(),
-            Some(false)
+        assert!(
+            window.try_find("mailbox-picker").is_none(),
+            "settings replaces the mail list, so no mailbox picker shows"
         );
         window.click("theme-linen", cx);
         window.render_frame(cx);
@@ -118,7 +115,7 @@ fn theme_and_text_size_persist_to_disk_and_reopen_in_the_real_view(cx: &mut Test
         window.render_frame(cx);
         let height = window.find(("row", 0usize)).bounds().size.height.as_f32();
         assert!(
-            (height - 44. * 15. / 14.).abs() <= 1.,
+            (height - kite::theme::ROW_H * 2. * 15. / 14.).abs() <= 1.,
             "row height {height}"
         );
     })
@@ -352,10 +349,11 @@ async fn account_connect_and_confirmed_remove_update_settings_and_switcher(
         window.render_frame(cx);
         window.click("close-settings", cx);
         window.render_frame(cx);
-        window.click("account-switcher", cx);
-        window.render_frame(cx);
-        assert!(window.try_find("account-3").is_none());
-        assert_eq!(window.find("account-2").label(), Some("karl@outlook.com"));
+        assert!(window.try_find(("rail-account", 3usize)).is_none());
+        assert_eq!(
+            window.find(("rail-account", 2usize)).label(),
+            Some("karl@outlook.com")
+        );
     })
     .unwrap();
 }
@@ -435,12 +433,12 @@ fn compact_settings_fit_beside_the_sidebar(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let sidebar = window.find("sidebar").bounds();
+        let rail = window.find("sidebar").bounds();
         let page = window.find("settings-page").bounds();
-        assert!(page.origin.x >= sidebar.right());
+        assert!(page.origin.x >= rail.right());
         assert!(page.right() <= px(720.));
         assert!(window.find("theme-light").bounds().right() <= px(720.));
-        assert!(window.find("account-switcher").bounds().bottom() <= px(480.));
+        assert!(window.find("open-settings").bounds().bottom() <= px(480.));
         window.click("close-settings", cx);
         window.render_frame(cx);
         assert!(window.try_find("settings-page").is_none());

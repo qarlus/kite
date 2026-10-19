@@ -147,3 +147,36 @@ fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut
     assert_eq!(settings.font_color, None);
     assert_eq!(settings.font_size, 14);
 }
+
+#[gpui_kit::test]
+fn the_ember_theme_can_be_picked_and_persists(cx: &mut TestAppContext) {
+    let file = TempFile::new();
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    *fixture.settings_path.lock().unwrap() = Some(file.0.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("theme-ember", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("theme-ember").selected(),
+            Some(true),
+            "picked: {:?}",
+            window
+                .try_find("settings-error")
+                .and_then(|e| e.label().map(str::to_owned))
+        );
+        assert_eq!(window.find("theme-dark").selected(), Some(false));
+    })
+    .unwrap();
+    assert_eq!(read_settings(&file.0).unwrap().theme, "ember");
+
+    let (reopened, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(reopened.into(), "secondary-,");
+    cx.update_window(reopened.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("theme-ember").selected(), Some(true));
+    })
+    .unwrap();
+}

@@ -448,6 +448,16 @@ impl Store {
         })
     }
 
+    /// Adds a folder the provider reports if the catalog does not hold it yet. A name
+    /// clash with a different id is ignored: one sidebar entry cannot show two folders.
+    pub(crate) fn ensure_folder(&self, account: Id, id: &str, name: &str) -> Result<()> {
+        if self.folder_exists(account, id)? {
+            return Ok(());
+        }
+        let _ = self.add_folder(account, id, name);
+        Ok(())
+    }
+
     pub fn folder_exists(&self, account: Id, folder: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=?1 AND id=?2)",

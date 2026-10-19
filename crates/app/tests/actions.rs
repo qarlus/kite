@@ -110,6 +110,8 @@ fn x_selects_and_the_next_action_applies_to_the_selection(cx: &mut TestAppContex
 fn toolbar_icon_runs_the_same_action(cx: &mut TestAppContext) {
     let fixture = Fixture::new(3);
     let (window, _) = mount(cx, fixture.clone());
+    // The reading pane's toolbar is where an open conversation offers its verbs.
+    cx.simulate_keystrokes(window.into(), "enter");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
@@ -122,4 +124,25 @@ fn toolbar_icon_runs_the_same_action(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert_eq!(fixture.last_action(), Some((vec![1], Action::Archive)));
+}
+
+#[gpui_kit::test]
+fn the_row_action_strip_stars_without_opening_the_thread(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.hover(("row", 0usize), cx);
+        window.render_frame(cx);
+        window.click(("row-star", 0usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(fixture.last_action(), Some((vec![1], Action::Star)));
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert!(
+            kite.open_id().is_none(),
+            "the click did not open the thread"
+        );
+    });
 }

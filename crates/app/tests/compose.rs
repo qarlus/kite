@@ -1,10 +1,12 @@
-//! Compose phase 1: new mail, reply/reply-all/forward, send + undo, draft keeping
+//! Compose: new mail, reply/reply-all/forward, send + undo, persistent drafts
 //! and key isolation while typing.
 mod common;
 use common::{Fixture, mount, update_content};
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
-use kite_core::model::Addr;
+use kite_core::api::Mail;
+use kite_core::model::{Addr, Draft};
+use std::time::Duration;
 
 fn addr(name: &str, email: &str) -> Addr {
     Addr {
@@ -73,7 +75,11 @@ fn r_replies_to_the_sender_and_quotes_the_message(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-enter");
     let drafts = fixture.drafts();
     assert_eq!(drafts.len(), 1);
-    assert_eq!(drafts[0].reply_to, Some(12), "threading points at the latest message");
+    assert_eq!(
+        drafts[0].reply_to,
+        Some(12),
+        "threading points at the latest message"
+    );
     assert_eq!(drafts[0].to, vec![addr("Sender 1", "sender1@example.com")]);
 }
 
@@ -82,10 +88,7 @@ fn a_replies_to_all_without_self_or_duplicates(cx: &mut TestAppContext) {
     let fixture = Fixture::new(2);
     fixture.set_message_recipients(
         1,
-        vec![
-            addr("Me", "me@example.com"),
-            addr("Bob", "bob@example.com"),
-        ],
+        vec![addr("Me", "me@example.com"), addr("Bob", "bob@example.com")],
         vec![
             addr("Sender 1", "sender1@example.com"),
             addr("Me", "me@example.com"),
@@ -248,8 +251,16 @@ fn reply_keeps_a_hidden_draft_instead_of_replacing_it(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "r");
     update_content(window, &kite, cx, |kite, _, cx| {
         assert!(kite.compose_open(), "the draft reopens");
-        assert_eq!(kite.compose_body(cx), "Half written", "the draft survives r");
-        assert_eq!(kite.compose_subject(cx), "", "the reply did not replace the draft");
+        assert_eq!(
+            kite.compose_body(cx),
+            "Half written",
+            "the draft survives r"
+        );
+        assert_eq!(
+            kite.compose_subject(cx),
+            "",
+            "the reply did not replace the draft"
+        );
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -324,7 +335,472 @@ fn invalid_address_is_rejected_with_an_error_toast(cx: &mut TestAppContext) {
     assert_eq!(fixture.drafts().len(), 0, "no draft is sent");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert_eq!(window.find("toast").label(), Some("Invalid address: not-an-email"));
+        assert_eq!(
+            window.find("toast").label(),
+            Some("Invalid address: not-an-email")
+        );
+    })
+    .unwrap();
+}
+
+// ---- persistent drafts -------------------------------------------------------
+
+#[gpui_kit::test]
+async fn autosave_writes_the_draft_after_a_pause(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert!(
+        fixture.saved_drafts().is_empty(),
+        "nothing is written before the debounce"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("compose-status").label(), Some("Saving…"));
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(4), |_, _| {
+        !fixture.saved_drafts().is_empty()
+    })
+    .await;
+    let saved = fixture.saved_drafts();
+    assert_eq!(saved.len(), 1);
+    assert!(saved[0].id.is_some(), "the saved draft carries an id");
+    assert_eq!(saved[0].to, vec![addr("", "alice@example.com")]);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("compose-status").label(), Some("Saved"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_empty_draft_is_never_written(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.simulate_keystrokes(window.into(), "escape");
+    assert!(
+        fixture.saved_drafts().is_empty(),
+        "a draft with no content is never saved"
+    );
+}
+
+#[gpui_kit::test]
+fn escape_saves_the_draft(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-body", cx);
+        window.input("Half written", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    let saved = fixture.saved_drafts();
+    assert_eq!(saved.len(), 1, "Esc persists the draft");
+    assert_eq!(saved[0].body, "Half written");
+    assert!(saved[0].id.is_some());
+}
+
+#[gpui_kit::test]
+fn a_saved_draft_emptied_is_discarded(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let id = fixture
+        .save_draft(Draft {
+            id: None,
+            account_id: 1,
+            to: vec![addr("", "alice@example.com")],
+            ..Draft::default()
+        })
+        .unwrap();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "g d");
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        for _ in 0.."alice@example.com".len() {
+            window.press("backspace", cx);
+        }
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    assert_eq!(
+        fixture.discarded(),
+        vec![id],
+        "the emptied draft is discarded"
+    );
+    assert!(fixture.saved_drafts().is_empty());
+}
+
+#[gpui_kit::test]
+async fn emptying_a_draft_discards_it_without_closing_the_panel(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let id = fixture
+        .save_draft(Draft {
+            id: None,
+            account_id: 1,
+            to: vec![addr("", "alice@example.com")],
+            ..Draft::default()
+        })
+        .unwrap();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "g d");
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        for _ in 0.."alice@example.com".len() {
+            window.press("backspace", cx);
+        }
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(4), |_, _| {
+        fixture.discarded().contains(&id)
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose").is_some(),
+            "the emptied editor stays open for more typing"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_discard_button_throws_the_saved_draft_away(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    let id = fixture.saved_drafts()[0].id.unwrap();
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-discard", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose").is_none(),
+            "discarding closes the panel"
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.discarded(), vec![id]);
+    assert!(fixture.saved_drafts().is_empty());
+}
+
+#[gpui_kit::test]
+fn secondary_shift_d_discards_the_draft(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-body", cx);
+        window.input("Discard me", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    let id = fixture.saved_drafts()[0].id.unwrap();
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-shift-d");
+    assert_eq!(fixture.discarded(), vec![id]);
+}
+
+#[gpui_kit::test]
+fn opening_a_draft_in_the_drafts_mailbox_reopens_it_in_compose(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let id = fixture
+        .save_draft(Draft {
+            id: None,
+            account_id: 1,
+            to: vec![addr("Alice", "alice@example.com")],
+            subject: "Lunch".into(),
+            body: "noon?".into(),
+            ..Draft::default()
+        })
+        .unwrap();
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "g d");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("mailbox-heading").label(), Some("Drafts"));
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose").is_some(),
+            "a saved draft opens in compose"
+        );
+        assert!(
+            window.try_find("thread-subject").is_none(),
+            "not the reading view"
+        );
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert!(kite.compose_open());
+        assert_eq!(kite.compose_to(cx), "Alice <alice@example.com>");
+        assert_eq!(kite.compose_subject(cx), "Lunch");
+        assert_eq!(kite.compose_body(cx), "noon?");
+    });
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].id, Some(id), "the reopened draft keeps its id");
+}
+
+// ---- reply / reply-all / forward --------------------------------------------
+
+#[gpui_kit::test]
+fn replying_to_my_own_message_addresses_the_original_recipients(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_from(1, addr("Me", "me@example.com"));
+    fixture.set_message_recipients(
+        1,
+        vec![
+            addr("Bob", "bob@example.com"),
+            addr("Carol", "carol@example.com"),
+        ],
+        Vec::new(),
+    );
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(
+            kite.compose_to(cx),
+            "Bob <bob@example.com>, Carol <carol@example.com>",
+            "a reply to my own mail goes to who I sent it to, not myself"
+        );
+    });
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(
+        sent[0].to,
+        vec![
+            addr("Bob", "bob@example.com"),
+            addr("Carol", "carol@example.com")
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn reply_all_drops_my_address_case_insensitively(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_recipients(
+        1,
+        vec![addr("Me", "ME@example.com"), addr("Bob", "bob@example.com")],
+        vec![
+            addr("Me", "me@EXAMPLE.com"),
+            addr("Carol", "carol@example.com"),
+        ],
+    );
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter a");
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(
+        sent[0].to,
+        vec![
+            addr("Sender 1", "sender1@example.com"),
+            addr("Bob", "bob@example.com")
+        ],
+        "my own address is skipped however it is cased"
+    );
+    assert_eq!(sent[0].cc, vec![addr("Carol", "carol@example.com")]);
+}
+
+#[gpui_kit::test]
+fn reply_subject_never_stacks_its_marker(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_subject(1, "RE: Re: Fwd: hello");
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(kite.compose_subject(cx), "Re: hello");
+    });
+}
+
+#[gpui_kit::test]
+fn forward_subject_never_stacks_its_marker(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_subject(1, "Fw: Re: hi");
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter f");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(kite.compose_subject(cx), "Fwd: hi");
+    });
+}
+
+#[gpui_kit::test]
+fn forward_carries_the_original_headers_above_the_quote(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter f");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        let body = kite.compose_body(cx);
+        for expected in [
+            "From: Sender 1 <sender1@example.com>",
+            "Subject: Subject 1",
+            "To: Me <me@example.com>",
+            "> Plain body for thread 1",
+        ] {
+            assert!(body.contains(expected), "missing {expected:?} in {body:?}");
+        }
+        assert!(
+            body.contains("Date: "),
+            "the forward includes the date: {body:?}"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn reply_quotes_with_an_attribution_line(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_message_from(1, addr("Jane Doe", "jane@example.com"));
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        let body = kite.compose_body(cx);
+        assert!(
+            body.contains("On ") && body.contains("Jane Doe <jane@example.com> wrote:"),
+            "reply attributes the original: {body:?}"
+        );
+        assert!(body.contains("> Plain body for thread 1"));
+    });
+}
+
+#[gpui_kit::test]
+fn reply_targets_the_expanded_older_message(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("msg-0", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        let body = kite.compose_body(cx);
+        assert!(
+            body.contains("> Earlier plain text"),
+            "quotes the expanded message: {body:?}"
+        );
+        assert!(!body.contains("> Plain body for thread 1"));
+        assert_eq!(kite.compose_subject(cx), "Re: Older note");
+    });
+}
+
+#[gpui_kit::test]
+fn sending_with_no_recipients_keeps_the_panel(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert!(fixture.drafts().is_empty(), "nothing was sent");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_some(), "the panel stays open");
+        assert_eq!(window.find("toast").label(), Some("Add a recipient"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+async fn undo_send_reopens_the_saved_draft_with_its_id(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Keep me", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(4), |_, _| {
+        !fixture.saved_drafts().is_empty()
+    })
+    .await;
+    let saved_id = fixture.saved_drafts()[0].id.unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert_eq!(
+        fixture.drafts().last().unwrap().id,
+        Some(saved_id),
+        "sending carries the saved draft's id"
+    );
+    cx.simulate_keystrokes(window.into(), "z");
+    assert_eq!(fixture.cancelled(), vec![9001]);
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 2);
+    assert_eq!(
+        sent[1].id,
+        Some(saved_id),
+        "the reopened draft keeps its id through the next send"
+    );
+}
+
+#[gpui_kit::test]
+fn ctrl_shift_enter_schedules_the_send(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-shift-enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snooze").is_some(),
+            "a send-time picker opens"
+        );
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "enter");
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 1);
+    assert!(sent[0].send_at.is_some(), "the send is scheduled for later");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_none());
     })
     .unwrap();
 }

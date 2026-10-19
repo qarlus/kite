@@ -714,3 +714,5 @@ pub fn upserts(deltas: &[Delta]) -> Vec<&RemoteMsg> {
         })
         .collect()
 }
+
+pub mod proton_fake;

@@ -1,6 +1,6 @@
 //! The virtualised thread list, the empty states and the shortcut cheat sheet.
 use crate::app::Kite;
-use crate::keys::{self, Cmd};
+use crate::keys::{self, Cmd, Group};
 use crate::theme::{RADIUS, RADIUS_SM, ROW_H, Theme};
 use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
 use gpui_kit::assets::IconName;
@@ -8,25 +8,73 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Mailbox, Ms, ThreadSummary};
+use kite_core::model::{Action as MailAction, Id, Mailbox, Ms, ThreadSummary};
 use std::ops::Range;
 use std::time::Duration;
 
-/// `9:41` today, `Mon` this week, `Oct 3` this year, `3/10/25` older.
+/// The day gutter's width: a two-digit numeral and its caption, right-aligned.
+const DAY_W: f32 = 88.;
+
+/// A row's time once the gutter has already named the day: `9:41` inside the last week,
+/// then the date, since the gutter steps up to whole months there.
 pub fn when(ms: Ms, now: DateTime<Local>) -> String {
-    let Some(at) = Local.timestamp_millis_opt(ms).single() else {
+    let Some(at) = at_or_now(ms, now) else {
         return String::new();
     };
-    let days = (now.date_naive() - at.date_naive()).num_days();
-    if days <= 0 {
+    if days_ago(at, now) < 7 {
         format!("{}:{:02}", at.time().hour(), at.time().minute())
-    } else if days < 7 {
-        at.format("%a").to_string()
     } else if at.year() == now.year() {
         format!("{} {}", at.format("%b"), at.day())
     } else {
-        format!("{}/{}/{}", at.month(), at.day(), at.year() % 100)
+        format!("{}, {}", at.format("%b"), at.year())
     }
+}
+
+/// Where a row files in the gutter: one group per day for the last week, then one per month,
+/// so conversations from the same day share a key and only the first row paints the numeral.
+fn day_key(ms: Ms, now: DateTime<Local>) -> (i32, u32, u32) {
+    let Some(at) = at_or_now(ms, now) else {
+        return (0, 0, 0);
+    };
+    if days_ago(at, now) < 7 {
+        let at = at.date_naive();
+        (at.year(), at.month(), at.day())
+    } else {
+        (at.year(), at.month(), 0)
+    }
+}
+
+/// The gutter numeral and its caption: `19`/`Today`, `15`/`Thu`, then `Oct` for older mail.
+fn day_label(ms: Ms, now: DateTime<Local>) -> (String, String) {
+    let Some(at) = at_or_now(ms, now) else {
+        return Default::default();
+    };
+    let days = days_ago(at, now);
+    if days < 7 {
+        let caption = match days {
+            0 => "Today".to_string(),
+            1 => "Yesterday".to_string(),
+            _ => at.format("%a").to_string(),
+        };
+        (at.date_naive().day().to_string(), caption)
+    } else {
+        let caption = if at.year() == now.year() {
+            String::new()
+        } else {
+            at.year().to_string()
+        };
+        (at.format("%b").to_string(), caption)
+    }
+}
+
+/// A sender's wrong clock (or a still-importing message) is filed under today, as mail clients do.
+fn at_or_now(ms: Ms, now: DateTime<Local>) -> Option<DateTime<Local>> {
+    let at = Local.timestamp_millis_opt(ms).single()?;
+    Some(if at > now { now } else { at })
+}
+
+fn days_ago(at: DateTime<Local>, now: DateTime<Local>) -> i64 {
+    (now.date_naive() - at.date_naive()).num_days()
 }
 
 impl Kite {
@@ -41,25 +89,24 @@ impl Kite {
             cx.processor(
                 move |this: &mut Kite,
                       range: Range<usize>,
-                      window: &mut Window,
+                      _window: &mut Window,
                       cx: &mut Context<Kite>| {
                     if !this.loaded_all && range.end + 50 >= this.rows.len() {
                         this.load_more(cx);
                     }
+                    let now = Local::now();
                     let mut items = Vec::with_capacity(range.len());
                     for ix in range {
                         let Some(row) = this.rows.get(ix) else {
                             continue;
                         };
-                        let sender_width = if window.viewport_size().width
-                            - px(crate::sidebar::width(window))
-                            < px(700.)
-                        {
-                            112.
-                        } else {
-                            180.
-                        };
-                        items.push(row_element(this, row, ix, sender_width, cx));
+                        // The gutter is painted per row: only a row whose day differs from the
+                        // one above it names the day, so the list stays a uniform-height list.
+                        let new_day = ix
+                            .checked_sub(1)
+                            .and_then(|prev| this.rows.get(prev))
+                            .is_none_or(|prev| day_key(prev.date, now) != day_key(row.date, now));
+                        items.push(row_element(this, row, ix, new_day, now, cx));
                     }
                     items
                 },
@@ -74,8 +121,7 @@ impl Kite {
             .flex_col()
             .min_h_0()
             .overflow_hidden()
-            .px_5()
-            .pb_4()
+            .pb_2()
             .child(list)
             .into_any_element()
     }
@@ -151,10 +197,9 @@ impl Kite {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(t.bg)
             .child(
                 div()
-                    .size(px(48.))
+                    .size(px(44.))
                     .rounded_full()
                     .bg(t.bg2)
                     .flex()
@@ -211,25 +256,26 @@ impl Kite {
             .into_any_element()
     }
 
-    /// The `?` cheat sheet, generated from the same command table as the keymap.
-    pub fn render_help(&mut self, _cx: &mut Context<Self>) -> AnyElement {
+    /// The `?` cheat sheet, generated from the same command table as the keymap, so it always
+    /// shows the keys that are bound right now — including the user's own edits.
+    pub fn render_help(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        let half = keys::COMMANDS.len().div_ceil(2);
-        let column = |cmds: &[Cmd]| {
-            div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .children(cmds.iter().map(|c| {
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .h(px(24.))
-                        .child(div().text_size(t.px(13.)).child(c.title))
-                        .child(keys_pills(&t, c.keys[0]))
-                }))
+        let mut columns = [Vec::new(), Vec::new()];
+        for (ix, group) in Group::ALL.into_iter().enumerate() {
+            let commands: Vec<(&Cmd, String)> = keys::COMMANDS
+                .iter()
+                .filter(|command| command.group == group)
+                .map(|command| (command, keys::bound(&self.settings, command).join(" ")))
+                .filter(|(_, keys)| !keys.is_empty())
+                .collect();
+            if !commands.is_empty() {
+                columns[ix / 3].push(help_section(&t, group, commands));
+            }
+        }
+        let note = if self.settings.input_mode == "classic" {
+            "Classic (click) mode: single-key shortcuts are off. Ctrl/Cmd chords and the arrows still work."
+        } else {
+            "Arrows move the selection and Delete trashes it in either input mode."
         };
         overlay(
             &t,
@@ -255,36 +301,135 @@ impl Kite {
                         .child("Keyboard shortcuts"),
                 )
                 .child(
+                    div().flex().flex_row().items_start().gap_8().children(
+                        columns.into_iter().map(|column| {
+                            div().flex().flex_col().flex_1().gap_4().children(column)
+                        }),
+                    ),
+                )
+                .child(
                     div()
                         .flex()
-                        .flex_row()
-                        .gap_8()
-                        .child(column(&keys::COMMANDS[..half]))
-                        .child(column(&keys::COMMANDS[half..])),
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(t.px(11.))
+                                .text_color(t.fg3)
+                                .child(note),
+                        )
+                        .child(
+                            crate::preferences::button("help-close", "Close", t).on_click(
+                                cx.listener(|this, _, window, cx| {
+                                    this.run(crate::keys::cmd::BACK, window, cx)
+                                }),
+                            ),
+                        ),
                 ),
         )
         .into_any_element()
     }
 }
 
-/// One list row. Borrows its summary, so painting a frame copies no threads.
+/// One labelled block of the cheat sheet.
+fn help_section(t: &Theme, group: Group, commands: Vec<(&Cmd, String)>) -> AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(t.px(11.))
+                .font_weight(FontWeight(650.))
+                .text_color(t.fg3)
+                .child(group.label()),
+        )
+        .children(commands.into_iter().map(|(command, keys)| {
+            div()
+                .id(format!("help-{}", command.slug))
+                .test_support()
+                .aria_label(format!("{}: {keys}", command.title))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .h(px(22.))
+                .child(div().text_size(t.px(13.)).child(command.title))
+                .child(keys_pills(t, &keys))
+        }))
+        .into_any_element()
+}
+
+/// One list row: the day gutter, then the sender and time, the subject and a two-line snippet.
+/// Borrows its summary, so painting a frame copies no threads.
 fn row_element(
     kite: &Kite,
     row: &ThreadSummary,
     ix: usize,
-    sender_width: f32,
+    new_day: bool,
+    now: DateTime<Local>,
     cx: &mut Context<Kite>,
 ) -> AnyElement {
     let t = kite.theme;
     let selected = ix == kite.sel;
     let checked = kite.multi.contains(&row.id);
     let label = format!("{}: {}", row.participants, row.subject);
-    let now = Local::now();
     let account = kite
         .accounts
         .iter()
         .find(|account| account.id == row.account_id);
     let row_id = row.id;
+    let buttons = row_actions(row);
+    let when = when(row.date, now);
+    let sender = row.participants.clone();
+    let unread = if row.unread {
+        format!("Unread: {sender}")
+    } else {
+        sender.clone()
+    };
+    let combined = kite.view.account_id.is_none() && kite.accounts.len() > 1;
+    let account_email = account
+        .map(|account| account.email.clone())
+        .unwrap_or_default();
+    // The day gutter: the numeral hangs at the top of its group, and every row after the first
+    // of the day leaves it empty, so the list stays uniform-height and virtualised.
+    let mut gutter = div()
+        .w(px(DAY_W * t.scale))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .items_end()
+        .pt_2()
+        .pr_3();
+    if new_day {
+        let (big, caption) = day_label(row.date, now);
+        gutter = gutter.child(
+            div()
+                .id(("day", ix))
+                .test_support()
+                .aria_label(if caption.is_empty() {
+                    big.clone()
+                } else {
+                    format!("{big} {caption}")
+                })
+                .flex()
+                .flex_col()
+                .items_end()
+                .child(
+                    div()
+                        .text_size(t.px(30.))
+                        .font_weight(FontWeight(500.))
+                        .text_color(t.fg)
+                        .child(big),
+                )
+                .when(!caption.is_empty(), |d| {
+                    d.child(div().text_size(t.px(12.)).text_color(t.fg2).child(caption))
+                }),
+        );
+    }
     div()
         .id(("row", ix))
         .test_support()
@@ -294,194 +439,319 @@ fn row_element(
         .relative()
         .flex()
         .flex_row()
-        .items_center()
         .flex_shrink_0()
         .w_full()
-        .h(px(ROW_H * t.scale))
-        .rounded(px(RADIUS_SM))
-        .px_3()
-        .gap_3()
+        // Two design units tall, and the same for every row: `uniform_list` measures only the
+        // first one, so a taller row here would misalign the whole list.
+        .h(px(ROW_H * 2. * t.scale))
         .cursor_pointer()
-        .when(selected, |d| d.bg(t.sel))
-        .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
-        .when(selected, |d| d.child(selection_edge(&t)))
-        .child(
-            div()
-                .id(("select-row", ix))
-                .test_support()
-                .aria_label("Select conversation")
-                .aria_selected(checked)
-                .w(px(14.))
-                .h_full()
-                .flex_shrink_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    if let Some(index) = this.multi.iter().position(|id| *id == row_id) {
-                        this.multi.remove(index);
-                    } else {
-                        this.multi.push(row_id);
-                    }
-                    window.focus(&this.focus, cx);
-                    cx.notify();
-                    cx.stop_propagation();
-                }))
-                .when(checked, |d| {
-                    d.child(
-                        Icon::new(IconName::Check)
-                            .with_size(px(12.))
-                            .text_color(t.accent),
-                    )
-                })
-                .when(!checked && row.unread, |d| {
-                    d.child(div().size(px(6.)).rounded_full().bg(t.accent))
-                }),
-        )
-        .child(
-            div()
-                .w(px(sender_width))
-                .flex_shrink_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .child(
-                    div()
-                        .truncate()
-                        .text_size(t.px(13.))
-                        .font_weight(if row.unread {
-                            FontWeight(650.)
-                        } else {
-                            FontWeight(500.)
-                        })
-                        .text_color(if row.unread { t.fg } else { t.fg2 })
-                        .child(row.participants.clone()),
-                )
-                .when(
-                    kite.view.account_id.is_none() && kite.accounts.len() > 1,
-                    |d| {
-                        d.child(
-                            div()
-                                .id(("row-account", ix))
-                                .test_support()
-                                .aria_label(
-                                    account
-                                        .map(|account| account.email.clone())
-                                        .unwrap_or_default(),
-                                )
-                                .truncate()
-                                .text_size(t.px(11.))
-                                .text_color(t.fg2)
-                                .child(
-                                    account
-                                        .map(|account| account.email.clone())
-                                        .unwrap_or_default(),
-                                ),
-                        )
-                    },
-                ),
-        )
+        .child(gutter)
+        // The hairline that separates the gutter from the conversations; painted per row it
+        // reads as one continuous spine.
         .child(
             div()
                 .flex_1()
-                .flex()
-                .items_center()
-                .gap_2()
                 .min_w_0()
-                .overflow_hidden()
+                .h_full()
+                .border_l_1()
+                .border_color(t.line)
+                .pl_0p5()
                 .child(
                     div()
-                        .max_w(px(360.))
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(if row.unread {
-                            FontWeight::MEDIUM
-                        } else {
-                            FontWeight::NORMAL
-                        })
-                        .text_size(t.px(13.))
-                        .text_color(t.fg)
-                        .child(row.subject.clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(t.px(13.))
-                        .text_color(t.fg2)
-                        .child(row.snippet.clone()),
-                ),
-        )
-        .when(row.starred, |d| {
-            d.child(
-                Icon::new(IconName::Star)
-                    .with_size(px(13.))
-                    .text_color(t.accent),
-            )
-        })
-        .when(!row.labels.is_empty(), |d| {
-            d.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .max_w(px(160.))
-                    .overflow_hidden()
-                    .flex_shrink_0()
-                    .children(row.labels.iter().take(2).map(|label| {
-                        div()
-                            .max_w(px(120.))
-                            .min_w_0()
-                            .truncate()
-                            .px_2()
-                            .py_0p5()
-                            .rounded(px(RADIUS_SM))
-                            .bg(t.bg3)
-                            .text_size(t.px(12.))
-                            .text_color(t.fg2)
-                            .child(label.clone())
-                    })),
-            )
-        })
-        .child(
-            div()
-                .id(("row-time", ix))
-                .test_support()
-                .aria_label(when(row.date, now))
-                .relative()
-                .w(px(64.))
-                .flex_shrink_0()
-                .flex()
-                .justify_end()
-                .text_size(t.px(12.))
-                .text_color(t.fg3)
-                .child(
-                    div()
-                        .group_hover("row", |s| s.opacity(0.))
-                        .child(when(row.date, now)),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .opacity(0.)
-                        .group_hover("row", |s| s.opacity(1.))
+                        .h_full()
+                        .flex()
+                        .flex_row()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded(px(RADIUS_SM))
+                        .overflow_hidden()
+                        .when(selected, |d| d.bg(t.sel))
+                        .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
                         .child(
                             div()
+                                .id(("select-row", ix))
+                                .test_support()
+                                .aria_label("Select conversation")
+                                .aria_selected(checked)
+                                .w(px(14.))
+                                .h_full()
+                                .flex_shrink_0()
                                 .flex()
                                 .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Some(index) =
+                                        this.multi.iter().position(|id| *id == row_id)
+                                    {
+                                        this.multi.remove(index);
+                                    } else {
+                                        this.multi.push(row_id);
+                                    }
+                                    window.focus(&this.focus, cx);
+                                    cx.notify();
+                                    cx.stop_propagation();
+                                }))
+                                .when(checked, |d| {
+                                    d.child(
+                                        Icon::new(IconName::Check)
+                                            .with_size(px(13.))
+                                            .text_color(t.accent),
+                                    )
+                                })
+                                .when(!checked, |d| {
+                                    // Unread is ink weight here, never a coloured dot, so the box
+                                    // only appears once the pointer is on the row.
+                                    d.child(
+                                        div()
+                                            .size(px(13.))
+                                            .rounded(px(4.))
+                                            .border_1()
+                                            .border_color(t.line)
+                                            .opacity(0.)
+                                            .group_hover("row", |s| s.opacity(1.)),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .justify_center()
                                 .gap_1()
-                                .child(keys_pills(&t, "e"))
-                                .child(keys_pills(&t, "h")),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .id(("row-sender", ix))
+                                                .test_support()
+                                                .aria_label(unread)
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(t.px(13.))
+                                                .font_weight(if row.unread {
+                                                    FontWeight(650.)
+                                                } else {
+                                                    FontWeight(500.)
+                                                })
+                                                .text_color(t.fg)
+                                                .child(sender),
+                                        )
+                                        .when(combined, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("row-account", ix))
+                                                    .test_support()
+                                                    .aria_label(account_email.clone())
+                                                    .max_w(px(140.))
+                                                    .min_w_0()
+                                                    .flex_shrink_0()
+                                                    .truncate()
+                                                    .text_size(t.px(11.))
+                                                    .text_color(t.fg2)
+                                                    .child(account_email.clone()),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id(("row-time", ix))
+                                                .test_support()
+                                                .aria_label(when.clone())
+                                                .flex_shrink_0()
+                                                .text_size(t.px(12.))
+                                                .text_color(t.fg3)
+                                                .child(when),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(t.px(13.))
+                                                .text_color(t.fg)
+                                                .child(row.subject.clone()),
+                                        )
+                                        .children(row.labels.iter().take(1).map(|label| {
+                                            div()
+                                                .max_w(px(120.))
+                                                .min_w_0()
+                                                .flex_shrink_0()
+                                                .truncate()
+                                                .px_2()
+                                                .rounded(px(RADIUS_SM))
+                                                .bg(t.bg3)
+                                                .text_size(t.px(11.))
+                                                .text_color(t.fg2)
+                                                .child(label.clone())
+                                        }))
+                                        .when(row.attachments, |d| {
+                                            d.child(
+                                                Icon::new(IconName::Paperclip)
+                                                    .with_size(px(13.))
+                                                    .text_color(t.fg2),
+                                            )
+                                        })
+                                        .when(row.starred, |d| {
+                                            d.child(
+                                                Icon::new(IconName::StarFill)
+                                                    .with_size(px(13.))
+                                                    .text_color(t.accent),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .line_clamp(2)
+                                        .text_size(t.px(12.))
+                                        .line_height(relative(1.45))
+                                        .text_color(t.fg2)
+                                        .child(row.snippet.clone()),
+                                ),
                         ),
+                ),
+        )
+        // DESIGN › Layout: hovering a row replaces the time with the actions a click-first
+        // client expects, so every triage action is reachable with the mouse.
+        .child(
+            div()
+                .id(("row-actions", ix))
+                .test_support()
+                .aria_label("Row actions")
+                .absolute()
+                .right_1()
+                .top_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded(px(RADIUS_SM))
+                .bg(if selected { t.sel } else { t.bg3 })
+                .opacity(0.)
+                .group_hover("row", |s| s.opacity(1.))
+                .children(
+                    buttons
+                        .into_iter()
+                        .map(|button| row_action(&t, ix, row_id, button, cx)),
                 ),
         )
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.sel = ix;
             window.focus(&this.focus, cx);
             this.open_thread(cx);
+        }))
+        .into_any_element()
+}
+
+/// One button in a row's hover action strip.
+struct RowAction {
+    name: &'static str,
+    icon: IconName,
+    label: &'static str,
+    action: MailAction,
+    /// Whether the action removes the row from the list.
+    remove: bool,
+    text: &'static str,
+}
+
+/// The actions a row offers: the ones a traditional client puts in its toolbar.
+fn row_actions(row: &ThreadSummary) -> [RowAction; 4] {
+    [
+        RowAction {
+            name: "row-archive",
+            icon: IconName::Archive,
+            label: "Archive",
+            action: MailAction::Archive,
+            remove: true,
+            text: "Marked done",
+        },
+        RowAction {
+            name: "row-trash",
+            icon: IconName::Trash,
+            label: "Trash",
+            action: MailAction::Trash,
+            remove: true,
+            text: "Trashed",
+        },
+        RowAction {
+            name: "row-star",
+            icon: IconName::Star,
+            label: if row.starred { "Unstar" } else { "Star" },
+            action: if row.starred {
+                MailAction::Unstar
+            } else {
+                MailAction::Star
+            },
+            remove: false,
+            text: if row.starred { "Unstarred" } else { "Starred" },
+        },
+        RowAction {
+            name: "row-read",
+            icon: IconName::MailOpen,
+            label: if row.unread {
+                "Mark read"
+            } else {
+                "Mark unread"
+            },
+            action: if row.unread {
+                MailAction::Read
+            } else {
+                MailAction::Unread
+            },
+            remove: false,
+            text: if row.unread {
+                "Marked read"
+            } else {
+                "Marked unread"
+            },
+        },
+    ]
+}
+
+/// A row action acts on its own row, never on the selection, so the button does what it says.
+fn row_action(
+    t: &Theme,
+    ix: usize,
+    row_id: Id,
+    button: RowAction,
+    cx: &mut Context<Kite>,
+) -> AnyElement {
+    let RowAction {
+        name,
+        icon,
+        label,
+        action,
+        remove,
+        text,
+    } = button;
+    div()
+        .id((name, ix))
+        .test_support()
+        .aria_label(label)
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(24.))
+        .rounded(px(RADIUS_SM))
+        .cursor_pointer()
+        .hover(|s| s.bg(t.bg2))
+        .child(Icon::new(icon).with_size(px(14.)).text_color(t.fg2))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.act_on(vec![row_id], action.clone(), remove, text, cx);
+            window.focus(&this.focus, cx);
+            cx.stop_propagation();
         }))
         .into_any_element()
 }

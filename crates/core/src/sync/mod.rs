@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod graph;
 pub mod imap;
+pub mod proton;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteAttachment {

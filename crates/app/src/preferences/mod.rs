@@ -8,6 +8,7 @@ pub mod appearance;
 pub mod connections;
 pub mod general;
 pub mod privacy;
+pub mod shortcuts;
 pub mod typography;
 
 use crate::app::{Kite, Overlay};
@@ -22,6 +23,7 @@ use kite_core::model::Settings;
 pub const OPEN_APPEARANCE: usize = 0;
 pub const OPEN_ACCOUNTS: usize = 2;
 pub const OPEN_CONNECTIONS: usize = 3;
+pub const OPEN_SHORTCUTS: usize = 7;
 
 pub struct Preferences {
     pub tab: usize,
@@ -31,6 +33,7 @@ pub struct Preferences {
     pub connections: connections::State,
     pub general: general::State,
     pub privacy: privacy::State,
+    pub shortcuts: shortcuts::State,
     pub ai: ai::State,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -42,7 +45,7 @@ pub struct Preferences {
 pub const TEMPLATE: &str = "{\n  \"name\": \"My midnight\",\n  \"base\": \"dark\",\n  \"colors\": {\n    \"bg\": \"#101820\",\n    \"bg2\": \"#16212b\",\n    \"accent\": \"#77c5dc\"\n  }\n}";
 
 /// `(index, rail label, page subtitle, icon)`. The index is the id the tests and shortcuts use.
-fn tabs() -> [(usize, &'static str, &'static str, IconName); 7] {
+fn tabs() -> [(usize, &'static str, &'static str, IconName); 8] {
     [
         (0, "Appearance", "Colours and palette", IconName::Palette),
         (1, "Typography", "Type, size and colour", IconName::ALargeSmall),
@@ -56,6 +59,7 @@ fn tabs() -> [(usize, &'static str, &'static str, IconName); 7] {
         (4, "General", "Everyday defaults", IconName::Settings2),
         (5, "Privacy", "Remote images and tracking", IconName::EyeOff),
         (6, "AI", "Writing and summaries", IconName::Bot),
+        (7, "Shortcuts", "Keys for every command", IconName::Keyboard),
     ]
 }
 
@@ -78,9 +82,10 @@ impl Kite {
                 appearance: appearance::State,
                 typography: typography::State::new(&settings, window, cx),
                 accounts: accounts::State::default(),
-                connections: connections::State::new(window, cx),
+                connections: connections::State::new(&settings, window, cx),
                 general: general::State,
                 privacy: privacy::State,
+                shortcuts: shortcuts::State::default(),
                 ai: ai::State::new(&settings, window, cx),
                 error: None,
                 notice: None,
@@ -238,7 +243,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
     let t = kite.theme;
     let compact = window.viewport_size().width < px(1000.);
     let rail = if compact { px(56.) } else { px(200.) };
-    let (_, title, subtitle, _) = tabs()[page.tab.min(6)];
+    let (_, title, subtitle, _) = tabs()[page.tab.min(7)];
     let inset = if compact { px(24.) } else { px(40.) };
 
     let body = match page.tab {
@@ -248,6 +253,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         4 => general::render(kite, window, cx),
         5 => privacy::render(kite, window, cx),
         6 => ai::render(kite, window, cx),
+        7 => shortcuts::render(kite, window, cx),
         _ => appearance::render(kite, window, cx),
     };
 

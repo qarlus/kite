@@ -40,6 +40,11 @@ base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }
 # Proton Bridge vault: AES-256-GCM over msgpack.
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# Native Proton API: SRP (bcrypt + the big-int crate rpgp already links) and OpenPGP bodies.
+bcrypt = { version = "0.19", default-features = false, features = ["std"] }
+num-bigint-dig = { version = "0.8", default-features = false, features = ["std"] }
+pgp = { version = "0.21", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 rmp-serde = "1"
 # Win32 credential enumeration for the Bridge vault key (Keyring cannot enumerate).
 windows = "0.62"
