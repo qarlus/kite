@@ -715,3 +715,166 @@ fn a_proton_label_shows_up_as_a_folder_and_holds_its_mail() {
     });
     assert_eq!(threads.subject, "Trip");
 }
+
+#[test]
+fn a_synced_draft_can_be_trashed_and_restored_with_undo() {
+    let rt = runtime();
+    let mut world = World::new();
+    let remote = world.add_message(
+        "Unfinished",
+        ("Kite", "kite@proton.me"),
+        "Keep this text",
+        &["1", "8"],
+    );
+    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let view = mailbox(account.id, Mailbox::Drafts);
+    let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
+    // Opening and closing compose adopts the provider draft without changing its identity.
+    let draft = engine.draft(row.id).expect("draft").expect("editable");
+    assert_eq!(draft.body, "Keep this text");
+    let token = engine.act(&[row.id], &Action::Trash).expect("trash");
+    assert!(
+        engine.threads(&view, 0, 10).expect("drafts").is_empty(),
+        "removed locally before the remote request finishes"
+    );
+    eventually(|| {
+        server
+            .world()
+            .messages
+            .iter()
+            .find(|m| m.id == remote)
+            .filter(|m| m.label_ids.iter().any(|l| l == "3"))
+            .map(|_| ())
+    });
+    engine.undo(token).expect("undo");
+    assert_eq!(engine.threads(&view, 0, 10).expect("restored").len(), 1);
+    eventually(|| {
+        server
+            .world()
+            .messages
+            .iter()
+            .find(|m| m.id == remote)
+            .filter(|m| {
+                m.label_ids.iter().any(|l| l == "8") && !m.label_ids.iter().any(|l| l == "3")
+            })
+            .map(|_| ())
+    });
+    engine.sync_now();
+    eventually(|| {
+        let rows = engine.threads(&view, 0, 10).ok()?;
+        (rows.len() == 1 && engine.draft(rows[0].id).ok()??.body == "Keep this text").then_some(())
+    });
+}
+
+#[test]
+fn discarding_a_reopened_provider_draft_deletes_it_locally_and_on_proton() {
+    let rt = runtime();
+    let mut world = World::new();
+    let remote = world.add_message(
+        "Discard me",
+        ("Kite", "kite@proton.me"),
+        "Started on the web",
+        &["1", "8"],
+    );
+    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let view = mailbox(account.id, Mailbox::Drafts);
+    let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
+    let draft = engine.draft(row.id).expect("draft").expect("editable");
+    assert_eq!(draft.body, "Started on the web");
+    engine
+        .discard_draft(draft.id.expect("id"))
+        .expect("discard");
+    assert!(engine.threads(&view, 0, 10).expect("drafts").is_empty());
+    eventually(|| {
+        let world = server.world();
+        (world.deleted.contains(&remote) && !world.messages.iter().any(|m| m.id == remote))
+            .then_some(())
+    });
+    engine.sync_now();
+    assert!(engine.thread(row.id).expect("removed thread").is_empty());
+}
+
+#[test]
+fn sent_is_visible_as_soon_as_proton_accepts_the_send_and_does_not_duplicate_on_sync() {
+    let rt = runtime();
+    let mut world = World::new();
+    world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
+    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    server.world().pause_events = true;
+    let mut settings = engine.settings().expect("settings");
+    settings.undo_send_secs = 0;
+    engine.set_settings(settings).expect("settings");
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: "Alice".into(),
+                email: "alice@proton.me".into(),
+            }],
+            subject: "Accepted send".into(),
+            body: "A sent copy without an event".into(),
+            ..Default::default()
+        })
+        .expect("send");
+    let view = mailbox(account.id, Mailbox::Sent);
+    let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
+    assert_eq!(row.subject, "Accepted send");
+    assert_eq!(
+        engine.thread(row.id).expect("sent body")[0].text,
+        "A sent copy without an event"
+    );
+    {
+        let mut world = server.world();
+        world.pause_events = false;
+        world.add_message(
+            "After the send event",
+            ("Alice", "alice@proton.me"),
+            "A sync barrier",
+            &["0", "5"],
+        );
+    }
+    engine.sync_now();
+    eventually(|| {
+        engine
+            .threads(&inbox(account.id), 0, 10)
+            .ok()?
+            .iter()
+            .any(|row| row.subject == "After the send event")
+            .then_some(())
+    });
+    let rows = engine.threads(&view, 0, 10).expect("sent after event sync");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(engine.thread(rows[0].id).expect("sent body").len(), 1);
+    assert_eq!(server.world().sends.len(), 1);
+}
+
+#[test]
+fn external_sending_uses_protons_clock_even_when_the_computer_is_ahead() {
+    let rt = runtime();
+    let mut world = World::new();
+    world.clock_skew_secs = -120;
+    world.sign_external = false;
+    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let mut settings = engine.settings().expect("settings");
+    settings.undo_send_secs = 0;
+    engine.set_settings(settings).expect("settings");
+    engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: String::new(),
+                email: "outside@example.com".into(),
+            }],
+            subject: "Clock skew".into(),
+            body: "Signed using server time".into(),
+            ..Default::default()
+        })
+        .expect("send");
+    let view = mailbox(account.id, Mailbox::Sent);
+    let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
+    assert_eq!(
+        engine.thread(row.id).expect("sent body")[0].text,
+        "Signed using server time"
+    );
+    assert_eq!(server.world().sends.len(), 1);
+}

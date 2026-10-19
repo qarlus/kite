@@ -387,6 +387,7 @@ async fn sync_account(
         }
         let backend = backend_mut(backends, account.id)?;
         for (op_id, op) in ops {
+            let op = inner.write(|s| s.address_op(op_id, op))?;
             match backend.apply(&op).await {
                 Ok(new_remote_id) => {
                     inner.write(|s| s.op_done(op_id, new_remote_id))?;
@@ -462,7 +463,15 @@ async fn send_due(
         match backend.apply(&Op::Send { mime }).await {
             Ok(_) => {
                 persist_tokens(inner, account.id, backend)?;
+                if let Backend::Proton { client, .. } = backend
+                    && let Some(message) = client.take_sent()
+                {
+                    inner.write(|s| {
+                        s.apply_deltas(account.id, &[Delta::Upsert(Box::new(message))])
+                    })?;
+                }
                 inner.write(|s| s.outbox_sent(outbox_id))?;
+                queued = true;
                 // The provider copy of a saved draft is stale now that it has been sent; delete it
                 // on the next pass rather than leaving a duplicate in Drafts.
                 if let Some(id) = draft.id
@@ -471,7 +480,6 @@ async fn send_due(
                     inner.write(|s| {
                         s.draft_op(account_id, &Op::DeleteDraft { remote_id: remote }, None)
                     })?;
-                    queued = true;
                 }
                 changed.push(account.id);
                 if let (Some(at), Some(reply)) = (draft.remind_at, draft.reply_to)
@@ -488,7 +496,7 @@ async fn send_due(
         }
     }
     if queued {
-        // Drain the delete op in the next tick instead of waiting out the poll interval.
+        // Sync the sent copy and drain draft deletions without waiting out the poll interval.
         let _ = inner.wake.try_send(());
     }
     Ok(())
@@ -986,13 +994,12 @@ impl Mail for Engine {
 
     fn discard_draft(&self, id: Id) -> Result<()> {
         let remote = self.inner.write(|s| s.discard_draft(id))?;
-        let Some((account, remote_id)) = remote else {
-            return Ok(());
-        };
-        self.inner
-            .write(|s| s.draft_op(account, &Op::DeleteDraft { remote_id }, None))?;
-        self.wake();
-        self.inner.emit(Event::Changed(vec![account]));
+        if let Some((account, remote_id)) = remote {
+            self.inner
+                .write(|s| s.draft_op(account, &Op::DeleteDraft { remote_id }, None))?;
+            self.wake();
+        }
+        self.emit_changed()?;
         Ok(())
     }
 

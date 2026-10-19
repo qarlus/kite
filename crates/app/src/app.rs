@@ -160,6 +160,8 @@ pub struct Kite {
     pub(crate) images_pending: std::collections::HashSet<String>,
     /// Messages the reader allowed remote images for, one at a time.
     pub(crate) images_allowed: std::collections::HashSet<Id>,
+    /// Bumped when a fetched image lands, so bodies re-render with it inlined.
+    pub(crate) images_version: u64,
     pub(crate) overlay: Overlay,
     pub(crate) search: Entity<InputState>,
     pub(crate) focus: FocusHandle,
@@ -276,6 +278,7 @@ impl Kite {
             images: Arc::new(HashMap::new()),
             images_pending: std::collections::HashSet::new(),
             images_allowed: std::collections::HashSet::new(),
+            images_version: 0,
             overlay: Overlay::None,
             search: search.clone(),
             focus: cx.focus_handle(),
@@ -504,7 +507,11 @@ impl Kite {
             return;
         };
         // A saved draft opens in compose, prefilled, instead of the reading view.
-        let draft = self.mail.draft(row.id).unwrap_or(None);
+        let draft = if self.view.mailbox == Mailbox::Drafts {
+            self.mail.draft(row.id).unwrap_or(None)
+        } else {
+            None
+        };
         if let Some(draft) = draft {
             self.multi.clear();
             self.open = None;
@@ -1796,7 +1803,7 @@ impl Render for Kite {
                 theme::resolve(&self.settings, window.appearance()).unwrap_or(*theme::pick(dark));
             self.sidebar_dirty = true;
             theme::install(&self.theme, theme::font(&self.settings), cx);
-            self.html_cache.clear();
+            // A new appearance re-keys the cache; the painted frame stays until it lands.
             self.appearance_version += 1;
         }
         if self.sidebar_dirty {

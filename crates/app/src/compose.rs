@@ -405,14 +405,15 @@ impl Kite {
 
     /// Throws the draft away, on the provider too when it was saved.
     pub(crate) fn discard_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let id = self.compose.as_mut().and_then(|compose| compose.id.take());
+        let id = self.compose.as_ref().and_then(|compose| compose.id);
+        if let Some(error) = id.and_then(|id| self.mail.discard_draft(id).err()) {
+            self.toast(format!("Could not discard draft: {error}"), cx);
+            return;
+        }
         self.compose = None;
         self.compose_open = false;
-        let error = id.and_then(|id| self.mail.discard_draft(id).err());
-        match error {
-            Some(error) => self.toast(format!("Could not discard draft: {error}"), cx),
-            None => self.toast("Draft discarded", cx),
-        }
+        self.reload();
+        self.toast("Draft discarded", cx);
         window.focus(&self.focus, cx);
         cx.notify();
     }

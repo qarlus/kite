@@ -804,3 +804,82 @@ fn ctrl_shift_enter_schedules_the_send(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn discarding_a_draft_reopened_from_drafts_removes_its_row_immediately(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(0);
+    fixture
+        .save_draft(Draft {
+            account_id: 1,
+            to: vec![addr("Alice", "alice@example.com")],
+            subject: "Unfinished".into(),
+            body: "Keep or discard".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "g d enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_some());
+        window.click("compose-discard", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_none());
+        assert!(
+            window.try_find(("row", 0usize)).is_none(),
+            "the discarded draft leaves the list on this frame"
+        );
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 0)
+    });
+    assert!(fixture.saved_drafts().is_empty());
+}
+
+#[gpui_kit::test]
+fn opening_sent_reads_the_conversation_even_when_it_also_has_a_draft(cx: &mut TestAppContext) {
+    use kite_core::model::{Mailbox, View};
+    let fixture = Fixture::new(0);
+    fixture
+        .save_draft(Draft {
+            account_id: 1,
+            to: vec![addr("Alice", "alice@example.com")],
+            subject: "A conversation with a draft".into(),
+            body: "Unfinished reply".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let view = View {
+        account_id: None,
+        mailbox: Mailbox::Drafts,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let thread = fixture.threads(&view, 0, 10).unwrap()[0].id;
+    // This conversation remains editable from Drafts while also appearing in Sent.
+    fixture
+        .locations
+        .lock()
+        .unwrap()
+        .insert(thread, (Mailbox::Sent, None));
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "g t enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("mailbox-heading").label(), Some("Sent"));
+        assert_eq!(
+            window.find("thread-subject").label(),
+            Some("A conversation with a draft")
+        );
+        assert!(
+            window.try_find("compose").is_none(),
+            "Sent opens the reader"
+        );
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), Some(thread))
+    });
+}

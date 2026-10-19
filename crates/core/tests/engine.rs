@@ -1052,3 +1052,81 @@ fn a_forward_starts_a_new_conversation() {
     assert!(!raw.contains("In-Reply-To:"), "{raw}");
     assert!(!raw.contains("References:"), "{raw}");
 }
+
+#[test]
+fn a_provider_draft_can_be_trashed_and_undone_over_imap() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("Drafts")
+        .push(FIRST, &["\\Seen", "\\Draft"]);
+    let server = rt.block_on(serve(world.clone()));
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = engine.add_proton(login(server.ports())).expect("account");
+    let row = {
+        let mut rows = Vec::new();
+        wait_for("the provider draft", || {
+            engine.sync_now();
+            rows = engine.threads(&drafts(account.id), 0, 10).expect("drafts");
+            !rows.is_empty()
+        });
+        rows.remove(0)
+    };
+    let draft = engine.draft(row.id).expect("draft").expect("editable");
+    let token = engine.act(&[row.id], &Action::Trash).expect("trash");
+    assert!(
+        engine
+            .threads(&drafts(account.id), 0, 10)
+            .expect("drafts")
+            .is_empty()
+    );
+    wait_for("the provider trash", || {
+        world
+            .lock()
+            .expect("world")
+            .folders
+            .iter()
+            .any(|f| f.name == "Trash" && !f.msgs.is_empty())
+    });
+    engine.undo(token).expect("undo");
+    wait_for("the provider draft to return", || {
+        world
+            .lock()
+            .expect("world")
+            .folders
+            .iter()
+            .any(|f| f.name == "Drafts" && !f.msgs.is_empty())
+    });
+    let rows = engine
+        .threads(&drafts(account.id), 0, 10)
+        .expect("restored");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        engine
+            .draft(rows[0].id)
+            .expect("draft")
+            .expect("editable")
+            .body,
+        draft.body
+    );
+    engine
+        .discard_draft(draft.id.expect("id"))
+        .expect("discard after undo uses the new IMAP id");
+    wait_for("the provider draft to be discarded", || {
+        world
+            .lock()
+            .expect("world")
+            .folders
+            .iter()
+            .all(|f| f.name != "Drafts" || f.msgs.is_empty())
+    });
+    assert!(
+        engine
+            .threads(&drafts(account.id), 0, 10)
+            .expect("drafts")
+            .is_empty()
+    );
+}

@@ -11,11 +11,14 @@ use std::io::Read as _;
 use anyhow::{Context, Result, anyhow, bail};
 use pgp::composed::{
     Deserializable, DetachedSignature, Message, MessageBuilder, SignedPublicKey, SignedSecretKey,
+    SubpacketConfig,
 };
 use pgp::crypto::hash::HashAlgorithm;
 use pgp::crypto::sym::SymmetricKeyAlgorithm;
-use pgp::packet::{DataMode, PacketTrait as _, PublicKeyEncryptedSessionKey};
-use pgp::types::{KeyDetails as _, Password, SigningKey};
+use pgp::packet::{
+    DataMode, PacketTrait as _, PublicKeyEncryptedSessionKey, Subpacket, SubpacketData,
+};
+use pgp::types::{KeyDetails as _, KeyVersion, Password, SigningKey, Timestamp};
 
 /// Proton's session-key algorithm for every message it stores or sends.
 pub const SESSION_ALGORITHM: SymmetricKeyAlgorithm = SymmetricKeyAlgorithm::AES256;
@@ -171,8 +174,7 @@ pub struct Package {
 }
 
 /// A body the way gopenpgp's `NewPlainMessageFromString` makes one, which is what Proton's own
-/// clients send: CRLF line endings, a UTF-8 literal packet and a text-mode signature. Proton
-/// refuses a binary signature on a text body ("Invalid or missing message signature").
+/// clients send: CRLF line endings, a UTF-8 literal packet and a text-mode signature.
 fn canonical_text(plaintext: &str) -> Vec<u8> {
     plaintext
         .replace("\r\n", "\n")
@@ -180,16 +182,41 @@ fn canonical_text(plaintext: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+// Proton's verifier rejects signatures in its future. Like go-proton-api's updateTime,
+// sign at the last authenticated server Date rather than trusting the computer's clock.
+fn signature_subpackets(signer: &dyn SigningKey, time: Option<u32>) -> Result<SubpacketConfig> {
+    Ok(SubpacketConfig::UserDefined {
+        hashed: vec![
+            Subpacket::regular(SubpacketData::IssuerFingerprint(signer.fingerprint()))?,
+            Subpacket::regular(SubpacketData::SignatureCreationTime(
+                time.map(Timestamp::from_secs)
+                    .unwrap_or_else(Timestamp::now),
+            ))?,
+        ],
+        unhashed: if signer.version() <= KeyVersion::V4 {
+            vec![Subpacket::regular(SubpacketData::IssuerKeyId(
+                signer.legacy_key_id(),
+            ))?]
+        } else {
+            Vec::new()
+        },
+    })
+}
+
 /// Encrypts `plaintext` with a fresh session key, signing it with `signer`.
-pub fn encrypt_body(signer: &SecretKey, plaintext: &str) -> Result<Package> {
+pub fn encrypt_body(signer: &SecretKey, plaintext: &str, time: Option<u32>) -> Result<Package> {
     let mut rng = rand::thread_rng();
     let mut builder = MessageBuilder::from_bytes("", canonical_text(plaintext))
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-    builder.data_mode(DataMode::Utf8)?.sign_text().sign(
-        signer.signing(),
-        signer.passphrase(),
-        HashAlgorithm::Sha256,
-    );
+    builder
+        .data_mode(DataMode::Utf8)?
+        .sign_text()
+        .sign_with_subpackets(
+            signer.signing(),
+            signer.passphrase(),
+            HashAlgorithm::Sha256,
+            signature_subpackets(signer.signing(), time)?,
+        );
     let session_key = builder.session_key().as_ref().to_vec();
     // No recipients were added, so the output is exactly one encrypted data packet.
     let data = builder
@@ -203,15 +230,19 @@ pub fn encrypt_body(signer: &SecretKey, plaintext: &str) -> Result<Package> {
 
 /// The body a Proton draft stores: encrypted to the sending address's own key, in the same
 /// text form and signed the same way as the body that is sent.
-pub fn encrypt_draft(signer: &SecretKey, plaintext: &str) -> Result<String> {
+pub fn encrypt_draft(signer: &SecretKey, plaintext: &str, time: Option<u32>) -> Result<String> {
     let mut rng = rand::thread_rng();
     let mut builder = MessageBuilder::from_bytes("", canonical_text(plaintext))
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
-    builder.data_mode(DataMode::Utf8)?.sign_text().sign(
-        signer.signing(),
-        signer.passphrase(),
-        HashAlgorithm::Sha256,
-    );
+    builder
+        .data_mode(DataMode::Utf8)?
+        .sign_text()
+        .sign_with_subpackets(
+            signer.signing(),
+            signer.passphrase(),
+            HashAlgorithm::Sha256,
+            signature_subpackets(signer.signing(), time)?,
+        );
     match &Recipient::of(&signer.key.to_public_key())? {
         Recipient::Primary(key) => {
             builder.encrypt_to_key(&mut rng, key)?;

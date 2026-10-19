@@ -78,6 +78,7 @@ pub struct Api {
     pub uid: String,
     pub access: String,
     pub refresh: String,
+    pub server_time: Option<u32>,
 }
 
 impl Api {
@@ -93,6 +94,7 @@ impl Api {
             uid: String::new(),
             access: String::new(),
             refresh: String::new(),
+            server_time: None,
         }
     }
 
@@ -178,6 +180,15 @@ impl Api {
             request = request.json(body);
         }
         let response = request.send().await.context("Proton API request")?;
+        if let Some(time) = response
+            .headers()
+            .get(reqwest::header::DATE)
+            .and_then(|date| date.to_str().ok())
+            .and_then(|date| chrono::DateTime::parse_from_rfc2822(date).ok())
+            .and_then(|date| u32::try_from(date.timestamp()).ok())
+        {
+            self.server_time = Some(time);
+        }
         let status = response.status().as_u16();
         let text = response.text().await.unwrap_or_default();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
@@ -434,14 +445,15 @@ impl Api {
         serde_json::from_value(value["Message"].clone()).context("Proton draft")
     }
 
-    pub async fn send_draft(&mut self, id: &str, body: &Value) -> Result<()> {
-        self.call(
-            reqwest::Method::POST,
-            &format!("/mail/v4/messages/{id}"),
-            Some(body),
-        )
-        .await?;
-        Ok(())
+    pub async fn send_draft(&mut self, id: &str, body: &Value) -> Result<Message> {
+        let value = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/mail/v4/messages/{id}"),
+                Some(body),
+            )
+            .await?;
+        serde_json::from_value(value["Sent"].clone()).context("Proton sent message")
     }
 
     /// The account's labels, folders included (`GET /core/v4/labels`).

@@ -2420,3 +2420,87 @@ fn a_draft_written_in_another_client_becomes_editable_and_replaced() {
         "the whole thought"
     );
 }
+
+#[test]
+fn sent_and_drafts_views_include_messages_in_a_mixed_mailbox_conversation() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let received = msg("received", "alice@x.com", "A conversation", D0);
+    let sent = in_mailbox(
+        replying_to(
+            msg("sent", "me@x.com", "Re: A conversation", D0 + 1),
+            "received",
+        ),
+        Mailbox::Sent,
+    );
+    let draft = in_mailbox(
+        replying_to(
+            msg("unfinished", "me@x.com", "Re: A conversation", D0 + 2),
+            "received",
+        ),
+        Mailbox::Drafts,
+    );
+    s.apply_deltas(account.id, &[up(received), up(sent), up(draft)])
+        .unwrap();
+    let inbox = s.threads(&view(Mailbox::Inbox), 0, 10).unwrap();
+    let sent = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 10).unwrap();
+    assert_eq!(
+        sent.len(),
+        1,
+        "a reply is visible in Sent even when another message determines the thread mailbox"
+    );
+    assert_eq!(drafts.len(), 1);
+    assert_ne!(
+        sent[0].id, drafts[0].id,
+        "a draft can be discarded without trashing its sent conversation"
+    );
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(sent[0].id, inbox[0].id);
+    let draft = s.draft(drafts[0].id).unwrap().unwrap();
+    s.discard_draft(draft.id.unwrap()).unwrap();
+    assert!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().is_empty());
+    assert_eq!(s.threads(&view(Mailbox::Sent), 0, 10).unwrap().len(), 1);
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn old_grouped_provider_drafts_are_separated_without_losing_sent_mail() {
+    let path = temp_db("grouped-drafts");
+    let s = Store::open(&path).unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let sent = in_mailbox(
+        msg("sent", "me@x.com", "Repeated subject", D0),
+        Mailbox::Sent,
+    );
+    let draft = in_mailbox(
+        msg("draft1", "me@x.com", "Repeated subject", D0 + 1),
+        Mailbox::Drafts,
+    );
+    let second = in_mailbox(
+        msg("draft2", "me@x.com", "Repeated subject", D0 + 2),
+        Mailbox::Drafts,
+    );
+    s.apply_deltas(account.id, &[up(sent), up(draft), up(second)])
+        .unwrap();
+    drop(s);
+    // Reproduce the pre-fix database: all copies shared one thread.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("UPDATE messages SET thread_id=(SELECT thread_id FROM messages WHERE remote_id='sent');
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages); PRAGMA user_version=5;").unwrap();
+    drop(connection);
+    let s = Store::open(&path).unwrap();
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 10).unwrap();
+    assert_eq!(
+        drafts.len(),
+        2,
+        "each dead provider draft has its own deletable row"
+    );
+    let token = s.act(&[drafts[0].id], &Action::Trash).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().len(), 1);
+    assert_eq!(s.threads(&view(Mailbox::Sent), 0, 10).unwrap().len(), 1);
+    s.undo(token).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().len(), 2);
+    drop(s);
+    cleanup(&path);
+}

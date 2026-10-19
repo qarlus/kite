@@ -1,60 +1,55 @@
-//! The reading pane's layout: the day gutter in the list, and the header, avatar, attachment
-//! pills and inline reply of an open conversation.
+//! The reading pane's layout: each row's own timestamp in the list, and the header, avatar,
+//! attachment pills and inline reply of an open conversation.
 mod common;
-use chrono::TimeZone as _;
+use chrono::{Datelike as _, TimeZone as _, Timelike as _};
 use common::{Fixture, mount, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
 use std::time::Duration;
 
 #[gpui_kit::test]
-fn only_the_first_row_of_a_day_paints_the_day_gutter(cx: &mut TestAppContext) {
-    let fixture = Fixture::new(3);
+fn every_row_carries_its_own_unambiguous_date(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(4);
     let now = chrono::Local::now().timestamp_millis();
     fixture.set_thread_date(1, now - 60_000);
-    fixture.set_thread_date(2, now - 3_600_000);
+    fixture.set_thread_date(2, now - 86_400_000);
     fixture.set_thread_date(3, now - 3 * 86_400_000);
+    fixture.set_thread_date(4, now - 400 * 86_400_000);
     let (window, _) = mount(cx, fixture);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let today = window
-            .find(("day", 0usize))
-            .label()
-            .unwrap_or_default()
-            .to_string();
+        let label = |ix: usize| {
+            window
+                .find(("row-time", ix))
+                .label()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let now = chrono::Local::now();
+        // The contract `list::when` paints: time today, `Yesterday`, a weekday inside the
+        // week, then the date with the year once it matters.
+        let expected = |ms: i64| {
+            let at = chrono::Local.timestamp_millis_opt(ms).single().unwrap();
+            match (now.date_naive() - at.date_naive()).num_days() {
+                0 => format!("{}:{:02}", at.time().hour(), at.time().minute()),
+                1 => "Yesterday".to_string(),
+                2..=6 => at.format("%a").to_string(),
+                _ if at.year() == now.year() => format!("{} {}", at.format("%b"), at.day()),
+                _ => format!("{} {}, {}", at.format("%b"), at.day(), at.year()),
+            }
+        };
+        assert_eq!(label(0), expected(now.timestamp_millis() - 60_000));
+        assert_eq!(label(1), "Yesterday");
+        assert_eq!(label(2), expected(now.timestamp_millis() - 3 * 86_400_000));
+        let old = label(3);
+        assert_eq!(old, expected(now.timestamp_millis() - 400 * 86_400_000));
         assert!(
-            today.ends_with("Today"),
-            "the first row names its day: {today:?}"
+            old.chars().any(|c| c.is_ascii_digit()) && old.contains(','),
+            "mail from a previous year shows day, month and year: {old:?}"
         );
         assert!(
-            today.starts_with(&chrono::Local::now().format("%-d").to_string()),
-            "with the day of the month: {today:?}"
-        );
-        assert!(
-            window.try_find(("day", 1usize)).is_none(),
-            "a row in the same day leaves the gutter empty"
-        );
-        assert!(
-            window.find(("day", 0usize)).bounds().right()
-                <= window.find(("row-sender", 0usize)).bounds().left(),
-            "the gutter sits left of the conversations"
-        );
-        let older = window
-            .find(("day", 2usize))
-            .label()
-            .unwrap_or_default()
-            .to_string();
-        let at = chrono::Local
-            .timestamp_millis_opt(now - 3 * 86_400_000)
-            .single()
-            .unwrap();
-        assert!(
-            older.starts_with(&at.format("%-d").to_string()),
-            "{older:?}"
-        );
-        assert!(
-            !older.ends_with("Today"),
-            "a new day starts its own group: {older:?}"
+            window.try_find(("day", 0usize)).is_none(),
+            "the list no longer paints a day gutter"
         );
     })
     .unwrap();

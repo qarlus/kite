@@ -293,6 +293,39 @@ impl Store {
             tx.execute_batch("PRAGMA user_version=5")?;
             tx.commit()?;
         }
+        if version < 6 {
+            let tx = conn.unchecked_transaction()?;
+            // Earlier versions grouped independent provider drafts with each other and even
+            // with sent mail. Give each draft its own row before enabling conversation Trash.
+            let drafts: Vec<(Id, Id, Id, String)> = {
+                let mut statement = tx.prepare("SELECT m.id, m.thread_id, m.account_id, m.remote_id FROM messages m
+                    WHERE m.mailbox='drafts' AND (SELECT COUNT(*) FROM messages other WHERE other.thread_id=m.thread_id)>1")?;
+                statement
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (message, old, account, remote) in drafts {
+                let thread = new_thread(&tx, account)?;
+                tx.execute(
+                    "UPDATE messages SET thread_id=?1 WHERE id=?2",
+                    params![thread, message],
+                )?;
+                tx.execute(
+                    "UPDATE drafts SET thread_id=?1 WHERE account_id=?2 AND thread_id=?3
+                    AND (remote_id=?4 OR 'kite-draft:'||id=?4)",
+                    params![thread, account, old, remote],
+                )?;
+                tx.execute(
+                    "UPDATE undo_log SET thread_id=?1 WHERE message_id=?2",
+                    params![thread, message],
+                )?;
+                tx.execute("INSERT INTO thread_tags(thread_id, tag_id) SELECT ?1, tag_id FROM thread_tags WHERE thread_id=?2", params![thread, old])?;
+                refresh_thread(&tx, thread)?;
+                refresh_thread(&tx, old)?;
+            }
+            tx.execute_batch("PRAGMA user_version=6")?;
+            tx.commit()?;
+        }
         migrate_split_defaults(&conn)?;
         Ok(Store { conn })
     }
@@ -527,7 +560,10 @@ impl Store {
 fn find_message(tx: &Transaction, account_id: Id, remote_id: &str) -> Result<Option<(Id, Id)>> {
     Ok(tx
         .query_row(
-            "SELECT id, thread_id FROM messages WHERE account_id=?1 AND remote_id=?2",
+            "SELECT id, thread_id FROM messages WHERE account_id=?1 AND remote_id=?2
+             UNION ALL SELECT m.id, m.thread_id FROM drafts d JOIN messages m
+               ON m.account_id=d.account_id AND m.remote_id='kite-draft:'||d.id
+             WHERE d.account_id=?1 AND d.remote_id=?2 LIMIT 1",
             params![account_id, remote_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -587,13 +623,7 @@ fn upsert_message(
         .optional()?
         .unwrap_or(0);
     let important = m.important.unwrap_or(from_self || sent_to > 0);
-    let existing: Option<Id> = tx
-        .query_row(
-            "SELECT id FROM messages WHERE account_id=?1 AND remote_id=?2",
-            params![account_id, m.remote_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let existing = find_message(tx, account_id, &m.remote_id)?.map(|(id, _)| id);
     let mid = match existing {
         Some(id) => {
             // While a local change is queued, keep the local placement and flags (?22 = pending).
@@ -677,6 +707,11 @@ fn thread_id_of(tx: &Transaction, message_id: Id) -> Result<Id> {
 /// Graph's `conversationId` wins; otherwise the Message-ID/In-Reply-To/References union; otherwise
 /// normalized subject + overlapping participants within 30 days.
 fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Id> {
+    // Drafts are individual editable messages, even when the provider gives them the
+    // same conversation or References chain as an already sent message.
+    if m.mailbox == Mailbox::Drafts {
+        return new_thread(tx, account_id);
+    }
     let hint = m.thread_hint.as_deref().filter(|s| !s.is_empty());
     if let Some(h) = hint {
         let known = key_thread(tx, account_id, &format!("h:{h}"))?;
@@ -702,15 +737,7 @@ fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
         }
         None => match subject_thread(tx, account_id, m, ns)? {
             Some(t) => t,
-            None => {
-                tx.execute(
-                    "INSERT INTO threads(account_id, subject, norm_subject, snippet, participants, date,
-                       unread, starred, important, attachments, count, mailbox)
-                     VALUES (?1,'','','','',0,0,0,0,0,0,'inbox')",
-                    [account_id],
-                )?;
-                tx.last_insert_rowid()
-            }
+            None => new_thread(tx, account_id)?,
         },
     };
     let mut keys = keys;
@@ -724,6 +751,16 @@ fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
         )?;
     }
     Ok(tid)
+}
+
+fn new_thread(tx: &Transaction, account_id: Id) -> Result<Id> {
+    tx.execute(
+        "INSERT INTO threads(account_id, subject, norm_subject, snippet, participants, date,
+           unread, starred, important, attachments, count, mailbox)
+         VALUES (?1,'','','','',0,0,0,0,0,0,'inbox')",
+        [account_id],
+    )?;
+    Ok(tx.last_insert_rowid())
 }
 
 fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Option<Id>> {
@@ -743,7 +780,7 @@ fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
     let holes = vec!["?"; emails.len()].join(",");
     let sql = format!(
         "SELECT m.thread_id FROM messages m
-         WHERE m.account_id=?1 AND m.norm_subject=?2 AND m.date BETWEEN ?3 AND ?4
+         WHERE m.account_id=?1 AND m.mailbox!='drafts' AND m.norm_subject=?2 AND m.date BETWEEN ?3 AND ?4
            AND EXISTS (SELECT 1 FROM message_people p WHERE p.message_id=m.id AND p.email IN ({holes}))
          ORDER BY m.date DESC LIMIT 1"
     );
@@ -1392,10 +1429,12 @@ fn with_remote_id(op: Op, remote_id: &str) -> Op {
     }
 }
 
-fn current_remote_id(tx: &Transaction, message_id: Id) -> Result<Option<String>> {
+fn current_remote_id(tx: &Connection, message_id: Id) -> Result<Option<String>> {
     Ok(tx
         .query_row(
-            "SELECT remote_id FROM messages WHERE id=?1",
+            "SELECT COALESCE(d.remote_id, m.remote_id) FROM messages m
+             LEFT JOIN drafts d ON d.account_id=m.account_id AND m.remote_id='kite-draft:'||d.id
+             WHERE m.id=?1",
             [message_id],
             |r| r.get(0),
         )
@@ -1437,8 +1476,7 @@ fn plan(action: &Action, m: &MsgState) -> Plan {
             Some(move_op(rid, Mailbox::Inbox)),
             Some(move_op(rid, Mailbox::Archive)),
         ),
-        // The whole conversation goes to the bin, except drafts, which are not conversations.
-        Action::Trash if m.mailbox != "trash" && m.mailbox != "drafts" => (
+        Action::Trash if m.mailbox != "trash" => (
             Some("trash".into()),
             Some(false),
             None,
@@ -1508,7 +1546,10 @@ fn tag_id_by_name(tx: &Transaction, name: &str) -> Result<Option<Id>> {
 
 fn message_states(tx: &Transaction, thread_id: Id) -> Result<Vec<MsgState>> {
     let mut s = tx.prepare(
-        "SELECT id, remote_id, mailbox, folder, unread, starred FROM messages WHERE thread_id=?1 ORDER BY date, id",
+        "SELECT m.id, COALESCE(d.remote_id, m.remote_id), m.mailbox, m.folder, m.unread, m.starred
+         FROM messages m LEFT JOIN drafts d
+           ON d.account_id=m.account_id AND m.remote_id='kite-draft:'||d.id
+         WHERE m.thread_id=?1 ORDER BY m.date, m.id",
     )?;
     let it = s.query_map([thread_id], |r| {
         Ok(MsgState {
@@ -1541,12 +1582,36 @@ impl Store {
         Ok(out)
     }
 
+    /// Resolve each op when it runs: an earlier draft save or move in the same batch can change
+    /// the provider id after the batch was read.
+    pub(crate) fn address_op(&self, op_id: i64, op: Op) -> Result<Op> {
+        let message: Option<Id> = self.conn.query_row(
+            "SELECT message_id FROM pending_ops WHERE id=?1",
+            [op_id],
+            |r| r.get(0),
+        )?;
+        match message
+            .map(|id| current_remote_id(&self.conn, id))
+            .transpose()?
+            .flatten()
+        {
+            Some(remote) => Ok(with_remote_id(op, &remote)),
+            None => Ok(op),
+        }
+    }
+
     /// A move changes a message's remote id; keep the local row pointing at the new one. A draft's
     /// save reports the provider copy's id, which the `drafts` row records instead.
     pub fn op_done(&self, op_id: i64, new_remote_id: Option<String>) -> Result<()> {
         if let Some(rid) = new_remote_id {
             self.conn.execute(
-                "UPDATE messages SET remote_id=?1 WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2)",
+                "UPDATE drafts SET remote_id=?1 WHERE 'kite-draft:'||id=(
+                   SELECT remote_id FROM messages WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2))",
+                params![rid, op_id],
+            )?;
+            self.conn.execute(
+                "UPDATE messages SET remote_id=?1 WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2)
+                   AND remote_id NOT LIKE 'kite-draft:%'",
                 params![rid, op_id],
             )?;
             self.conn.execute(
@@ -2623,8 +2688,12 @@ fn mailbox_cond(m: Mailbox) -> &'static str {
         Mailbox::Snoozed => "t.snoozed_until IS NOT NULL AND t.mailbox NOT IN ('trash','spam')",
         Mailbox::All => "t.mailbox NOT IN ('trash','spam')",
         Mailbox::Archive => "t.mailbox='archive'",
-        Mailbox::Drafts => "t.mailbox='drafts'",
-        Mailbox::Sent => "t.mailbox='sent'",
+        Mailbox::Drafts => {
+            "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.mailbox='drafts')"
+        }
+        Mailbox::Sent => {
+            "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.mailbox='sent')"
+        }
         Mailbox::Trash => "t.mailbox='trash'",
         Mailbox::Spam => "t.mailbox='spam'",
     }

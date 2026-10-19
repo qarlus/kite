@@ -3,7 +3,7 @@ mod common;
 use common::{Fixture, HTML, mount, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
-use kite_core::model::Action;
+use kite_core::model::{Action, Event};
 use std::time::Duration;
 
 #[gpui_kit::test]
@@ -75,6 +75,79 @@ async fn compact_html_uses_only_the_space_remaining_in_the_reading_pane(cx: &mut
         assert_eq!(body.size.width, expected);
         assert!(body.origin.x >= list.right());
         assert!(body.right() <= gpui_kit::px(720.));
+    })
+    .unwrap();
+}
+
+/// Once a body has painted, no frame may fall back to the "Rendering" placeholder: not when
+/// the reader allows its images, not while the fetch is in flight or lands, and not when the
+/// mark-read change event reloads the open conversation.
+#[gpui_kit::test]
+async fn a_painted_body_never_falls_back_to_the_placeholder(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    fixture.set_message_html(
+        2,
+        "<p>Hello there.</p><img src=\"https://cdn.example.com/logo.png\" width=\"8\" height=\"8\">",
+    );
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "j enter");
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window
+            .try_find("html-22")
+            .is_some_and(|body| body.label() != Some("Rendering"))
+    })
+    .await;
+    let painted = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let body = window.find("html-22");
+            (
+                body.label().unwrap_or_default().to_string(),
+                body.bounds().size.height,
+            )
+        })
+        .unwrap();
+    // Allowing this message's images re-keys the render; the painted frame stays up.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click("load-images-22", cx);
+        window.render_frame(cx);
+        let body = window.find("html-22");
+        assert_ne!(
+            body.label(),
+            Some("Rendering"),
+            "a shown body must not flash the placeholder"
+        );
+        assert_eq!(body.bounds().size.height, painted.1);
+    })
+    .unwrap();
+    // The fetch lands and the body re-renders with the image inlined; a store change
+    // arrives on top. Every observed frame keeps the body.
+    fixture.emit(Event::Changed(vec![1]));
+    for _ in 0..20 {
+        cx.run_until_parked();
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert_ne!(
+                window.find("html-22").label(),
+                Some("Rendering"),
+                "the placeholder came back"
+            );
+        })
+        .unwrap();
+    }
+    assert_eq!(
+        *fixture.images_fetched.lock().unwrap(),
+        vec!["https://cdn.example.com/logo.png".to_string()],
+        "the image was fetched once, through the engine"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let body = window.find("html-22");
+        assert!(
+            body.label().unwrap_or_default().starts_with("HTML body"),
+            "the body settled rendered: {:?}",
+            body.label()
+        );
     })
     .unwrap();
 }

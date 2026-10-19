@@ -26,7 +26,8 @@ pub const BODY_INDENT: f32 = 44.;
 /// remaining images blocked, which bounds a long session without a retry loop.
 const IMAGE_CACHE: usize = 128;
 
-/// Cache key: a body is re-rendered when the message, width, theme or DPI scale changes.
+/// Cache key: a body is re-rendered when the message, width, theme, DPI scale, the set of
+/// fetched remote images or the message's image permission changes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HtmlKey {
     pub id: Id,
@@ -34,10 +35,20 @@ pub struct HtmlKey {
     scale: u32,
     dark: bool,
     appearance: u64,
+    images: u64,
+    allowed: bool,
 }
 
 impl HtmlKey {
-    pub fn new(id: Id, width: f32, scale: f32, dark: bool, appearance: u64) -> Self {
+    pub fn new(
+        id: Id,
+        width: f32,
+        scale: f32,
+        dark: bool,
+        appearance: u64,
+        images: u64,
+        allowed: bool,
+    ) -> Self {
         Self {
             id,
             // Quantised so a drag-resize does not miss the cache every frame.
@@ -45,6 +56,8 @@ impl HtmlKey {
             scale: (scale * 20.).round() as u32,
             dark,
             appearance,
+            images,
+            allowed,
         }
     }
 
@@ -56,6 +69,9 @@ impl HtmlKey {
 pub struct HtmlCache {
     inner: Lru<HtmlKey, Rendered>,
     pending: std::collections::HashSet<HtmlKey>,
+    /// The key each message last painted, so a re-render under a new key keeps the previous
+    /// frame on screen instead of dropping back to the placeholder.
+    painted: std::collections::HashMap<Id, HtmlKey>,
 }
 
 impl HtmlCache {
@@ -63,6 +79,7 @@ impl HtmlCache {
         Self {
             inner: Lru::new(cap),
             pending: std::collections::HashSet::new(),
+            painted: std::collections::HashMap::new(),
         }
     }
 
@@ -70,9 +87,21 @@ impl HtmlCache {
         self.inner.get(key)
     }
 
+    /// The render a message last showed, while its new key is still rendering.
+    pub fn shown(&self, id: Id) -> Option<&Rendered> {
+        self.painted.get(&id).and_then(|key| self.inner.get(key))
+    }
+
+    /// Called when a body paints, so the fallback is what is on screen — a stale render
+    /// finishing late must not point it at a frame the reader never saw.
+    fn mark_shown(&mut self, key: HtmlKey) {
+        self.painted.insert(key.id, key);
+    }
+
     pub fn clear(&mut self) {
         self.inner.clear();
         self.pending.clear();
+        self.painted.clear();
     }
 
     fn start(&mut self, key: HtmlKey) -> bool {
@@ -82,6 +111,15 @@ impl HtmlCache {
     fn finish(&mut self, key: HtmlKey, rendered: Rendered) {
         self.pending.remove(&key);
         self.inner.insert(key, rendered);
+        // A body that was never shown yet still counts as the best thing to paint while a
+        // newer key renders; a painted key that fell out of the cache cannot be shown again.
+        if self
+            .painted
+            .get(&key.id)
+            .is_none_or(|painted| self.inner.get(painted).is_none())
+        {
+            self.painted.insert(key.id, key);
+        }
     }
 }
 
@@ -325,7 +363,8 @@ impl Kite {
                 crate::preferences::button(format!("load-images-{id}"), "Load images", t).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.images_allowed.insert(id);
-                        this.html_cache.clear();
+                        // `allowed` is part of the render key, so the body re-renders with its
+                        // images inlined — and keeps painting the old frame until it lands.
                         cx.notify();
                     }),
                 ),
@@ -360,8 +399,9 @@ impl Kite {
                     let mut images = (*this.images).clone();
                     images.insert(url, crate::html::data_url(&bytes));
                     this.images = std::sync::Arc::new(images);
-                    // The body that was painted without it has to be laid out again.
-                    this.html_cache.clear();
+                    // A fetched image is part of the render key: the body re-renders with it
+                    // inlined while the last painted frame stays up — no placeholder flash.
+                    this.images_version += 1;
                     cx.notify();
                 })
                 .ok();
@@ -661,7 +701,15 @@ impl Kite {
     ) -> AnyElement {
         let t = self.theme;
         let width = (body_width * scale).round() / scale;
-        let key = HtmlKey::new(message.id, width, scale, self.dark, self.appearance_version);
+        let key = HtmlKey::new(
+            message.id,
+            width,
+            scale,
+            self.dark,
+            self.appearance_version,
+            self.images_version,
+            images_allowed,
+        );
         // A blocked body has every remote source replaced, so nothing can reach the network.
         let images = if images_allowed {
             self.images.clone()
@@ -669,7 +717,16 @@ impl Kite {
             std::sync::Arc::new(std::collections::HashMap::new())
         };
         self.request_html(source, key, images, cx);
-        match self.html_cache.get(&key) {
+        if self.html_cache.get(&key).is_some() {
+            self.html_cache.mark_shown(key);
+        }
+        // While a re-render for a new key is in flight the last painted frame stays up:
+        // a body that was shown once never drops back to the placeholder.
+        match self
+            .html_cache
+            .get(&key)
+            .or_else(|| self.html_cache.shown(message.id))
+        {
             Some(rendered) => {
                 let image: Arc<RenderImage> = rendered.image.clone();
                 let height = rendered.height;
@@ -710,6 +767,7 @@ impl Kite {
                             if let Some(href) = this
                                 .html_cache
                                 .get(&key)
+                                .or_else(|| this.html_cache.shown(id))
                                 .and_then(|r| r.link_at(at.x.into(), at.y.into()))
                             {
                                 cx.open_url(&href);
@@ -778,6 +836,8 @@ impl Kite {
                 self.html_scale,
                 self.dark,
                 self.appearance_version,
+                self.images_version,
+                allowed,
             );
             let images = if allowed {
                 images.clone()

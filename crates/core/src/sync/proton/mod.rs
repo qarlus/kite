@@ -318,6 +318,7 @@ pub struct Proton {
     /// Key id -> the salted passphrase that unlocks it.
     passphrases: BTreeMap<String, String>,
     keys: Option<Keyring>,
+    sent: Option<RemoteMsg>,
     /// The account's folders (custom labels of type 3), fetched once.
     folders: Option<Vec<(String, String)>>,
 }
@@ -331,6 +332,7 @@ impl Proton {
             email: email.to_string(),
             passphrases: credentials.passphrases.clone(),
             keys: None,
+            sent: None,
             folders: None,
         }
     }
@@ -616,6 +618,8 @@ impl Proton {
             .create_draft(&draft.body())
             .await
             .context("create the Proton draft")?;
+        let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
+        let mut message = remote_msg(keys, &saved.meta, &saved)?;
         let sent = match self.packages(&draft).await {
             Ok(packages) => self
                 .api
@@ -626,10 +630,32 @@ impl Proton {
         };
         if sent.is_err() {
             // The outbox retries with a fresh draft, so this one would only pile up in Drafts.
-            let _ = self.api.delete_messages(&[saved.meta.id.clone()]).await;
+            let _ = self
+                .api
+                .delete_messages(std::slice::from_ref(&saved.meta.id))
+                .await;
         }
-        sent?;
+        let sent = sent?;
+        // Use the accepted send response and the body we already hold; Sent must not wait
+        // for another event poll or body download.
+        message.remote_id = sent.meta.id;
+        message.thread_hint =
+            (!sent.meta.conversation_id.is_empty()).then_some(sent.meta.conversation_id);
+        message.date = sent.meta.time.max(0) * 1000;
+        message.mailbox = Mailbox::Sent;
+        message.folder = SENT.into();
+        message.unread = false;
+        message.from = draft.from;
+        message.to = draft.to;
+        message.cc = draft.cc;
+        message.subject = draft.subject;
+        message.text = draft.text;
+        self.sent = Some(message);
         Ok(None)
+    }
+
+    pub(crate) fn take_sent(&mut self) -> Option<RemoteMsg> {
+        self.sent.take()
     }
 
     async fn build_draft(&mut self, mime: &[u8]) -> Result<Outgoing> {
@@ -644,7 +670,8 @@ impl Proton {
             outgoing.from.name = outgoing.from.email.clone();
         }
         let signer = Keyring::signing_key(address)?;
-        outgoing.armored_body = crypto::encrypt_draft(signer, &outgoing.text)?;
+        outgoing.armored_body =
+            crypto::encrypt_draft(signer, &outgoing.text, self.api.server_time)?;
         Ok(outgoing)
     }
 
@@ -654,7 +681,7 @@ impl Proton {
             .for_sender(&outgoing.from.email)
             .with_context(|| format!("no Proton address for {}", outgoing.from.email))?;
         let signer = Keyring::signing_key(address)?;
-        let package = crypto::encrypt_body(signer, &outgoing.text)?;
+        let package = crypto::encrypt_body(signer, &outgoing.text, self.api.server_time)?;
         // As Bridge does: an external copy declares the signature the account's "Sign external
         // messages" setting asks for (the body always carries it), or Proton refuses the send.
         let sign_external = self.api.signs_external_mail().await?;
@@ -887,9 +914,8 @@ fn mailbox_label(mailbox: Mailbox) -> Option<&'static str> {
         Mailbox::Archive => Some(ARCHIVE),
         Mailbox::Trash => Some(TRASH),
         Mailbox::Spam => Some(SPAM),
-        Mailbox::Sent | Mailbox::Drafts | Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => {
-            None
-        }
+        Mailbox::Drafts => Some(DRAFTS),
+        Mailbox::Sent | Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => None,
     }
 }
 

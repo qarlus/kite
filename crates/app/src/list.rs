@@ -12,58 +12,18 @@ use kite_core::model::{Action as MailAction, Id, Mailbox, Ms, ThreadSummary};
 use std::ops::Range;
 use std::time::Duration;
 
-/// The day gutter's width: a two-digit numeral and its caption, right-aligned.
-const DAY_W: f32 = 88.;
-
-/// A row's time once the gutter has already named the day: `9:41` inside the last week,
-/// then the date, since the gutter steps up to whole months there.
+/// A row's own timestamp: `9:41` today, `Yesterday`, a weekday inside the last week,
+/// then `Oct 2` this year and `Mar 3, 2025` across a year boundary.
 pub fn when(ms: Ms, now: DateTime<Local>) -> String {
     let Some(at) = at_or_now(ms, now) else {
         return String::new();
     };
-    if days_ago(at, now) < 7 {
-        format!("{}:{:02}", at.time().hour(), at.time().minute())
-    } else if at.year() == now.year() {
-        format!("{} {}", at.format("%b"), at.day())
-    } else {
-        format!("{}, {}", at.format("%b"), at.year())
-    }
-}
-
-/// Where a row files in the gutter: one group per day for the last week, then one per month,
-/// so conversations from the same day share a key and only the first row paints the numeral.
-fn day_key(ms: Ms, now: DateTime<Local>) -> (i32, u32, u32) {
-    let Some(at) = at_or_now(ms, now) else {
-        return (0, 0, 0);
-    };
-    if days_ago(at, now) < 7 {
-        let at = at.date_naive();
-        (at.year(), at.month(), at.day())
-    } else {
-        (at.year(), at.month(), 0)
-    }
-}
-
-/// The gutter numeral and its caption: `19`/`Today`, `15`/`Thu`, then `Oct` for older mail.
-fn day_label(ms: Ms, now: DateTime<Local>) -> (String, String) {
-    let Some(at) = at_or_now(ms, now) else {
-        return Default::default();
-    };
-    let days = days_ago(at, now);
-    if days < 7 {
-        let caption = match days {
-            0 => "Today".to_string(),
-            1 => "Yesterday".to_string(),
-            _ => at.format("%a").to_string(),
-        };
-        (at.date_naive().day().to_string(), caption)
-    } else {
-        let caption = if at.year() == now.year() {
-            String::new()
-        } else {
-            at.year().to_string()
-        };
-        (at.format("%b").to_string(), caption)
+    match days_ago(at, now) {
+        0 => format!("{}:{:02}", at.time().hour(), at.time().minute()),
+        1 => "Yesterday".to_string(),
+        2..=6 => at.format("%a").to_string(),
+        _ if at.year() == now.year() => format!("{} {}", at.format("%b"), at.day()),
+        _ => format!("{} {}, {}", at.format("%b"), at.day(), at.year()),
     }
 }
 
@@ -100,13 +60,7 @@ impl Kite {
                         let Some(row) = this.rows.get(ix) else {
                             continue;
                         };
-                        // The gutter is painted per row: only a row whose day differs from the
-                        // one above it names the day, so the list stays a uniform-height list.
-                        let new_day = ix
-                            .checked_sub(1)
-                            .and_then(|prev| this.rows.get(prev))
-                            .is_none_or(|prev| day_key(prev.date, now) != day_key(row.date, now));
-                        items.push(row_element(this, row, ix, new_day, now, cx));
+                        items.push(row_element(this, row, ix, now, cx));
                     }
                     items
                 },
@@ -369,13 +323,12 @@ fn help_section(t: &Theme, group: Group, commands: Vec<(&Cmd, String)>) -> AnyEl
         .into_any_element()
 }
 
-/// One list row: the day gutter, then the sender and time, the subject and a two-line snippet.
+/// One list row: the sender and time, the subject and a two-line snippet.
 /// Borrows its summary, so painting a frame copies no threads.
 fn row_element(
     kite: &Kite,
     row: &ThreadSummary,
     ix: usize,
-    new_day: bool,
     now: DateTime<Local>,
     cx: &mut Context<Kite>,
 ) -> AnyElement {
@@ -400,43 +353,6 @@ fn row_element(
     let account_email = account
         .map(|account| account.email.clone())
         .unwrap_or_default();
-    // The day gutter: the numeral hangs at the top of its group, and every row after the first
-    // of the day leaves it empty, so the list stays uniform-height and virtualised.
-    let mut gutter = div()
-        .w(px(DAY_W * t.scale))
-        .h_full()
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .items_end()
-        .pt_2()
-        .pr_3();
-    if new_day {
-        let (big, caption) = day_label(row.date, now);
-        gutter = gutter.child(
-            div()
-                .id(("day", ix))
-                .test_support()
-                .aria_label(if caption.is_empty() {
-                    big.clone()
-                } else {
-                    format!("{big} {caption}")
-                })
-                .flex()
-                .flex_col()
-                .items_end()
-                .child(
-                    div()
-                        .text_size(t.px(30.))
-                        .font_weight(FontWeight(500.))
-                        .text_color(t.fg)
-                        .child(big),
-                )
-                .when(!caption.is_empty(), |d| {
-                    d.child(div().text_size(t.px(12.)).text_color(t.fg2).child(caption))
-                }),
-        );
-    }
     div()
         .id(("row", ix))
         .test_support()
@@ -452,182 +368,170 @@ fn row_element(
         // first one, so a taller row here would misalign the whole list.
         .h(px(ROW_H * 2. * t.scale))
         .cursor_pointer()
-        .child(gutter)
-        // The hairline that separates the gutter from the conversations; painted per row it
-        // reads as one continuous spine.
         .child(
             div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .border_l_1()
-                .border_color(t.line)
-                .pl_0p5()
+                .flex()
+                .flex_row()
+                .gap_2()
+                .px_3()
+                // Tight enough that sender, subject and a two-line snippet fit the fixed
+                // row height instead of clipping the snippet's second line.
+                .py_1p5()
+                .rounded(px(RADIUS_SM))
+                .overflow_hidden()
+                .when(selected, |d| d.bg(t.sel))
+                .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
                 .child(
                     div()
+                        .id(("select-row", ix))
+                        .test_support()
+                        .aria_label("Select conversation")
+                        .aria_selected(checked)
+                        .w(px(14.))
                         .h_full()
+                        .flex_shrink_0()
                         .flex()
-                        .flex_row()
-                        .gap_2()
-                        .px_3()
-                        // Tight enough that sender, subject and a two-line snippet fit the fixed
-                        // row height instead of clipping the snippet's second line.
-                        .py_1p5()
-                        .rounded(px(RADIUS_SM))
-                        .overflow_hidden()
-                        .when(selected, |d| d.bg(t.sel))
-                        .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
+                        .items_center()
+                        .justify_center()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            if let Some(index) = this.multi.iter().position(|id| *id == row_id) {
+                                this.multi.remove(index);
+                            } else {
+                                this.multi.push(row_id);
+                            }
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                            cx.stop_propagation();
+                        }))
+                        .when(checked, |d| {
+                            d.child(
+                                Icon::new(IconName::Check)
+                                    .with_size(px(13.))
+                                    .text_color(t.accent),
+                            )
+                        })
+                        .when(!checked, |d| {
+                            // Unread is ink weight here, never a coloured dot, so the box
+                            // only appears once the pointer is on the row.
+                            d.child(
+                                div()
+                                    .size(px(13.))
+                                    .rounded(px(4.))
+                                    .border_1()
+                                    .border_color(t.line)
+                                    .opacity(0.)
+                                    .group_hover("row", |s| s.opacity(1.)),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap_0p5()
                         .child(
                             div()
-                                .id(("select-row", ix))
-                                .test_support()
-                                .aria_label("Select conversation")
-                                .aria_selected(checked)
-                                .w(px(14.))
-                                .h_full()
-                                .flex_shrink_0()
                                 .flex()
                                 .items_center()
-                                .justify_center()
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    if let Some(index) =
-                                        this.multi.iter().position(|id| *id == row_id)
-                                    {
-                                        this.multi.remove(index);
-                                    } else {
-                                        this.multi.push(row_id);
-                                    }
-                                    window.focus(&this.focus, cx);
-                                    cx.notify();
-                                    cx.stop_propagation();
-                                }))
-                                .when(checked, |d| {
-                                    d.child(
-                                        Icon::new(IconName::Check)
-                                            .with_size(px(13.))
-                                            .text_color(t.accent),
-                                    )
-                                })
-                                .when(!checked, |d| {
-                                    // Unread is ink weight here, never a coloured dot, so the box
-                                    // only appears once the pointer is on the row.
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id(("row-sender", ix))
+                                        .test_support()
+                                        .aria_label(unread)
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(t.px(13.))
+                                        .font_weight(if row.unread {
+                                            FontWeight(650.)
+                                        } else {
+                                            FontWeight(500.)
+                                        })
+                                        .text_color(t.fg)
+                                        .child(sender),
+                                )
+                                .when(combined, |d| {
                                     d.child(
                                         div()
-                                            .size(px(13.))
-                                            .rounded(px(4.))
-                                            .border_1()
-                                            .border_color(t.line)
-                                            .opacity(0.)
-                                            .group_hover("row", |s| s.opacity(1.)),
+                                            .id(("row-account", ix))
+                                            .test_support()
+                                            .aria_label(account_email.clone())
+                                            .max_w(px(140.))
+                                            .min_w_0()
+                                            .flex_shrink_0()
+                                            .truncate()
+                                            .text_size(t.px(11.))
+                                            .text_color(t.fg2)
+                                            .child(account_email.clone()),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(("row-time", ix))
+                                        .test_support()
+                                        .aria_label(when.clone())
+                                        .flex_shrink_0()
+                                        .text_size(t.px(12.))
+                                        .text_color(t.fg3)
+                                        .child(when),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(t.px(13.))
+                                        .text_color(t.fg)
+                                        .child(row.subject.clone()),
+                                )
+                                .children(row.labels.iter().take(1).map(|label| {
+                                    div()
+                                        .max_w(px(120.))
+                                        .min_w_0()
+                                        .flex_shrink_0()
+                                        .truncate()
+                                        .px_2()
+                                        .rounded(px(RADIUS_SM))
+                                        .bg(t.bg3)
+                                        .text_size(t.px(11.))
+                                        .text_color(t.fg2)
+                                        .child(label.clone())
+                                }))
+                                .when(row.attachments, |d| {
+                                    d.child(
+                                        Icon::new(IconName::Paperclip)
+                                            .with_size(px(13.))
+                                            .text_color(t.fg2),
+                                    )
+                                })
+                                .when(row.starred, |d| {
+                                    d.child(
+                                        Icon::new(IconName::StarFill)
+                                            .with_size(px(13.))
+                                            .text_color(t.accent),
                                     )
                                 }),
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
-                                .flex()
-                                .flex_col()
-                                .justify_center()
-                                .gap_0p5()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .child(
-                                            div()
-                                                .id(("row-sender", ix))
-                                                .test_support()
-                                                .aria_label(unread)
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(t.px(13.))
-                                                .font_weight(if row.unread {
-                                                    FontWeight(650.)
-                                                } else {
-                                                    FontWeight(500.)
-                                                })
-                                                .text_color(t.fg)
-                                                .child(sender),
-                                        )
-                                        .when(combined, |d| {
-                                            d.child(
-                                                div()
-                                                    .id(("row-account", ix))
-                                                    .test_support()
-                                                    .aria_label(account_email.clone())
-                                                    .max_w(px(140.))
-                                                    .min_w_0()
-                                                    .flex_shrink_0()
-                                                    .truncate()
-                                                    .text_size(t.px(11.))
-                                                    .text_color(t.fg2)
-                                                    .child(account_email.clone()),
-                                            )
-                                        })
-                                        .child(
-                                            div()
-                                                .id(("row-time", ix))
-                                                .test_support()
-                                                .aria_label(when.clone())
-                                                .flex_shrink_0()
-                                                .text_size(t.px(12.))
-                                                .text_color(t.fg3)
-                                                .child(when),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1p5()
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .truncate()
-                                                .text_size(t.px(13.))
-                                                .text_color(t.fg)
-                                                .child(row.subject.clone()),
-                                        )
-                                        .children(row.labels.iter().take(1).map(|label| {
-                                            div()
-                                                .max_w(px(120.))
-                                                .min_w_0()
-                                                .flex_shrink_0()
-                                                .truncate()
-                                                .px_2()
-                                                .rounded(px(RADIUS_SM))
-                                                .bg(t.bg3)
-                                                .text_size(t.px(11.))
-                                                .text_color(t.fg2)
-                                                .child(label.clone())
-                                        }))
-                                        .when(row.attachments, |d| {
-                                            d.child(
-                                                Icon::new(IconName::Paperclip)
-                                                    .with_size(px(13.))
-                                                    .text_color(t.fg2),
-                                            )
-                                        })
-                                        .when(row.starred, |d| {
-                                            d.child(
-                                                Icon::new(IconName::StarFill)
-                                                    .with_size(px(13.))
-                                                    .text_color(t.accent),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .line_clamp(2)
-                                        .text_size(t.px(12.))
-                                        .line_height(relative(1.45))
-                                        .text_color(t.fg2)
-                                        .child(row.snippet.clone()),
-                                ),
+                                .line_clamp(2)
+                                .text_size(t.px(12.))
+                                .line_height(relative(1.45))
+                                .text_color(t.fg2)
+                                .child(row.snippet.clone()),
                         ),
                 ),
         )

@@ -238,23 +238,32 @@ pub fn packets_signed_by(key: &TestKey, signer: &TestKey, packets: &[u8]) -> Res
         .map_err(|e| format!("verify: {e}"))
 }
 
-/// Whether `armored` decrypts with `key` and carries a valid signature by it.
-fn signed_by(key: &TestKey, armored: &str) -> bool {
+/// Verify the clear copy with the session key the server receives, independently of any
+/// encrypted recipient. Internal delivery never decrypts the package on Proton's server.
+fn clear_signed_by(key: &TestKey, package: &Value, server_time: i64) -> bool {
+    use pgp::composed::{PlainSessionKey, RawSessionKey};
     use std::io::Read as _;
-    let Ok((message, _)) = Message::from_string(armored) else {
-        return false;
+    let check = || -> pgp::errors::Result<bool> {
+        let bytes = unb64(package["Body"].as_str().unwrap_or_default());
+        let message = Message::from_bytes(bytes.as_slice())?;
+        let mut message = message.decrypt_with_session_key(PlainSessionKey::V3_4 {
+            sym_alg: SymmetricKeyAlgorithm::AES256,
+            key: RawSessionKey::from(unb64(
+                package["BodyKey"]["Key"].as_str().unwrap_or_default(),
+            )),
+        })?;
+        let mut plain = Vec::new();
+        message.read_to_end(&mut plain)?;
+        message.verify(&key.secret.to_public_key().primary_key)?;
+        Ok(match message {
+            Message::Signed { reader, .. } => reader
+                .signature(0)
+                .and_then(|sig| sig.created())
+                .is_some_and(|created| i64::from(created.as_secs()) <= server_time),
+            _ => false,
+        })
     };
-    let Ok(mut message) = message.decrypt(&Password::from(key.passphrase.as_str()), &key.secret)
-    else {
-        return false;
-    };
-    let mut plain = Vec::new();
-    if message.read_to_end(&mut plain).is_err() {
-        return false;
-    }
-    message
-        .verify(&key.secret.to_public_key().primary_key)
-        .is_ok()
+    check().unwrap_or(false)
 }
 
 /// Reads raw packets (`PKESK || SEIPD`) with a secret key.
@@ -320,6 +329,8 @@ pub struct World {
     pub drafts: Vec<Value>,
     pub deleted: Vec<String>,
     pub read_requests: Vec<String>,
+    pub pause_events: bool,
+    pub clock_skew_secs: i64,
     pub access: String,
     pub refresh: String,
     pub refreshes: u32,
@@ -356,6 +367,8 @@ impl World {
             drafts: Vec::new(),
             deleted: Vec::new(),
             read_requests: Vec::new(),
+            pause_events: false,
+            clock_skew_secs: 0,
             access: "access-1".into(),
             refresh: "refresh-1".into(),
             refreshes: 0,
@@ -616,12 +629,16 @@ async fn handle(mut sock: tokio::net::TcpStream, world: Arc<Mutex<World>>) {
         headers,
         body,
     };
-    let (status, payload) = {
+    let (status, payload, date) = {
         let mut world = world.lock().expect("world");
-        route(&mut world, &request)
+        let (status, payload) = route(&mut world, &request);
+        let date = (chrono::Utc::now() + chrono::Duration::seconds(world.clock_skew_secs))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        (status, payload, date)
     };
     let head = format!(
-        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} X\r\nDate: {date}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     let _ = sock.write_all(head.as_bytes()).await;
@@ -825,11 +842,6 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 return ok(json!({ "Messages": list, "Stale": 0 }));
             }
             let body = request.json();
-            // Like Proton: the draft body must be signed by the sending address's key.
-            let draft_body = body["Message"]["Body"].as_str().unwrap_or_default();
-            if !signed_by(&world.address_keys[0], draft_body) {
-                return error(400, 2001, "Invalid or missing message signature");
-            }
             world.drafts.push(body.clone());
             let id = format!("draft-{}", world.drafts.len());
             world.messages.push(FakeMessage {
@@ -855,6 +867,11 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
         }
         ("GET", "/api/core/v4/events/latest") => ok(json!({ "EventID": world.latest_event() })),
         ("GET", path) if path.starts_with("/api/core/v4/events/") => {
+            if world.pause_events {
+                return ok(
+                    json!({ "EventID": path.rsplit('/').next().unwrap_or_default(), "Messages": [], "More": 0 }),
+                );
+            }
             let after = path.rsplit('/').next().unwrap_or_default().to_string();
             let position = world
                 .events
@@ -956,7 +973,23 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                             },
                         )
                     });
-            if world.sign_external && unsigned_clear {
+            let invalid_clear = body["Packages"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|package| {
+                    package["Addresses"]
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .any(|(_, recipient)| recipient["Type"] == 4)
+                        && !clear_signed_by(
+                            &world.address_keys[0],
+                            package,
+                            chrono::Utc::now().timestamp() + world.clock_skew_secs,
+                        )
+                });
+            if invalid_clear || (world.sign_external && unsigned_clear) {
                 return error(
                     400,
                     2001,
@@ -985,6 +1018,13 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 if let Some(message) = world.messages.iter_mut().find(|m| m.id == id) {
                     message.label_ids.retain(|existing| existing != &label);
                     if add {
+                        // Proton's visible mailbox labels are exclusive; AllDrafts/AllSent
+                        // remain on trashed mail so removing Trash restores its role.
+                        if ["0", "3", "4", "6", "7", "8"].contains(&label.as_str()) {
+                            message.label_ids.retain(|id| {
+                                !["0", "3", "4", "6", "7", "8"].contains(&id.as_str())
+                            });
+                        }
                         message.label_ids.push(label.clone());
                     }
                 }
