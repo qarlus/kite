@@ -230,6 +230,19 @@ pub struct ProtonLogin {
     pub smtp_port: Option<u16>,
 }
 
+/// The next step of a native Proton sign-in (Proton's API directly, no Bridge; works on free plans).
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum ProtonAuth {
+    Done(Account),
+    /// A six-digit code from the user's authenticator app.
+    TwoFactor,
+    /// Two-password mode: the separate mailbox password unlocks the keys.
+    MailboxPassword,
+    /// Proton wants a human-verification challenge solved at `url` (opened in the browser);
+    /// the answer is the verification token.
+    HumanVerification { url: String },
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ChatMsg {
     pub role: String,

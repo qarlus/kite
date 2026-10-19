@@ -23,6 +23,17 @@ pub trait Mail: Send + Sync + 'static {
         crate::bridge::launch()
     }
 
+    /// Starts a native Proton sign-in with the account password. Blocking; run off the UI thread.
+    /// The password is used for SRP and key unlock and is never stored.
+    fn proton_sign_in(&self, _email: &str, _password: &str) -> Result<ProtonAuth> {
+        anyhow::bail!("Proton sign-in is not available")
+    }
+    /// Answers the step the previous call returned (2FA code, mailbox password or verification
+    /// token). Blocking; run off the UI thread.
+    fn proton_sign_in_step(&self, _answer: &str) -> Result<ProtonAuth> {
+        anyhow::bail!("No Proton sign-in in progress")
+    }
+
     /// Locally known custom folders, with provider identities scoped to their accounts.
     fn folders(&self) -> Result<Vec<Folder>> {
         Ok(Vec::new())
