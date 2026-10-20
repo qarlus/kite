@@ -39,9 +39,10 @@ async fn opening_a_thread_renders_its_html_body_at_the_rendered_height(cx: &mut 
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         let body = window.find("html-22");
-        let width = body.bounds().size.width.as_f32();
+        // The card is the body's column; the mail is laid out inside its padding.
+        let width = body.bounds().size.width.as_f32() - 2. * kite::thread::PAPER_PAD;
         let scale = window.scale_factor();
-        let expected = kite::html::render(HTML, width, scale, true).height;
+        let expected = kite::html::render(HTML, width, scale).height + 2. * kite::thread::PAPER_PAD;
         assert!(
             (body.bounds().size.height.as_f32() - expected).abs() <= 2.,
             "the body is displayed at its rendered height ({} vs {expected})",
@@ -68,7 +69,8 @@ async fn compact_html_uses_only_the_space_remaining_in_the_reading_pane(cx: &mut
         window.render_frame(cx);
         let list = window.find("list-column").bounds();
         let body = window.find("html-22").bounds();
-        // The body is laid out for the pane, inside its padding, less the indent it hangs under.
+        // The body's card is laid out for the pane, inside its padding, less the indent it
+        // hangs under; the mail itself renders inside the card's own padding.
         let expected = gpui_kit::px(
             720. - list.right().as_f32() - 2. * kite::thread::PANE_PAD - kite::thread::BODY_INDENT,
         );
@@ -164,7 +166,16 @@ fn opening_an_unread_thread_renders_its_text_body_and_marks_it_read(cx: &mut Tes
             Some("Plain body for thread 1"),
             "a text-only body renders as GPUI text"
         );
-        assert!(window.try_find("html-12").is_none());
+        assert!(
+            window.try_find("html-12").is_none(),
+            "plain text is theme text on the pane, never HTML paper"
+        );
+        // It keeps the theme's own body type: 15px at a 1.7 line height.
+        let line = window.find("text-12").bounds().size.height;
+        assert!(
+            (line - kite::theme::pick(true).px(15.) * 1.7).abs() < gpui_kit::px(1.),
+            "the text body is the theme's body size: {line:?}"
+        );
     })
     .unwrap();
     assert_eq!(

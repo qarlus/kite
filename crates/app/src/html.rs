@@ -32,25 +32,22 @@ pub struct Rendered {
 }
 
 /// Lays out and rasterises `html` at `width` logical px. `scale` is the window's DPI scale.
-pub fn render(html: &str, width: f32, scale: f32, dark: bool) -> Rendered {
-    render_styled(html, width, scale, *crate::theme::pick(dark), "system-ui")
+pub fn render(html: &str, width: f32, scale: f32) -> Rendered {
+    render_styled(html, width, scale, 1., "system-ui")
 }
 
-pub fn render_styled(
-    html: &str,
-    width: f32,
-    scale: f32,
-    theme: crate::theme::Theme,
-    font: &str,
-) -> Rendered {
-    // Font family is validated before preferences reach the renderer.
+/// `text` is the reader's type scale. Mail is authored for white, so a body always paints on
+/// the same paper in both appearances: the author's own backgrounds and colours then look as
+/// designed, and the reading pane can frame the render as a card on its own surface.
+pub fn render_styled(html: &str, width: f32, scale: f32, text: f32, font: &str) -> Rendered {
+    // Font family is validated before preferences reach the renderer. The author's own styles
+    // follow this block, so they still win where they set a colour.
     let base = format!(
-        "<style>html{{background:{};color:{};font-family:'{}',sans-serif;font-size:{}px}}a{{color:{}}}</style>",
-        crate::theme::hex(theme.bg2),
-        crate::theme::hex(theme.fg),
+        "<style>html{{background:#fff;color:{};font-family:'{}',sans-serif;font-size:{}px}}a{{color:{}}}</style>",
+        crate::theme::hex(crate::theme::PAPER.fg),
         font,
-        15. * theme.scale,
-        crate::theme::hex(theme.accent)
+        15. * text,
+        crate::theme::hex(crate::theme::PAPER.accent)
     );
     let pw = (width * scale).ceil() as u32;
     let mut doc = HtmlDocument::from_html(
@@ -59,11 +56,8 @@ pub fn render_styled(
             viewport: Some(Viewport {
                 window_size: (pw, 1),
                 hidpi_scale: scale,
-                color_scheme: if theme.dark {
-                    ColorScheme::Dark
-                } else {
-                    ColorScheme::Light
-                },
+                // The paper is light, so `prefers-color-scheme` mail must agree with it.
+                color_scheme: ColorScheme::Light,
                 ..Default::default()
             }),
             ..Default::default()

@@ -231,6 +231,22 @@ fn the_settings_cog_opens_settings_over_the_whole_window_and_escape_restores_mai
 }
 
 #[gpui_kit::test]
+fn the_settings_cog_is_centred_on_the_window_strip(cx: &mut TestAppContext) {
+    let (window, _) = mount(cx, Fixture::showcase());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let strip = window.find("window-strip").bounds();
+        let cog = window.find("open-settings").bounds();
+        assert_eq!(
+            cog.center().y,
+            strip.center().y,
+            "the cog shares the strip's midline, in line with the window controls"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn the_appearance_switch_turns_the_reading_pane_off_and_back_on(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());

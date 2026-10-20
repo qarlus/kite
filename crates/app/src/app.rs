@@ -1272,6 +1272,7 @@ impl Kite {
             .flex_shrink_0()
             .h(px(STRIP_H))
             .flex()
+            .items_center()
             .when(wide > 0., |d| d.child(div().w(px(wide)).h_full().bg(panel)))
             .child(
                 div()
@@ -1298,19 +1299,19 @@ impl Kite {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .size(px(STRIP_H - 8.))
-                    .mr_1()
-                    .rounded(px(RADIUS_SM))
+                    // Same box as a window button, so the icons share one line.
+                    .w(px(WINDOW_CONTROL_W))
+                    .h_full()
+                    // Only there when the OS draws no controls: keep it off the edge.
+                    .when(!cfg!(target_os = "windows"), |d| d.mr_2())
                     .cursor_pointer()
                     .text_color(if settings_open { t.fg } else { t.fg2 })
                     .when(settings_open, |d| d.bg(Theme::alpha(t.fg, 0.1)))
                     .when(!settings_open, |d| {
-                        d.hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
+                        d.hover(|s| s.bg(Theme::alpha(t.fg, 0.08)).text_color(t.fg))
                     })
-                    .child(Icon::new(IconName::Settings).with_size(px(15.)))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.toggle_settings(window, cx)
-                    })),
+                    .child(Icon::new(IconName::Settings).with_size(px(14.)))
+                    .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
             )
             .child(self.window_controls(window))
             .into_any_element()
@@ -1788,6 +1789,8 @@ impl Kite {
     }
 }
 
+const WINDOW_CONTROL_W: f32 = 46.;
+
 /// One window button. Windows resolves the click through its hit test, so no handler is needed.
 fn window_control(
     t: &Theme,
@@ -1806,7 +1809,7 @@ fn window_control(
         .id(id)
         .test_support()
         .aria_label(label)
-        .w(px(46.))
+        .w(px(WINDOW_CONTROL_W))
         .h_full()
         .flex()
         .items_center()

@@ -6,7 +6,7 @@ use crate::app::{Kite, Lru};
 use crate::html::{self, Rendered};
 use crate::keys;
 use crate::list::when;
-use crate::theme::{MAX_COL, RADIUS_SM, Theme};
+use crate::theme::{MAX_COL, RADIUS, RADIUS_SM, Theme};
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::menu::ContextMenuExt as _;
@@ -23,18 +23,23 @@ pub const PANE_PAD: f32 = 32.;
 /// Past the avatar column, so everything a message holds lines up under its sender's name.
 pub const BODY_INDENT: f32 = 44.;
 
+/// The paper card's padding: mail text stops short of the card's rounded edge, and the padding
+/// is the paper's own colour, so the body still looks like one sheet.
+pub const PAPER_PAD: f32 = 12.;
+
 /// How many fetched remote images are kept in memory. A body that asks for more keeps its
 /// remaining images blocked, which bounds a long session without a retry loop.
 const IMAGE_CACHE: usize = 128;
 
-/// Cache key: a body is re-rendered when the message, width, theme, DPI scale, the set of
-/// fetched remote images or the message's image permission changes.
+/// Cache key: a body is re-rendered when the message, width, DPI scale, the reader's type scale
+/// or font, the set of fetched remote images or the message's image permission changes. The
+/// appearance itself is absent: a body paints on its own paper, so switching light and dark
+/// must not re-render every conversation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HtmlKey {
     pub id: Id,
     width: u32,
     scale: u32,
-    dark: bool,
     appearance: u64,
     images: u64,
     allowed: bool,
@@ -45,7 +50,6 @@ impl HtmlKey {
         id: Id,
         width: f32,
         scale: f32,
-        dark: bool,
         appearance: u64,
         images: u64,
         allowed: bool,
@@ -55,7 +59,6 @@ impl HtmlKey {
             // Quantised so a drag-resize does not miss the cache every frame.
             width: (width * 4.).round() as u32,
             scale: (scale * 20.).round() as u32,
-            dark,
             appearance,
             images,
             allowed,
@@ -128,6 +131,21 @@ impl Kite {
     /// The Blitz render width: the reading pane's column, less the indent a body hangs under.
     pub(crate) fn body_width(&self) -> f32 {
         (self.html_width - BODY_INDENT).max(120.)
+    }
+
+    /// The card a body sits in, less its padding: the width Blitz lays the mail out at.
+    fn paper_width(&self) -> f32 {
+        (self.body_width() - 2. * PAPER_PAD).max(80.)
+    }
+
+    /// What a body takes from the appearance: the reader's type scale and font. Nothing else
+    /// reaches the paper, so a light/dark switch leaves every rendered body valid.
+    fn html_appearance(&self) -> u64 {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        ((self.theme.scale * 1000.).round() as u64).hash(&mut hasher);
+        crate::theme::font(&self.settings).hash(&mut hasher);
+        hasher.finish()
     }
 
     pub fn render_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
@@ -691,7 +709,8 @@ impl Kite {
         card.child(column).into_any_element()
     }
 
-    /// The rendered HTML body: an image at the exact rendered height, with link hit testing.
+    /// The rendered HTML body: paper card around an image at the exact rendered height, with
+    /// link hit testing.
     fn html_body(
         &mut self,
         message: &Message,
@@ -702,13 +721,12 @@ impl Kite {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
-        let width = (body_width * scale).round() / scale;
+        let width = (self.paper_width() * scale).round() / scale;
         let key = HtmlKey::new(
             message.id,
             width,
             scale,
-            self.dark,
-            self.appearance_version,
+            self.html_appearance(),
             self.images_version,
             images_allowed,
         );
@@ -738,44 +756,49 @@ impl Kite {
                     .id(format!("html-{id}"))
                     .test_support()
                     .aria_label(format!("HTML body, {height:.0}px"))
-                    .relative()
                     .w(px(body_width))
-                    .h(px(height))
+                    .p(px(PAPER_PAD))
+                    .rounded(px(RADIUS))
+                    .bg(white())
+                    .when(t.dark, |d| d.border_1().border_color(t.line))
                     .child(
-                        img(ImageSource::Render(image))
-                            .w(px(body_width))
-                            .h(px(height)),
-                    )
-                    .child(
-                        canvas(
-                            {
-                                let bounds = bounds.clone();
-                                move |area, _, _| {
-                                    bounds.borrow_mut().insert(id, area);
-                                }
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .inset_0(),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            let Some(area) = this.html_bounds.borrow().get(&id).copied() else {
-                                return;
-                            };
-                            let at = event.position - area.origin;
-                            if let Some(href) = this
-                                .html_cache
-                                .get(&key)
-                                .or_else(|| this.html_cache.shown(id))
-                                .and_then(|r| r.link_at(at.x.into(), at.y.into()))
-                            {
-                                cx.open_url(&href);
-                                cx.stop_propagation();
-                            }
-                        }),
+                        div()
+                            .relative()
+                            .w(px(width))
+                            .h(px(height))
+                            .child(img(ImageSource::Render(image)).w(px(width)).h(px(height)))
+                            .child(
+                                canvas(
+                                    {
+                                        let bounds = bounds.clone();
+                                        move |area, _, _| {
+                                            bounds.borrow_mut().insert(id, area);
+                                        }
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    let Some(area) = this.html_bounds.borrow().get(&id).copied()
+                                    else {
+                                        return;
+                                    };
+                                    let at = event.position - area.origin;
+                                    if let Some(href) = this
+                                        .html_cache
+                                        .get(&key)
+                                        .or_else(|| this.html_cache.shown(id))
+                                        .and_then(|r| r.link_at(at.x.into(), at.y.into()))
+                                    {
+                                        cx.open_url(&href);
+                                        cx.stop_propagation();
+                                    }
+                                }),
+                            ),
                     )
                     .into_any_element()
             }
@@ -785,7 +808,7 @@ impl Kite {
                 .aria_label("Rendering")
                 .w(px(body_width))
                 .h(px(120.))
-                .rounded(px(RADIUS_SM))
+                .rounded(px(RADIUS))
                 .bg(Theme::alpha(t.bg3, 0.6))
                 .into_any_element(),
         }
@@ -806,11 +829,11 @@ impl Kite {
         }
         let (width, scale) = key.at();
         let source = source.to_string();
-        let theme = self.theme;
+        let text = self.theme.scale;
         let font = crate::theme::font(&self.settings).to_string();
         let task = cx.background_executor().spawn(async move {
             let html = crate::html::inline_images(&source, &images);
-            html::render_styled(&html, width, scale, theme, &font)
+            html::render_styled(&html, width, scale, text, &font)
         });
         cx.spawn(async move |this, cx| {
             let rendered = task.await;
@@ -834,10 +857,9 @@ impl Kite {
                 self.settings.load_remote_images || self.images_allowed.contains(&message.id);
             let key = HtmlKey::new(
                 message.id,
-                self.body_width(),
+                self.paper_width(),
                 self.html_scale,
-                self.dark,
-                self.appearance_version,
+                self.html_appearance(),
                 self.images_version,
                 allowed,
             );
