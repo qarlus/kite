@@ -682,6 +682,9 @@ impl Kite {
         Some(
             div()
                 .id("compose")
+                // A floating panel owns every mouse event inside it: without this, a
+                // click on its padding or a gap reaches the list row underneath.
+                .occlude()
                 .test_support()
                 .aria_label(title)
                 .key_context("KiteCompose")
@@ -721,29 +724,41 @@ impl Kite {
                                 .child(title),
                         )
                         .child(
-                            Button::new("compose-expand")
-                                .label(if expanded { "Collapse" } else { "Expand" })
-                                .accessibility_label(if expanded {
-                                    "Collapse compose"
-                                } else {
-                                    "Expand compose"
-                                })
-                                .small()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(compose) = &mut this.compose {
-                                        compose.expanded = !compose.expanded;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            Button::new("compose-close")
-                                .accessibility_label("Close compose")
-                                .icon(IconName::X)
-                                .small()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.close_compose(window, cx)
-                                })),
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .child(
+                                    Button::new("compose-expand")
+                                        .accessibility_label(if expanded {
+                                            "Collapse compose"
+                                        } else {
+                                            "Expand compose"
+                                        })
+                                        .tooltip(if expanded { "Collapse" } else { "Expand" })
+                                        .icon(if expanded {
+                                            IconName::Minimize2
+                                        } else {
+                                            IconName::Maximize2
+                                        })
+                                        .text_color(t.fg2)
+                                        .small()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if let Some(compose) = &mut this.compose {
+                                                compose.expanded = !compose.expanded;
+                                            }
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("compose-close")
+                                        .accessibility_label("Close compose")
+                                        .icon(IconName::X)
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.close_compose(window, cx)
+                                        })),
+                                ),
                         ),
                 )
                 .child(
@@ -856,12 +871,16 @@ impl Kite {
                                     }
                                 }))
                                 .child(
+                                    // The textarea wrapper sizes itself to its content (one row),
+                                    // so it must be told to take the whole body area: percentage
+                                    // heights are refined last, over the component's own height.
                                     Textarea::new(&body)
                                         .aria_label("Message")
                                         .appearance(false)
                                         .bordered(false)
                                         .text_size(t.px(14.))
-                                        .text_color(t.fg),
+                                        .text_color(t.fg)
+                                        .h_full(),
                                 ),
                         ),
                 )

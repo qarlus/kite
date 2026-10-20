@@ -1006,6 +1006,180 @@ fn compose_docks_expands_and_keeps_actions_inside_a_small_reading_pane(cx: &mut 
     .unwrap();
 }
 
+/// The body textarea, found by the text it holds: it is the only observed input
+/// whose accessibility value is the drafted message.
+fn body_editor(window: &gpui_kit::Window, expected: &str) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    let matches: Vec<_> = gpui_kit::base::test_support::snapshots(window)
+        .into_iter()
+        .filter(|element| {
+            element
+                .value()
+                .is_some_and(|value| value.contains(expected))
+        })
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "one observed input holds the message body, found {}",
+        matches.len()
+    );
+    matches[0].bounds()
+}
+
+#[gpui_kit::test]
+fn expand_is_an_icon_as_small_as_close(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        for (label, expanded) in [("Expand compose", false), ("Collapse compose", true)] {
+            let close = window.find("compose-close").bounds();
+            let expand = window.find("compose-expand");
+            assert_eq!(
+                expand.label(),
+                Some(label),
+                "the icon keeps its announced action"
+            );
+            let bounds = expand.bounds();
+            assert_eq!(
+                bounds.size, close.size,
+                "the expand icon is the size of the close X, not a word"
+            );
+            assert!(
+                bounds.size.width <= gpui_kit::px(32.),
+                "an icon button is ~24px wide, not a label: {bounds:?}"
+            );
+            assert!(
+                (bounds.center().y - close.center().y).abs() <= gpui_kit::px(1.),
+                "the icon sits on the close button's line"
+            );
+            if !expanded {
+                window.click("compose-expand", cx);
+            }
+        }
+        window.click("compose-expand", cx);
+        assert_eq!(
+            window.find("compose-expand").label(),
+            Some("Expand compose")
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn body_fills_its_area_so_every_line_shows(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-body", cx);
+        for line in 1..=12 {
+            if line > 1 {
+                window.press("enter", cx);
+            }
+            window.input(&format!("line {line}"), cx);
+        }
+        for expanded in [false, true] {
+            let area = window.find("compose-body").bounds();
+            let editor = body_editor(window, "line 12");
+            // The area's own padding (py_2) is the only part the editor may leave empty.
+            assert!(
+                editor.size.height >= area.size.height - gpui_kit::px(16.) - gpui_kit::px(1.),
+                "expanded={expanded}: the editor fills the body area ({editor:?} in {area:?})"
+            );
+            assert!(
+                editor.size.height > 12. * window.line_height()
+                    || editor.size.height >= area.size.height - gpui_kit::px(16.),
+                "expanded={expanded}: 12 lines are visible or the area is full ({editor:?})"
+            );
+            assert!(
+                editor.top() >= area.top() && editor.bottom() <= area.bottom(),
+                "expanded={expanded}: the editor stays inside the body area ({editor:?} in {area:?})"
+            );
+            window.click("compose-expand", cx);
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicks_and_scroll_inside_compose_never_reach_the_list_behind(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(6);
+    // The classic layout: the list runs under the whole window, so it sits behind the
+    // docked compose panel, which is what a pass-through click reaches.
+    fixture.settings.lock().unwrap().reading_pane = false;
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let panel = window.find("compose").bounds();
+        let body = window.find("compose-body").bounds();
+        let row = (0..6usize)
+            .map(|ix| window.find(("row", ix)).bounds())
+            .find(|row| panel.contains(&row.center()))
+            .expect("a list row sits behind the compose panel");
+        let header = panel.origin + gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(14.));
+        assert!(
+            row.contains(&header),
+            "the header point is over a row behind the panel ({header:?} in {row:?})"
+        );
+        for (target, offset) in [
+            // The header, beside its title and the two icon buttons.
+            (
+                "compose",
+                gpui_kit::point(gpui_kit::px(24.), gpui_kit::px(14.)),
+            ),
+            // The empty space below the message text.
+            (
+                "compose-body",
+                gpui_kit::point(gpui_kit::px(24.), body.size.height - gpui_kit::px(4.)),
+            ),
+        ] {
+            window.click_at(target, offset, cx);
+            window.render_frame(cx);
+            assert!(
+                window.try_find("thread-subject").is_none(),
+                "a click inside the compose panel ({target}) must not open a thread behind it"
+            );
+        }
+        let rows_before: Vec<_> = (0..6usize)
+            .map(|ix| window.find(("row", ix)).bounds())
+            .collect();
+        window.scroll(
+            "compose-body",
+            gpui_kit::ScrollDelta::Lines(gpui_kit::point(0., 100.)),
+            cx,
+        );
+        window.render_frame(cx);
+        let rows_after: Vec<_> = (0..6usize)
+            .map(|ix| window.find(("row", ix)).bounds())
+            .collect();
+        assert_eq!(
+            rows_before, rows_after,
+            "a wheel event over compose must not scroll the list behind it"
+        );
+        assert!(
+            fixture.opened.lock().unwrap().is_empty(),
+            "nothing under the panel opened: {:?}",
+            fixture.opened.lock().unwrap()
+        );
+        // Outside the panel the list still answers: the panel blocks only itself.
+        let outside = (0..6usize)
+            .map(|ix| (ix, window.find(("row", ix)).bounds()))
+            .find(|(_, bounds)| !panel.contains(&bounds.center()))
+            .expect("a row beside the panel");
+        window.click(("row", outside.0), cx);
+        window.render_frame(cx);
+        assert!(
+            !fixture.opened.lock().unwrap().is_empty(),
+            "a click outside the panel still opens its thread"
+        );
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn escaped_display_names_and_quoted_local_parts_send_without_losing_recipients(
     cx: &mut TestAppContext,

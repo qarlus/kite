@@ -37,7 +37,9 @@ gpui_kit::assets::icon_assets!(
         RefreshCw,
         Lock,
         Plus,
-        Tag
+        Tag,
+        Maximize2,
+        Minimize2
     ]
 );
 
