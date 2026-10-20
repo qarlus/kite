@@ -49,6 +49,10 @@ pub struct RemoteMsg {
     pub important: Option<bool>,
     /// Bulk-mail signal: the message carried List-Unsubscribe or List-Id.
     pub list_unsubscribe: bool,
+    #[serde(default)]
+    pub unsubscribe_header: String,
+    #[serde(default)]
+    pub unsubscribe_post: String,
     pub attachments: Vec<RemoteAttachment>,
 }
 

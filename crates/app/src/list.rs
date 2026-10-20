@@ -281,6 +281,8 @@ impl Kite {
                 .test_support()
                 .aria_label("Keyboard shortcuts")
                 .w(px(620.))
+                // The shortcut list outgrows short windows: it scrolls, the title and Close stay.
+                .max_h(relative(0.9))
                 .rounded(px(RADIUS))
                 .bg(t.bg2)
                 .border_1()
@@ -296,11 +298,18 @@ impl Kite {
                         .child("Keyboard shortcuts"),
                 )
                 .child(
-                    div().flex().flex_row().items_start().gap_8().children(
-                        columns.into_iter().map(|column| {
+                    div()
+                        .id("help-columns")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap_8()
+                        .children(columns.into_iter().map(|column| {
                             div().flex().flex_col().flex_1().gap_4().children(column)
-                        }),
-                    ),
+                        })),
                 )
                 .child(
                     div()

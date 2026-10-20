@@ -319,6 +319,7 @@ impl Graph {
                 .auth_send(|http, token| {
                     http.post(&url)
                         .bearer_auth(token)
+                        .header("Prefer", "IdType=\"ImmutableId\"")
                         .header("Content-Type", "text/plain")
                         .body(body.clone())
                 })
@@ -331,7 +332,12 @@ impl Graph {
                 message.clone()
             };
             let res = self
-                .auth_send(|http, token| http.post(&url).bearer_auth(token).json(&payload))
+                .auth_send(|http, token| {
+                    http.post(&url)
+                        .bearer_auth(token)
+                        .header("Prefer", "IdType=\"ImmutableId\"")
+                        .json(&payload)
+                })
                 .await?;
             json_res(res, "create send draft").await?
         };
@@ -343,7 +349,12 @@ impl Graph {
             let created = if reply_id.is_some() {
                 let url = format!("{}/me/messages/{id}", self.base_url);
                 let res = self
-                    .auth_send(|http, token| http.patch(&url).bearer_auth(token).json(&message))
+                    .auth_send(|http, token| {
+                        http.patch(&url)
+                            .bearer_auth(token)
+                            .header("Prefer", "IdType=\"ImmutableId\"")
+                            .json(&message)
+                    })
                     .await?;
                 json_res(res, "update reply draft").await?
             } else {
@@ -381,6 +392,42 @@ impl Graph {
             let _ = self.delete_message(id).await;
         }
         result
+    }
+
+    /// Retain the provider item after an ambiguous transport error. Retrying must inspect
+    /// isDraft first: Exchange may already have accepted it into the deferred Outbox.
+    pub async fn send_deferred(&mut self, id: &str) -> Result<()> {
+        let url = format!("{}/me/messages/{id}/send", self.base_url);
+        let response = self
+            .auth_send(|http, token| {
+                http.post(&url)
+                    .bearer_auth(token)
+                    .header("Content-Length", "0")
+            })
+            .await?;
+        check(response, "send deferred draft").await
+    }
+
+    pub async fn deferred_submitted(&mut self, id: &str) -> Result<bool> {
+        let url = format!("{}/me/messages/{id}?$select=isDraft", self.base_url);
+        let message = self.get_json(&url, "IdType=\"ImmutableId\"").await?;
+        Ok(!message["isDraft"]
+            .as_bool()
+            .context("Graph scheduled message missing isDraft")?)
+    }
+
+    /// MAPI PidTagDeferredSendTime: UTC ISO 8601, not a Unix timestamp.
+    pub async fn defer_send(&mut self, id: &str, at: Ms) -> Result<()> {
+        let time = chrono::DateTime::from_timestamp_millis(at)
+            .context("scheduled time out of range")?
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let url = format!("{}/me/messages/{id}", self.base_url);
+        let body =
+            json!({"singleValueExtendedProperties":[{"id":"SystemTime 0x3FEF","value":time}]});
+        let res = self
+            .auth_send(|http, token| http.patch(&url).bearer_auth(token).json(&body))
+            .await?;
+        check(res, "defer send").await
     }
 
     async fn delete_message(&mut self, remote_id: &str) -> Result<()> {
@@ -763,12 +810,29 @@ fn delta_for(
             _ => None,
         },
         list_unsubscribe: has_bulk_header(&item["internetMessageHeaders"]),
+        unsubscribe_header: header_value(&item["internetMessageHeaders"], "List-Unsubscribe"),
+        unsubscribe_post: header_value(&item["internetMessageHeaders"], "List-Unsubscribe-Post"),
         attachments: attachments.get(id).cloned().unwrap_or_default(),
     })))
 }
 
 /// `internetMessageHeaders` is an array of `{name, value}`. Bulk mail announces itself with
 /// `List-Unsubscribe` or `List-Id`; both are selected above (Graph only returns them on `$select`).
+fn header_value(headers: &Value, name: &str) -> String {
+    headers
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|h| {
+            h["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        })
+        .filter_map(|h| h["value"].as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn has_bulk_header(headers: &Value) -> bool {
     headers.as_array().into_iter().flatten().any(|h| {
         matches!(h["name"].as_str(), Some(n)

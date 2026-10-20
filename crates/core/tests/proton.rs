@@ -1618,3 +1618,42 @@ fn a_private_saved_draft_stays_private_after_native_send_and_event_sync() {
         std::io::ErrorKind::WouldBlock
     );
 }
+
+#[test]
+fn proton_retains_unsubscribe_headers_and_scheduled_send_stays_local() {
+    let rt = runtime();
+    let mut world = World::new();
+    let id = world.add_message(
+        "Newsletter",
+        ("News", "news@example.com"),
+        "Read me",
+        &["0", "5"],
+    );
+    world.message(&id).header.push_str("List-Unsubscribe: <mailto:leave@example.com>\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n");
+    let (dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let thread = engine.threads(&inbox(account.id), 0, 10).unwrap()[0].id;
+    let store = kite_core::store::Store::open(&dir.join("kite.db")).unwrap();
+    let (_, sender, header, post) = store.unsubscribe_source(thread).unwrap();
+    assert_eq!(sender, "news@example.com");
+    assert_eq!(header, "<mailto:leave@example.com>");
+    assert_eq!(post, "List-Unsubscribe=One-Click");
+    let id = engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: String::new(),
+                email: "recipient@example.com".into(),
+            }],
+            subject: "Later".into(),
+            body: "Queued".into(),
+            send_at: Some(kite_core::auth::now_ms() + 600_000),
+            ..Default::default()
+        })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        server.world().sends.is_empty(),
+        "Proton schedules must not send early"
+    );
+    assert!(engine.cancel_send(id).unwrap().is_some());
+}

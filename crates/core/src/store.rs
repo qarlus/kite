@@ -349,6 +349,36 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 9 {
+            let tx = conn.unchecked_transaction()?;
+            for (table, column, definition) in [
+                ("messages", "unsubscribe_header", "TEXT NOT NULL DEFAULT ''"),
+                ("messages", "unsubscribe_post", "TEXT NOT NULL DEFAULT ''"),
+                (
+                    "messages",
+                    "unsubscribe_checked",
+                    "INTEGER NOT NULL DEFAULT 0",
+                ),
+                ("outbox", "remote_id", "TEXT"),
+                ("outbox", "handed_over", "INTEGER NOT NULL DEFAULT 0"),
+            ] {
+                let exists:bool=tx.query_row(&format!("SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"),[],|r| r.get(0))?;
+                if !exists {
+                    tx.execute_batch(&format!(
+                        "ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                    ))?;
+                }
+            }
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS unsubscribed_senders (
+                account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                sender TEXT NOT NULL, PRIMARY KEY(account_id, sender)
+            ) WITHOUT ROWID;
+            UPDATE accounts SET cursor=NULL;
+            PRAGMA user_version=9;",
+            )?;
+            tx.commit()?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO tags(name, color, position)
              VALUES (?1, '#64748b', (SELECT COALESCE(MAX(position), -1) + 1 FROM tags))",
@@ -652,7 +682,7 @@ impl Store {
 
 impl Store {
     pub(crate) fn remote_ids(&self, account: Id) -> Result<BTreeSet<String>> {
-        let mut statement = self.conn.prepare("SELECT remote_id FROM messages WHERE account_id=?1 AND remote_id NOT LIKE 'kite-draft:%'")?;
+        let mut statement = self.conn.prepare("SELECT remote_id FROM messages WHERE account_id=?1 AND remote_id NOT LIKE 'kite-draft:%' AND (list_unsubscribe=0 OR unsubscribe_checked=1)")?;
         Ok(statement
             .query_map([account], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?)
@@ -679,6 +709,9 @@ impl Store {
                         continue;
                     }
                     let thread = upsert_message(&tx, account_id, &account_email, m)?;
+                    tx.execute("UPDATE messages SET unsubscribe_header=?1, unsubscribe_post=?2, unsubscribe_checked=1 WHERE account_id=?3 AND remote_id=?4",
+                        params![m.unsubscribe_header, m.unsubscribe_post, account_id, m.remote_id])?;
+                    auto_archive(&tx, account_id, thread)?;
                     for identity in [
                         m.message_id
                             .as_deref()
@@ -733,6 +766,7 @@ impl Store {
                 Delta::Upsert(_) => unreachable!(),
             };
             if changed > 0 {
+                auto_archive(&tx, account_id, tid)?;
                 touched.insert(tid);
             }
         }
@@ -742,6 +776,37 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+}
+
+// Exact normalized addresses, scoped to the receiving account. Undo leaves this preference intact.
+fn auto_archive(tx: &Transaction<'_>, account: Id, thread: Id) -> Result<()> {
+    let messages = {
+        let mut q = tx.prepare(
+            "SELECT m.id, m.remote_id FROM messages m JOIN unsubscribed_senders u
+            ON u.account_id=m.account_id AND u.sender=m.from_email
+            WHERE m.account_id=?1 AND m.thread_id=?2 AND m.mailbox='inbox'",
+        )?;
+        q.query_map(params![account, thread], |r| {
+            Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (id, remote) in messages {
+        tx.execute("UPDATE messages SET mailbox='archive' WHERE id=?1", [id])?;
+        tx.execute(
+            "INSERT INTO pending_ops(account_id,message_id,op,at) VALUES (?1,?2,?3,?4)",
+            params![
+                account,
+                id,
+                json(&Op::Move {
+                    remote_id: remote,
+                    to: Mailbox::Archive
+                })?,
+                now_ms()
+            ],
+        )?;
+    }
+    Ok(())
 }
 
 fn find_message(tx: &Transaction, account_id: Id, remote_id: &str) -> Result<Option<(Id, Id)>> {
@@ -1393,6 +1458,12 @@ impl Store {
     /// under a fresh undo token. Snooze is local-only and queues nothing.
     pub fn act(&self, ids: &[Id], action: &Action) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
+        let token = Self::act_in(&tx, ids, action)?;
+        tx.commit()?;
+        Ok(token)
+    }
+
+    fn act_in(tx: &Transaction<'_>, ids: &[Id], action: &Action) -> Result<i64> {
         tx.execute("INSERT INTO undo_seq(token) VALUES (NULL)", [])?;
         let token = tx.last_insert_rowid();
         let now = now_ms();
@@ -1410,7 +1481,7 @@ impl Store {
             // Tags are thread-level, local-only and queue no remote op. A no-op (already labelled
             // or already unlabelled) records nothing, so undo cannot touch the pre-existing state.
             if let Action::Label { tag } | Action::Unlabel { tag } = action {
-                let Some(tag_id) = tag_id_by_name(&tx, tag)? else {
+                let Some(tag_id) = tag_id_by_name(tx, tag)? else {
                     bail!("unknown tag {tag:?}");
                 };
                 let labelled: bool = tx.query_row(
@@ -1435,7 +1506,7 @@ impl Store {
                         "INSERT INTO undo_log(token, account_id, thread_id, tag_id) VALUES (?1,?2,?3,?4)",
                         params![token, account_id, thread_id, if on { tag_id } else { -tag_id }],
                     )?;
-                    refresh_labels(&tx, thread_id)?;
+                    refresh_labels(tx, thread_id)?;
                 }
                 continue;
             }
@@ -1451,7 +1522,7 @@ impl Store {
                     bail!("folder {folder:?} does not belong to account {account_id}");
                 }
             }
-            let states = message_states(&tx, thread_id)?;
+            let states = message_states(tx, thread_id)?;
             if states.is_empty() {
                 continue;
             }
@@ -1505,9 +1576,8 @@ impl Store {
                     [thread_id],
                 )?;
             }
-            refresh_thread(&tx, thread_id)?;
+            refresh_thread(tx, thread_id)?;
         }
-        tx.commit()?;
         Ok(token)
     }
 
@@ -2123,6 +2193,21 @@ impl Store {
         Ok(remote.map(|remote| (account, remote)))
     }
 
+    /// Retain the hidden local draft for cancellation of a provider schedule.
+    pub fn draft_provider_sent(&self, id: Id) -> Result<Option<(Id, String)>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let remote = tx
+            .query_row(
+                "SELECT account_id,remote_id FROM drafts WHERE id=?1 AND remote_id IS NOT NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        tx.execute("UPDATE drafts SET remote_id=NULL WHERE id=?1", [id])?;
+        tx.commit()?;
+        Ok(remote)
+    }
+
     /// Persist before transmission so tags survive a successful send followed by delayed sync
     /// or restart. Proton additionally supplies its exact provider identity after sending.
     pub fn remember_sent_tags(&self, draft: Id, account: Id, identity: &str) -> Result<()> {
@@ -2345,6 +2430,75 @@ impl Store {
         Ok(id)
     }
 
+    pub fn unsubscribe_source(&self, thread: Id) -> Result<(Id, String, String, String)> {
+        Ok(self.conn.query_row("SELECT account_id, from_email, unsubscribe_header, unsubscribe_post
+            FROM messages WHERE thread_id=?1 AND unsubscribe_header<>'' ORDER BY date DESC,id DESC LIMIT 1",
+            [thread], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?)
+    }
+
+    pub fn unsubscribe_archive(&self, account: Id, sender: &str) -> Result<(i64, usize)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ids = {
+            let mut q = tx.prepare("SELECT DISTINCT thread_id FROM messages WHERE account_id=?1 AND from_email=?2 AND mailbox='inbox'")?;
+            q.query_map(params![account, sender], |r| r.get::<_, Id>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let token = Self::act_in(&tx, &ids, &Action::Archive)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO unsubscribed_senders(account_id,sender) VALUES (?1,?2)",
+            params![account, sender],
+        )?;
+        tx.commit()?;
+        Ok((token, ids.len()))
+    }
+
+    fn expire_scheduled(&self) -> Result<()> {
+        let expired: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM outbox WHERE handed_over=1 AND at<=?1)",
+            [now_ms()],
+            |r| r.get(0),
+        )?;
+        if !expired {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM drafts WHERE id IN (SELECT json_extract(draft,'$.id') FROM outbox WHERE handed_over=1 AND at<=?1)",[now_ms()])?;
+        tx.execute(
+            "DELETE FROM outbox WHERE handed_over=1 AND at<=?1",
+            [now_ms()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn outbox_remote(&self, id: Id) -> Result<Option<(Id, String)>> {
+        self.expire_scheduled()?;
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT account_id,remote_id FROM outbox WHERE id=?1 AND remote_id IS NOT NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    pub fn outbox_prepared(&self, id: Id, remote: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET remote_id=?1 WHERE id=?2",
+            params![remote, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn outbox_handed_over(&self, id: Id) -> Result<()> {
+        self.conn.execute(
+            "UPDATE outbox SET handed_over=1, at=json_extract(draft, '$.send_at') WHERE id=?1",
+            [id],
+        )?;
+        Ok(())
+    }
+
     pub fn outbox_cancel(&self, id: Id) -> Result<Option<Draft>> {
         let tx = self.conn.unchecked_transaction()?;
         let raw: Option<String> = tx
@@ -2361,9 +2515,11 @@ impl Store {
     }
 
     pub fn outbox_due(&self, now: Ms) -> Result<Vec<(Id, Draft)>> {
+        self.expire_scheduled()?;
         let mut s = self
             .conn
-            .prepare("SELECT id, draft FROM outbox WHERE at<=?1 ORDER BY at, id")?;
+            .prepare("SELECT o.id, o.draft FROM outbox o JOIN accounts a ON a.id=o.account_id
+            WHERE handed_over=0 AND (at<=?1 OR (a.provider='microsoft' AND at>?1+120000)) ORDER BY at, o.id")?;
         let it = s.query_map([now], |r| Ok((r.get::<_, Id>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in it {

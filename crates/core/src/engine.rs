@@ -86,6 +86,64 @@ pub fn valid_recipient_address(addr: &Addr) -> bool {
         })
 }
 
+/// Resolve once and pin the checked addresses so DNS rebinding cannot reach the LAN.
+/// Redirects are refused: each hop would need its own address validation.
+async fn guarded_client(url: &reqwest::Url, allow_local: bool) -> Result<reqwest::Client> {
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none(),
+        "URL must be http(s) without credentials"
+    );
+    let host = url
+        .host_str()
+        .context("URL host missing")?
+        .trim_matches(['[', ']']);
+    let port = url.port_or_known_default().context("URL port missing")?;
+    let addresses: Vec<_> = tokio::time::timeout(
+        Duration::from_secs(10),
+        tokio::net::lookup_host((host, port)),
+    )
+    .await??
+    .collect();
+    anyhow::ensure!(!addresses.is_empty(), "URL host has no addresses");
+    for address in &addresses {
+        let local = match address.ip() {
+            std::net::IpAddr::V4(ip) => blocked_ipv4(ip),
+            std::net::IpAddr::V6(ip) => {
+                ip.to_ipv4_mapped().map(blocked_ipv4).unwrap_or_else(|| {
+                    let first = ip.segments()[0];
+                    ip.is_loopback()
+                        || ip.is_unspecified()
+                        || ip.is_multicast()
+                        || (first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80
+                })
+            }
+        };
+        anyhow::ensure!(allow_local || !local, "Local/private addresses are refused");
+    }
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .danger_accept_invalid_certs(allow_local)
+        .no_proxy()
+        .resolve_to_addrs(host, &addresses)
+        .build()?)
+}
+
+fn blocked_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || ip.octets()[0] == 0
+        || ip.octets()[0] >= 240
+        || (ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+}
+
 /// Where the store and config live for the current user.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
@@ -177,6 +235,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub(crate) struct Inner {
     reader: Mutex<Store>,
+    send_gate: tokio::sync::Mutex<()>,
     writer: Mutex<Store>,
     senders: Mutex<Vec<Sender<Event>>>,
     /// The native Proton sign-in between calls, so the UI only has to answer one step.
@@ -276,6 +335,7 @@ impl Engine {
         let (wake, wake_rx) = async_channel::unbounded();
         let inner = Arc::new(Inner {
             reader: Mutex::new(reader),
+            send_gate: tokio::sync::Mutex::new(()),
             writer: Mutex::new(writer),
             senders: Mutex::new(Vec::new()),
             sign_in: Mutex::new(None),
@@ -599,6 +659,7 @@ async fn send_due(
     next_sync: &mut HashMap<Id, Ms>,
     changed: &mut Vec<Id>,
 ) -> Result<()> {
+    let _sending = inner.send_gate.lock().await;
     let due = inner.write(|s| s.outbox_due(auth::now_ms()))?;
     let mut queued = false;
     for (outbox_id, draft) in due {
@@ -625,7 +686,32 @@ async fn send_due(
         }
         let backend = backend_mut(backends, account.id)?;
         let prepared = if let Backend::Graph { client, .. } = backend {
-            match client.prepare_send(&mime).await {
+            let existing = inner.write(|s| s.outbox_remote(outbox_id))?;
+            if let Some((_, id)) = &existing {
+                match client.deferred_submitted(id).await {
+                    Ok(true) => {
+                        inner.write(|s| s.outbox_handed_over(outbox_id))?;
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failed_send(
+                            inner,
+                            outbox_id,
+                            &draft,
+                            &error,
+                            proton::permanent_send(&error),
+                            changed,
+                        )?;
+                        continue;
+                    }
+                }
+            }
+            let prepare = match existing {
+                Some((_, id)) => Ok((id, outgoing_id.clone())),
+                None => client.prepare_send(&mime).await,
+            };
+            match prepare {
                 Ok(prepared) => Some(prepared),
                 Err(e) => {
                     failed_send(
@@ -662,7 +748,19 @@ async fn send_due(
         }
         let result = match (backend, &prepared) {
             (Backend::Graph { client, .. }, Some((id, _))) => {
-                client.send_prepared(id).await.map(|()| None)
+                let already_prepared = inner.write(|s| s.outbox_remote(outbox_id))?.is_some();
+                if let Some(at) = draft
+                    .send_at
+                    .filter(|at| already_prepared || *at > auth::now_ms() + 120_000)
+                {
+                    inner.write(|s| s.outbox_prepared(outbox_id, id))?;
+                    match client.defer_send(id, at).await {
+                        Ok(()) => client.send_deferred(id).await.map(|()| None),
+                        Err(e) => Err(e),
+                    }
+                } else {
+                    client.send_prepared(id).await.map(|()| None)
+                }
             }
             (backend, _) => backend.apply(&Op::Send { mime }).await,
         };
@@ -684,7 +782,12 @@ async fn send_due(
                         s.apply_deltas(account.id, &[Delta::Upsert(Box::new(message))])
                     })?;
                 }
-                inner.write(|s| s.outbox_sent(outbox_id))?;
+                let deferred = inner.write(|s| s.outbox_remote(outbox_id))?.is_some();
+                if deferred {
+                    inner.write(|s| s.outbox_handed_over(outbox_id))?;
+                } else {
+                    inner.write(|s| s.outbox_sent(outbox_id))?;
+                }
                 queued = true;
                 if !matches!(backend, Backend::Proton { .. }) {
                     next_sync.remove(&account.id);
@@ -692,7 +795,13 @@ async fn send_due(
                 // The provider copy of a saved draft is stale now that it has been sent; delete it
                 // on the next pass rather than leaving a duplicate in Drafts.
                 if let Some(id) = draft.id
-                    && let Some((account_id, remote)) = inner.write(|s| s.draft_sent(id))?
+                    && let Some((account_id, remote)) = inner.write(|s| {
+                        if deferred {
+                            s.draft_provider_sent(id)
+                        } else {
+                            s.draft_sent(id)
+                        }
+                    })?
                 {
                     inner.write(|s| {
                         s.draft_op(account_id, &Op::DeleteDraft { remote_id: remote }, None)
@@ -1145,6 +1254,89 @@ impl Mail for Engine {
         Ok(token)
     }
 
+    fn unsubscribe(&self, thread: Id) -> Result<crate::api::Unsubscribed> {
+        let (account, sender, header, post) = self.inner.read(|s| s.unsubscribe_source(thread))?;
+        let parts: Vec<&str> = if header.contains('<') {
+            header
+                .split('<')
+                .filter_map(|part| part.split_once('>').map(|(url, _)| url))
+                .collect()
+        } else {
+            header.split(',').collect()
+        };
+        let urls: Vec<_> = parts
+            .into_iter()
+            .filter_map(|part| reqwest::Url::parse(part.trim()).ok())
+            .collect();
+        let https = urls.iter().find(|u| u.scheme() == "https");
+        let one_click = post
+            .trim()
+            .eq_ignore_ascii_case("List-Unsubscribe=One-Click");
+        let mut browser = None;
+        if let Some(url) = https.filter(|_| one_click) {
+            run_async(async {
+                let client = guarded_client(url, self.inner.opts.local_images).await?;
+                let response = client
+                    .post(url.clone())
+                    .header("Content-Type", "application/x-www-form-urlencoded")
+                    .body("List-Unsubscribe=One-Click")
+                    .send()
+                    .await?;
+                anyhow::ensure!(
+                    response.status().is_success(),
+                    "Unsubscribe request failed ({})",
+                    response.status()
+                );
+                Ok(())
+            })?;
+        } else if let Some(url) = urls.iter().find(|u| u.scheme() == "mailto") {
+            let mut draft = Draft {
+                account_id: account,
+                subject: "unsubscribe".into(),
+                body: "unsubscribe".into(),
+                ..Draft::default()
+            };
+            // URL form decoding also decodes percent-escaped mailbox characters.
+            let address =
+                reqwest::Url::parse(&format!("https://unused.invalid/?address={}", url.path()))?
+                    .query_pairs()
+                    .next()
+                    .map(|(_, v)| v.into_owned())
+                    .context("unsubscribe address missing")?;
+            draft.to = address
+                .split(',')
+                .map(|email| Addr {
+                    name: String::new(),
+                    email: email.trim().into(),
+                })
+                .collect();
+            for (key, value) in url.query_pairs() {
+                if key.eq_ignore_ascii_case("subject") {
+                    draft.subject = value.into_owned();
+                } else if key.eq_ignore_ascii_case("body") {
+                    draft.body = value.into_owned();
+                }
+            }
+            self.send(draft)?;
+        } else if let Some(url) = https {
+            run_async(guarded_client(url, false))?;
+            browser = Some(url.to_string());
+        } else {
+            bail!("No supported unsubscribe address");
+        }
+        let (undo, archived) = self
+            .inner
+            .write(|s| s.unsubscribe_archive(account, &sender))?;
+        self.wake();
+        self.emit_changed()?;
+        Ok(crate::api::Unsubscribed {
+            sender,
+            archived,
+            undo,
+            url: browser,
+        })
+    }
+
     fn undo(&self, token: i64) -> Result<()> {
         self.inner.write(|s| s.undo(token))?;
         self.wake();
@@ -1184,7 +1376,21 @@ impl Mail for Engine {
     }
 
     fn cancel_send(&self, id: Id) -> Result<Option<Draft>> {
-        let draft = self.inner.write(|s| s.outbox_cancel(id))?;
+        let draft = run_async(async {
+            let _sending = self.inner.send_gate.lock().await;
+            if let Some((account, remote_id)) = self.inner.write(|s| s.outbox_remote(id))? {
+                let account = self
+                    .inner
+                    .read(Store::accounts)?
+                    .into_iter()
+                    .find(|a| a.id == account)
+                    .context("account was removed")?;
+                let mut backend = backend_for(&self.inner, &account)?;
+                backend.apply(&Op::DeleteDraft { remote_id }).await?;
+                persist_tokens(&self.inner, account.id, &mut backend)?;
+            }
+            self.inner.write(|s| s.outbox_cancel(id))
+        })?;
         if let Some(draft) = &draft
             && draft.id.is_some()
         {
@@ -1272,33 +1478,8 @@ impl Mail for Engine {
             matches!(url.scheme(), "https" | "http"),
             "Remote images must be http(s)"
         );
-        // Mail must not be able to make Kite probe the reader's own machine or LAN.
-        let host = url.host_str().unwrap_or_default();
-        let local = match host.trim_matches(['[', ']']).parse::<std::net::IpAddr>() {
-            Ok(std::net::IpAddr::V4(ip)) => {
-                ip.is_loopback() || ip.is_private() || ip.is_link_local() || ip.is_unspecified()
-            }
-            Ok(std::net::IpAddr::V6(ip)) => {
-                let first = ip.segments()[0];
-                ip.is_loopback()
-                    || ip.is_unspecified()
-                    || (first & 0xfe00) == 0xfc00
-                    || (first & 0xffc0) == 0xfe80
-            }
-            Err(_) => {
-                host.is_empty()
-                    || host.eq_ignore_ascii_case("localhost")
-                    || host.to_ascii_lowercase().ends_with(".localhost")
-            }
-        };
-        anyhow::ensure!(
-            !local || self.inner.opts.local_images,
-            "Remote images on local addresses are not loaded"
-        );
         run_async(async move {
-            let client = reqwest::Client::builder()
-                .timeout(Duration::from_secs(10))
-                .build()?;
+            let client = guarded_client(&url, self.inner.opts.local_images).await?;
             let mut res = client.get(url).send().await.context("fetch image")?;
             anyhow::ensure!(
                 res.status().is_success(),

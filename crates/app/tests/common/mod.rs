@@ -308,6 +308,21 @@ impl Fixture {
         }
     }
 
+    /// Replaces the latest message's text body (and drops its HTML), so text-body links
+    /// can be exercised.
+    pub fn set_message_text(&self, thread: Id, text: &str) {
+        if let Some(message) = self
+            .messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+        {
+            message.html = None;
+            message.text = text.into();
+        }
+    }
+
     pub fn next_id(&self) -> Id {
         self.threads
             .lock()

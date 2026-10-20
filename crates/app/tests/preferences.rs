@@ -604,15 +604,16 @@ fn settings_opens_on_general_and_the_rail_lists_every_section_in_order(cx: &mut 
         );
         assert!(window.try_find("undo-send-10").is_some());
         // (rail index, rail label, an element only that section renders)
-        let sections: [(usize, &str, &str); 8] = [
+        let sections: [(usize, &str, &str); 9] = [
             (0, "General", "undo-send-10"),
             (1, "Accounts", "settings-account-1"),
             (2, "Connections", "proton-native"),
             (3, "Appearance", "theme-dark"),
             (4, "Typography", "font-size-value"),
             (5, "Shortcuts", "shortcut-reset-all"),
-            (6, "Privacy", "remote-images"),
-            (7, "AI", "ai-enabled"),
+            (6, "Snippets", "snippet-new"),
+            (7, "Privacy", "remote-images"),
+            (8, "AI", "ai-enabled"),
         ];
         for (index, label, marker) in sections {
             let tab = window.find(("settings-tab", index));

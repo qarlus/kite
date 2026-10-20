@@ -78,7 +78,7 @@ impl Palette {
 }
 
 /// Subsequence match with bonuses for consecutive runs and word starts.
-fn fuzzy(query: &str, text: &str) -> Option<i32> {
+pub(crate) fn fuzzy(query: &str, text: &str) -> Option<i32> {
     let hay: Vec<char> = text.to_lowercase().chars().collect();
     let mut score = 0;
     let mut hay_ix = 0;

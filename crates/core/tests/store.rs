@@ -17,6 +17,8 @@ const JAN4: Ms = 1_704_326_400_000;
 
 fn msg(remote_id: &str, from: &str, subject: &str, date: Ms) -> RemoteMsg {
     RemoteMsg {
+        unsubscribe_header: String::new(),
+        unsubscribe_post: String::new(),
         remote_id: remote_id.into(),
         folder: "INBOX".into(),
         mailbox: Mailbox::Inbox,
@@ -2687,7 +2689,7 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        8
+        9
     );
     assert!(
         !connection

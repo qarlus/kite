@@ -4733,6 +4733,7 @@ dependencies = [
  "keyring",
  "mail-builder",
  "mail-parser",
+ "minisign-verify",
  "num-bigint-dig 0.8.6",
  "pgp",
  "rand 0.8.8",
@@ -5170,6 +5171,12 @@ dependencies = [
  "mime",
  "unicase",
 ]
+
+[[package]]
+name = "minisign-verify"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "22f9645cb765ea72b8111f36c522475d2daa0d22c957a9826437e97534bc4e9e"
 
 [[package]]
 name = "miniz_oxide"

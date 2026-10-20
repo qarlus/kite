@@ -12,7 +12,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Account, Action as MailAction, Addr, Draft, Id, Message, Ms, Provider};
+use kite_core::model::{
+    Account, Action as MailAction, Addr, Draft, Id, Message, Ms, Provider, Snippet,
+};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -45,7 +47,24 @@ pub struct Compose {
     saved: bool,
     /// Bumped on every edit and save, so a stale debounce cannot save newer state.
     save_gen: u64,
+    /// The open snippet picker, if any.
+    snippet: Option<Snippets>,
+    /// A `;` trigger the user escaped out of, so the same anchor does not reopen.
+    snippet_dismissed: Option<usize>,
+    /// Focus the picker takes while it is open, so its arrows never edit the draft.
+    snippet_focus: FocusHandle,
     _subs: Vec<Subscription>,
+}
+
+/// The inline snippet picker: opened by `;` at a word start or by "Insert snippet…".
+pub struct Snippets {
+    /// Byte offset of the `;` in the body. `None` when opened from the command, in
+    /// which case Enter inserts at the caret rather than replacing `;query`.
+    anchor: Option<usize>,
+    /// What filters the list: the text after `;`, or keystrokes in command mode.
+    query: String,
+    /// Selected row within the filtered list.
+    sel: usize,
 }
 
 /// Everything a new panel starts with. Keeps the constructor readable.
@@ -104,9 +123,10 @@ impl Compose {
             );
         }
         subs.push(
-            cx.subscribe_in(&body, window, |this, _, event: &InputEvent, _, cx| {
+            cx.subscribe_in(&body, window, |this, _, event: &InputEvent, window, cx| {
                 if matches!(event, InputEvent::Change) {
                     this.compose_changed(cx);
+                    this.snippet_scan(window, cx);
                 }
             }),
         );
@@ -130,6 +150,9 @@ impl Compose {
             dirty: false,
             saved: parts.id.is_some(),
             save_gen: 0,
+            snippet: None,
+            snippet_dismissed: None,
+            snippet_focus: cx.focus_handle(),
             _subs: subs,
         }
     }
@@ -673,6 +696,394 @@ impl Kite {
         cx.notify();
     }
 
+    // ---- snippets ---------------------------------------------------------------
+
+    /// A `;` typed at a word start opens the picker; what follows it is the
+    /// query. The picker takes focus, so its arrows and Enter never reach the
+    /// draft while the query text it will replace still lives in the body.
+    fn snippet_scan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        if self.settings.snippets.is_empty() || compose.snippet.is_some() {
+            return;
+        }
+        let (cursor, text) = {
+            let body = compose.body.read(cx);
+            (body.cursor(), body.value().to_string())
+        };
+        let Some(anchor) = snippet_anchor(&text, cursor) else {
+            compose.snippet_dismissed = None;
+            return;
+        };
+        if compose.snippet_dismissed == Some(anchor) {
+            return;
+        }
+        compose.snippet = Some(Snippets {
+            anchor: Some(anchor),
+            query: text[anchor + 1..cursor].to_string(),
+            sel: 0,
+        });
+        let focus = compose.snippet_focus.clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// "Insert snippet…" (palette / `Ctrl+;`): the picker opens with no `;` anchor, so
+    /// the chosen body is inserted at the caret rather than replacing trigger text.
+    pub(crate) fn open_snippets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.compose_open {
+            return;
+        }
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        compose.snippet = Some(Snippets {
+            anchor: None,
+            query: String::new(),
+            sel: 0,
+        });
+        compose.snippet_dismissed = None;
+        let focus = compose.snippet_focus.clone();
+        window.focus(&focus, cx);
+        cx.notify();
+    }
+
+    /// Whether a snippet picker is open, so `run` routes Escape and the confirm
+    /// and navigation commands to it instead of the mail list.
+    pub(crate) fn snippet_open(&self) -> bool {
+        self.compose
+            .as_ref()
+            .is_some_and(|compose| compose.snippet.is_some())
+    }
+
+    /// Close the picker and hand the body its caret back. `dismiss` marks an
+    /// Escape, so the same `;` does not immediately reopen while typing continues.
+    pub(crate) fn close_snippets(
+        &mut self,
+        dismiss: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        if dismiss && let Some(anchor) = compose.snippet.as_ref().and_then(|s| s.anchor) {
+            compose.snippet_dismissed = Some(anchor);
+        }
+        compose.snippet = None;
+        let handle = compose.body.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Key events while the picker holds focus: unbound keys land here (arrows,
+    /// Enter, Backspace, characters without a command). Bound single keys are
+    /// actions instead and arrive through [`Kite::snippet_act`]. Returns whether
+    /// the picker is open and consumed the key.
+    fn snippet_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(compose) = &self.compose else {
+            return false;
+        };
+        if compose.snippet.is_none() {
+            return false;
+        }
+        match event.keystroke.key.as_str() {
+            "up" => self.snippet_move(-1, cx),
+            "down" => self.snippet_move(1, cx),
+            "enter" => {
+                let row = compose.snippet.as_ref().map(|s| s.sel).unwrap_or(0);
+                self.insert_snippet_at(row, window, cx);
+            }
+            "escape" => self.close_snippets(true, window, cx),
+            "backspace" => self.snippet_backspace(window, cx),
+            _ => {
+                if let Some(c) = keystroke_char(&event.keystroke) {
+                    self.snippet_type(&c.to_string(), window, cx);
+                }
+            }
+        }
+        true
+    }
+
+    /// Actions that arrive while the picker holds focus: it owns the keyboard, so
+    /// every command is swallowed. Escape closes, and a bound single character
+    /// (`e`, `s`, `x`…) is the letter the user meant to type into the query.
+    fn snippet_act(&mut self, action: &keys::Act, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .compose
+            .as_ref()
+            .is_none_or(|compose| compose.snippet.is_none())
+        {
+            return;
+        }
+        match action.cmd {
+            keys::cmd::COMPOSE_CLOSE | keys::cmd::BACK => self.close_snippets(true, window, cx),
+            id => {
+                let typed = keys::command(id)
+                    .and_then(|command| keys::bound(&self.settings, command).into_iter().next())
+                    .and_then(|key| Keystroke::parse(&key).ok())
+                    .and_then(|stroke| keystroke_char(&stroke));
+                if let Some(c) = typed {
+                    self.snippet_type(&c.to_string(), window, cx);
+                }
+            }
+        }
+        cx.stop_propagation();
+    }
+
+    /// Enter (the OPEN command) inserts the selected row, whichever mode opened
+    /// the picker.
+    pub(crate) fn snippet_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let row = self
+            .compose
+            .as_ref()
+            .and_then(|compose| compose.snippet.as_ref())
+            .map(|picker| picker.sel)
+            .unwrap_or(0);
+        self.insert_snippet_at(row, window, cx);
+    }
+
+    pub(crate) fn snippet_move(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        let Some(picker) = &mut compose.snippet else {
+            return;
+        };
+        let count = snippet_hits(&self.settings.snippets, &picker.query).len();
+        if count > 0 {
+            picker.sel = (picker.sel as isize + delta).clamp(0, count as isize - 1) as usize;
+        }
+        cx.notify();
+    }
+
+    /// A query character: it filters the list, and for a `;` trigger it is also
+    /// the `;query` text living in the body, so it is appended after the anchor.
+    fn snippet_type(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        let Some(picker) = &mut compose.snippet else {
+            return;
+        };
+        // Whitespace ends the `;word`: keep it after the trigger text and close.
+        if text.chars().all(char::is_whitespace) {
+            if let Some(anchor) = picker.anchor {
+                let at = anchor + 1 + picker.query.len();
+                compose.body.update(cx, |body, cx| {
+                    body.set_selected_range(at..at, cx);
+                    body.insert(text.to_string(), window, cx);
+                });
+            }
+            self.close_snippets(true, window, cx);
+            return;
+        }
+        picker.query.push_str(text);
+        picker.sel = 0;
+        if let Some(anchor) = picker.anchor {
+            let at = anchor + 1 + picker.query.len() - text.len();
+            compose.body.update(cx, |body, cx| {
+                body.set_selected_range(at..at, cx);
+                body.insert(text.to_string(), window, cx);
+            });
+        }
+        cx.notify();
+    }
+
+    fn snippet_backspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        let Some(picker) = &mut compose.snippet else {
+            return;
+        };
+        let anchor = picker.anchor;
+        match picker.query.pop() {
+            Some(c) => {
+                if let Some(anchor) = anchor {
+                    let at = anchor + 1 + picker.query.len();
+                    compose.body.update(cx, |body, cx| {
+                        body.set_selected_range(at..at + c.len_utf8(), cx);
+                        body.replace("", window, cx);
+                    });
+                }
+                cx.notify();
+            }
+            // An empty query backspaces the `;` itself, which also ends the trigger.
+            None => {
+                if let Some(anchor) = anchor {
+                    compose.body.update(cx, |body, cx| {
+                        body.set_selected_range(anchor..anchor + 1, cx);
+                        body.replace("", window, cx);
+                    });
+                }
+                self.close_snippets(false, window, cx);
+            }
+        }
+    }
+
+    /// Insert the snippet at `row` in the filtered list: expand its variables,
+    /// lift a `Subject:` line into an empty subject field, replace the `;query`
+    /// text (or insert at the caret) and select the first variable left unfilled.
+    fn insert_snippet_at(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = &self.compose else {
+            return;
+        };
+        let Some(picker) = &compose.snippet else {
+            return;
+        };
+        let hits = snippet_hits(&self.settings.snippets, &picker.query);
+        let Some(snippet) = hits.get(row).map(|ix| self.settings.snippets[*ix].clone()) else {
+            return;
+        };
+        let anchor = picker.anchor;
+        let query_len = picker.query.len();
+        let to = parse_addrs(&compose.to.read(cx).value());
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == compose.account_id);
+        let (subject, text) = expand_snippet(&snippet.body, to.first(), account, &Local::now());
+        if let Some(subject) = subject
+            && compose.subject.read(cx).value().trim().is_empty()
+        {
+            compose
+                .subject
+                .update(cx, |input, cx| input.set_value(subject, window, cx));
+        }
+        compose.body.update(cx, |body, cx| {
+            if let Some(anchor) = anchor {
+                body.set_selected_range(anchor..anchor + 1 + query_len, cx);
+            }
+            body.replace(text.clone(), window, cx);
+            if let Some(range) = leftover_variable(&body.value()) {
+                body.set_selected_range(range, cx);
+            }
+        });
+        let compose = self.compose.as_mut().unwrap();
+        compose.snippet = None;
+        let handle = compose.body.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// The picker panel under the body: the matching snippets with their `;` shortcut.
+    /// It takes focus while open so its arrows and Enter never reach the draft.
+    fn render_snippets(
+        &self,
+        picker: &Snippets,
+        focus: &FocusHandle,
+        t: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let hits = snippet_hits(&self.settings.snippets, &picker.query);
+        let rows: Vec<AnyElement> = hits
+            .iter()
+            .take(8)
+            .enumerate()
+            .map(|(row, ix)| {
+                let snippet = &self.settings.snippets[*ix];
+                let selected = row == picker.sel;
+                let preview = snippet.body.lines().next().unwrap_or("").to_string();
+                div()
+                    .id(("snippet-row", row))
+                    .test_support()
+                    .aria_label(snippet.name.clone())
+                    .aria_selected(selected)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.insert_snippet_at(row, window, cx)
+                    }))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .px_3()
+                    .py_2()
+                    .when(selected, |d| d.bg(t.sel))
+                    .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .text_size(t.px(13.))
+                                    .when(!selected, |d| d.text_color(t.fg))
+                                    .child(snippet.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(t.px(11.))
+                                    .text_color(t.fg3)
+                                    .child(format!(";{}", snippet.shortcut)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(t.px(12.))
+                                    .text_color(t.fg2)
+                                    .child(preview),
+                            ),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        div()
+            .id("snippet-picker")
+            .test_support()
+            .aria_label("Insert snippet")
+            .track_focus(focus)
+            // Actions are intercepted here, on the focused picker, not on the compose
+            // panel: an Act listener on a node that always exists would shadow the
+            // inputs' own dispatch and break typing.
+            .on_action(cx.listener(|this, action: &keys::Act, window, cx| {
+                this.snippet_act(action, window, cx);
+            }))
+            .on_key_down(cx.listener(|this, event, window, cx| {
+                if this.snippet_key(event, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .flex_shrink_0()
+            .max_h(px(320.))
+            .overflow_y_hidden()
+            .mx_4()
+            .mb_2()
+            .rounded(px(RADIUS_SM))
+            .border_1()
+            .border_color(t.line)
+            .bg(t.bg)
+            .shadow(vec![
+                BoxShadow::new(px(0.), px(8.), SHADOW.into()).blur_radius(px(30.)),
+            ])
+            .py_1()
+            .flex()
+            .flex_col()
+            .children(rows)
+            .when(hits.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .py_4()
+                        .text_size(t.px(12.))
+                        .text_color(t.fg2)
+                        .child("No matching snippets — create them in Settings › Snippets"),
+                )
+            })
+            .into_any_element()
+    }
+
     pub fn render_compose(
         &mut self,
         window: &mut Window,
@@ -726,6 +1137,10 @@ impl Kite {
             keys::hint_for(&self.settings, keys::cmd::SEND_LATER),
         );
         let send_tip = action_tip("Send", keys::hint_for(&self.settings, keys::cmd::SEND));
+        let snippets = compose
+            .snippet
+            .as_ref()
+            .map(|picker| self.render_snippets(picker, &compose.snippet_focus, &t, cx));
         let pane_left = crate::sidebar::width(window);
         let pane_width = (window.viewport_size().width.as_f32() - pane_left).max(0.);
         let available_height = (window.viewport_size().height.as_f32() - BAR_H).max(0.);
@@ -951,6 +1366,7 @@ impl Kite {
                                 ),
                         ),
                 )
+                .when_some(snippets, |d, picker| d.child(picker))
                 .child(
                     div()
                         .flex()
@@ -1529,6 +1945,169 @@ fn valid_display_name(name: &str) -> bool {
         }
     }
     false
+}
+
+/// The `;` a picker can open on: at the text start or right after whitespace, with
+/// only non-whitespace (the query) between it and the caret. Returns its byte offset.
+fn snippet_anchor(text: &str, cursor: usize) -> Option<usize> {
+    if !text.is_char_boundary(cursor) {
+        return None;
+    }
+    let before = &text[..cursor];
+    let anchor = before.rfind(';')?;
+    if before[anchor + 1..].chars().any(char::is_whitespace) {
+        return None;
+    }
+    if anchor > 0 && !before[..anchor].chars().next_back()?.is_whitespace() {
+        return None;
+    }
+    Some(anchor)
+}
+
+/// Snippets matching the query, best first: a fuzzy hit on the name or the shortcut.
+fn snippet_hits(snippets: &[Snippet], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let mut scored: Vec<(i32, usize)> = snippets
+        .iter()
+        .enumerate()
+        .filter_map(|(ix, snippet)| {
+            let score = if query.is_empty() {
+                Some(0)
+            } else {
+                crate::palette::fuzzy(&query, &snippet.name)
+                    .into_iter()
+                    .chain(crate::palette::fuzzy(&query, &snippet.shortcut))
+                    .max()
+            }?;
+            Some((score, ix))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored.into_iter().map(|(_, ix)| ix).collect()
+}
+
+/// The character a keystroke would type, if it types one.
+fn keystroke_char(stroke: &Keystroke) -> Option<char> {
+    if stroke.modifiers.control
+        || stroke.modifiers.alt
+        || stroke.modifiers.platform
+        || stroke.modifiers.function
+    {
+        return None;
+    }
+    if let Some(c) = stroke.key_char.as_deref().and_then(|c| c.chars().next()) {
+        return Some(c);
+    }
+    if stroke.key.chars().count() != 1 {
+        return None;
+    }
+    let c = stroke.key.chars().next()?;
+    Some(if stroke.modifiers.shift {
+        c.to_ascii_uppercase()
+    } else {
+        c
+    })
+}
+
+/// The first `{name}` a snippet body could not fill, for the caret to land on.
+fn leftover_variable(text: &str) -> Option<std::ops::Range<usize>> {
+    for (start, _) in text.match_indices('{') {
+        if let Some(close) = text[start..].find('}') {
+            let name = &text[start + 1..start + close];
+            if !name.is_empty()
+                && name.len() <= 24
+                && name.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            {
+                return Some(start..start + close + 1);
+            }
+        }
+    }
+    None
+}
+
+fn capitalise(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn local_part(email: &str) -> &str {
+    email.split('@').next().unwrap_or(email)
+}
+
+/// `{name}`/`{first_name}`: the display name's words, or the email local part.
+fn recipient_name(addr: &Addr) -> Option<String> {
+    let name = addr.name.trim();
+    if !name.is_empty() {
+        return Some(name.to_string());
+    }
+    let local = local_part(addr.email.trim());
+    (!local.is_empty()).then(|| capitalise(local))
+}
+
+fn recipient_first_name(addr: &Addr) -> Option<String> {
+    let name = addr.name.trim();
+    if !name.is_empty() {
+        return name.split_whitespace().next().map(str::to_string);
+    }
+    recipient_name(addr)
+}
+
+fn recipient_last_name(addr: &Addr) -> Option<String> {
+    let mut words = addr.name.split_whitespace();
+    match (words.next(), words.next_back()) {
+        (Some(_), Some(last)) => Some(last.to_string()),
+        _ => None,
+    }
+}
+
+/// Expand the snippet: a leading `Subject:` line comes off as the subject, then the
+/// `{…}` variables fill from the first To recipient, the From account and today.
+/// A variable with no value stays in the text for the user to type over.
+fn expand_snippet(
+    raw: &str,
+    to: Option<&Addr>,
+    account: Option<&Account>,
+    now: &chrono::DateTime<Local>,
+) -> (Option<String>, String) {
+    let (subject, mut body) = if let Some(rest) = raw.strip_prefix("Subject:") {
+        let end = rest.find('\n').unwrap_or(rest.len());
+        (
+            Some(rest[..end].trim().to_string()),
+            rest[end..].strip_prefix('\n').unwrap_or("").to_string(),
+        )
+    } else {
+        (None, raw.to_string())
+    };
+    let own = account.map(|account| account.name.trim()).unwrap_or("");
+    let values: [(&str, Option<String>); 9] = [
+        ("{email}", {
+            let email = to.map(|addr| addr.email.trim()).unwrap_or("");
+            (!email.is_empty()).then(|| email.to_string())
+        }),
+        ("{name}", to.and_then(recipient_name)),
+        ("{first_name}", to.and_then(recipient_first_name)),
+        ("{last_name}", to.and_then(recipient_last_name)),
+        ("{my_name}", (!own.is_empty()).then(|| own.to_string())),
+        (
+            "{my_first_name}",
+            own.split_whitespace().next().map(str::to_string),
+        ),
+        (
+            "{date}",
+            Some(now.format("%e %B %Y").to_string().trim_start().to_string()),
+        ),
+        ("{day}", Some(now.format("%A").to_string())),
+        ("{time}", Some(now.format("%H:%M").to_string())),
+    ];
+    for (token, value) in values {
+        if let Some(value) = value {
+            body = body.replace(token, &value);
+        }
+    }
+    (subject, body)
 }
 
 fn recipient_error(t: &Theme, id: &'static str, error: String) -> AnyElement {

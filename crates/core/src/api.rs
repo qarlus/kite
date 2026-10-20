@@ -5,6 +5,14 @@ use crate::model::*;
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// The request cannot be recalled; only `undo` restores archived conversations.
+pub struct Unsubscribed {
+    pub sender: String,
+    pub archived: usize,
+    pub undo: i64,
+    pub url: Option<String>,
+}
+
 pub trait Mail: Send + Sync + 'static {
     fn accounts(&self) -> Result<Vec<Account>>;
     fn add_microsoft(&self) -> Result<Account>;
@@ -53,6 +61,10 @@ pub trait Mail: Send + Sync + 'static {
     /// Applies locally at once and queues the remote op. Returns an undo token.
     fn act(&self, ids: &[Id], action: &Action) -> Result<i64>;
     fn undo(&self, token: i64) -> Result<()>;
+    /// May contact an unsubscribe service. Call off the UI thread.
+    fn unsubscribe(&self, _thread: Id) -> Result<Unsubscribed> {
+        anyhow::bail!("Unsubscribe is not available")
+    }
 
     /// Queues to the outbox (due after the undo window or at `send_at`). Returns the outbox id.
     fn send(&self, draft: Draft) -> Result<Id>;
@@ -89,6 +101,15 @@ pub trait Mail: Send + Sync + 'static {
     fn set_tags(&self, _tags: Vec<Tag>) -> Result<()> {
         anyhow::bail!("Tags are not available")
     }
+    /// Blocking network work; call from the UI background executor.
+    fn check_update(&self, current: &str) -> Result<Option<crate::update::Release>> {
+        crate::update::blocking(crate::update::check(current))
+    }
+    /// Downloads, verifies and swaps the executable. Caller quits cleanly on success.
+    fn install_update(&self, release: &crate::update::Release) -> Result<()> {
+        crate::update::install_release(release)
+    }
+
     fn settings(&self) -> Result<Settings>;
     fn set_settings(&self, settings: Settings) -> Result<()>;
     fn set_ai_key(&self, key: &str) -> Result<()>;
