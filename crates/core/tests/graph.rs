@@ -1076,7 +1076,6 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
         .unwrap();
     store
         .set_settings(Settings {
-            ms_client_id: "client".into(),
             undo_send_secs: 0,
             ..Default::default()
         })

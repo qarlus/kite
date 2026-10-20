@@ -792,7 +792,7 @@ fn backend_for(inner: &Inner, account: &Account) -> Result<Backend> {
                 .get(&format!("ms:{}", account.id))?
                 .with_context(|| format!("no Microsoft tokens for {}", account.email))?;
             let tokens: Tokens = serde_json::from_str(&raw).context("Microsoft tokens")?;
-            let client = graph(inner, &ms_client_id(inner)?, tokens);
+            let client = graph(inner, &ms_client_id(), tokens);
             Ok(Backend::Graph {
                 client: Box::new(client),
                 saved: raw,
@@ -847,19 +847,14 @@ fn graph(inner: &Inner, client_id: &str, tokens: Tokens) -> Graph {
 }
 
 /// The Microsoft app registration Kite signs in as. It identifies the app, not the mailbox, so
-/// one registration serves every user: Settings overrides the build's, then the environment.
-fn ms_client_id(inner: &Inner) -> Result<String> {
-    let configured = inner.read(Store::settings)?.ms_client_id;
-    [
-        Some(configured),
-        std::env::var("KITE_MS_CLIENT_ID").ok(),
-        option_env!("KITE_MS_CLIENT_ID").map(str::to_string),
-    ]
-    .into_iter()
-    .flatten()
-    .map(|id| id.trim().to_string())
-    .find(|id| !id.is_empty())
-    .context("Outlook needs a Microsoft app (client) ID: add one in Settings › Connections")
+/// one registration serves every user; `KITE_MS_CLIENT_ID` overrides it in development.
+fn ms_client_id() -> String {
+    const BUILT_IN: &str = "a82018ad-1eb2-4c7c-b005-2144e4c61611";
+    std::env::var("KITE_MS_CLIENT_ID")
+        .map(|id| id.trim().to_string())
+        .ok()
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| BUILT_IN.to_string())
 }
 
 // ----------------------------------------------------------------------- MIME
@@ -962,7 +957,7 @@ impl Mail for Engine {
     }
 
     fn add_microsoft(&self) -> Result<Account> {
-        let client_id = ms_client_id(&self.inner)?;
+        let client_id = ms_client_id();
         let tokens = run_async(auth::ms_login(&client_id))?;
         let mut client = graph(&self.inner, &client_id, tokens);
         let (email, name) = run_async(client.me())?;

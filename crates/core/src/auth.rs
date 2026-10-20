@@ -304,8 +304,8 @@ fn oauth_error(status: reqwest::StatusCode, text: &str) -> String {
         .to_string();
     let hint = match code {
         "invalid_client" => {
-            "Check the app (client) ID in Settings › Connections: it must be the Application ID \
-             of a registration, and Kite signs in as a public client with no secret."
+            "Microsoft rejected Kite's app registration. If KITE_MS_CLIENT_ID is set, it must be \
+             the Application ID of a registration that allows public client flows."
         }
         "unauthorized_client" => {
             "The app registration does not allow this sign-in. In the Entra admin center set its \

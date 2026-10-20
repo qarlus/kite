@@ -105,7 +105,7 @@ impl Kite {
         } else if self.accounts.is_empty() {
             (
                 "Welcome to Kite".to_string(),
-                "Connect Proton Bridge or Outlook to start syncing your mail.".to_string(),
+                "Sign in to Proton or Outlook to start syncing your mail.".to_string(),
             )
         } else {
             match self.view.mailbox {

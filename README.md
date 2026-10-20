@@ -37,7 +37,7 @@ The current UI-shell build still starts without a connected mail engine. Setting
 1. Go to https://entra.microsoft.com, then **App registrations → New registration**.
 2. Name it `Kite`. For supported accounts, choose *Any Entra ID directory + personal Microsoft accounts*.
 3. Under **Redirect URI**, choose platform *Public client/native (mobile & desktop)* and enter `http://localhost`.
-4. Copy the **Application (client) ID** and set it as the `KITE_MS_CLIENT_ID` env var, or as `ms_client_id` in Kite's `config.json`.
+4. Copy the **Application (client) ID** and set it as the `KITE_MS_CLIENT_ID` env var. This is only needed to use your own registration; Kite has one built in.
 5. Under **API permissions**, add Microsoft Graph delegated permissions: `offline_access`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read`, `User.Read`.
 
 ## Proton setup

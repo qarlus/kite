@@ -505,71 +505,6 @@ async fn changing_text_size_reflows_an_already_open_html_message(cx: &mut TestAp
 }
 
 #[gpui_kit::test]
-async fn bridge_errors_clear_the_password_and_require_reentry(cx: &mut TestAppContext) {
-    let fixture = Fixture::showcase();
-    *fixture.account_error.lock().unwrap() = Some("Bridge is not running".into());
-    let (window, _) = mount(cx, fixture.clone());
-    cx.simulate_keystrokes(window.into(), "secondary-shift-,");
-    cx.update_window(window.into(), |_, window, cx| {
-        window.render_frame(cx);
-        window.click(("settings-tab", 3usize), cx);
-        window.render_frame(cx);
-        // The Connections page grew with the Outlook setup copy, so the Bridge button needs
-        // a scroll before it can be clicked.
-        window.scroll(
-            "settings-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-500.))),
-            cx,
-        );
-        window.render_frame(cx);
-        window.click("add-proton", cx);
-        window.render_frame(cx);
-        window.scroll(
-            "settings-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-500.))),
-            cx,
-        );
-        window.render_frame(cx);
-        window.click("proton-username", cx);
-        window.input("bridge@example.com", cx);
-        window.click("proton-password", cx);
-        window.input("temporary-bridge-secret", cx);
-        window.scroll(
-            "settings-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-300.))),
-            cx,
-        );
-        window.render_frame(cx);
-        window.click("connect-proton", cx);
-    })
-    .unwrap();
-    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
-        window.try_find("settings-error").is_some()
-    })
-    .await;
-    cx.update_window(window.into(), |_, window, cx| {
-        assert_eq!(
-            window.find("settings-error").label(),
-            Some("Bridge is not running")
-        );
-        window.scroll(
-            "settings-scroll",
-            ScrollDelta::Pixels(point(px(0.), px(-500.))),
-            cx,
-        );
-        window.render_frame(cx);
-        window.click("connect-proton", cx);
-        window.render_frame(cx);
-        assert_eq!(
-            window.find("settings-error").label(),
-            Some("Enter your Bridge username and password.")
-        );
-    })
-    .unwrap();
-    assert_eq!(fixture.accounts.lock().unwrap().len(), 2);
-}
-
-#[gpui_kit::test]
 fn a_failed_save_keeps_the_applied_theme_and_explains_the_error(cx: &mut TestAppContext) {
     let file = TempFile::new();
     std::fs::write(&file.0, "not a directory").unwrap();
@@ -601,7 +536,7 @@ fn every_settings_section_opens_from_the_rail(cx: &mut TestAppContext) {
             (0, "theme-dark"),
             (1, "font-size-value"),
             (2, "settings-account-1"),
-            (3, "proton-bridge-status"),
+            (3, "proton-native"),
             (4, "undo-send-10"),
             (5, "remote-images"),
             (6, "ai-enabled"),

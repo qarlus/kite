@@ -204,8 +204,6 @@ pub struct Settings {
     pub ai_enabled: bool,
     pub ai_base_url: String,
     pub ai_model: String,
-    /// Microsoft app registration (client) ID. Empty = the ID compiled into this build.
-    pub ms_client_id: String,
     /// `"keyboard"`: single-key shortcuts (Superhuman style). `"classic"`: click-first, where only
     /// modifier shortcuts (Ctrl/Cmd+…) stay bound and actions are shown as buttons.
     pub input_mode: String,
@@ -230,7 +228,6 @@ impl Default for Settings {
             ai_enabled: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
             ai_model: "deepseek-v4.1-flash".into(),
-            ms_client_id: String::new(),
             input_mode: "keyboard".into(),
             shortcuts: Default::default(),
             reading_pane: true,

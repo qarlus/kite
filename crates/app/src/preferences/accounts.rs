@@ -176,11 +176,9 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 .flex_col()
                 .gap_1()
                 .child(div().text_size(t.px(13.)).child("No accounts yet"))
-                .child(
-                    div().text_size(t.px(12.)).text_color(t.fg2).child(
-                        "Connect Proton Bridge or Outlook from Connections and your inbox appears here.",
-                    ),
-                )
+                .child(div().text_size(t.px(12.)).text_color(t.fg2).child(
+                    "Sign in to Proton or Outlook from Connections and your inbox appears here.",
+                ))
                 .into_any_element(),
         );
     }
