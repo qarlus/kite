@@ -72,7 +72,8 @@ impl Graph {
             .filter(|s| !s.trim().is_empty())
             .map(str::to_owned)
             .unwrap_or_else(|| {
-                email.split('@')
+                email
+                    .split('@')
                     .next()
                     .unwrap_or(email.as_str())
                     .to_string()
@@ -201,6 +202,10 @@ impl Graph {
         let res = self
             .auth_send(|http, token| http.delete(&url).bearer_auth(token))
             .await?;
+        // A save already in flight when From changed can have deleted this copy itself.
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
+        }
         check(res, "delete draft").await
     }
 

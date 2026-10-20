@@ -1789,24 +1789,45 @@ impl Store {
     /// A move changes a message's remote id; keep the local row pointing at the new one. A draft's
     /// save reports the provider copy's id, which the `drafts` row records instead.
     pub fn op_done(&self, op_id: i64, new_remote_id: Option<String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         if let Some(rid) = new_remote_id {
-            self.conn.execute(
+            let stale: Option<Id> = tx.query_row(
+                "SELECT p.account_id FROM pending_ops p LEFT JOIN drafts d ON d.id=p.draft_id
+                 WHERE p.id=?1 AND p.draft_id IS NOT NULL AND (d.id IS NULL OR d.account_id!=p.account_id)",
+                [op_id], |r| r.get(0),
+            ).optional()?;
+            if let Some(account) = stale {
+                // The save may already have reached the provider when From changed (or the
+                // draft was sent). Its result belongs to the old mailbox and must be removed.
+                tx.execute(
+                    "INSERT INTO pending_ops(account_id, op, at) VALUES (?1,?2,?3)",
+                    params![
+                        account,
+                        json(&Op::DeleteDraft { remote_id: rid })?,
+                        now_ms()
+                    ],
+                )?;
+                tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute(
                 "UPDATE drafts SET remote_id=?1 WHERE 'kite-draft:'||id=(
                    SELECT remote_id FROM messages WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2))",
                 params![rid, op_id],
             )?;
-            self.conn.execute(
+            tx.execute(
                 "UPDATE messages SET remote_id=?1 WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2)
                    AND remote_id NOT LIKE 'kite-draft:%'",
                 params![rid, op_id],
             )?;
-            self.conn.execute(
+            tx.execute(
                 "UPDATE drafts SET remote_id=?1 WHERE id=(SELECT draft_id FROM pending_ops WHERE id=?2)",
                 params![rid, op_id],
             )?;
         }
-        self.conn
-            .execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+        tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1872,11 +1893,14 @@ impl Store {
             )
             .optional()?
             .context("account was removed")?;
+        if let Some(id) = draft.id {
+            rehome_draft(&tx, id, draft.account_id)?;
+        }
         let existing = match draft.id {
             Some(id) => tx
                 .query_row(
-                    "SELECT thread_id, remote_id FROM drafts WHERE id=?1 AND account_id=?2",
-                    params![id, draft.account_id],
+                    "SELECT thread_id, remote_id FROM drafts WHERE id=?1",
+                    [id],
                     |r| Ok((r.get::<_, Option<Id>>(0)?, r.get::<_, Option<String>>(1)?)),
                 )
                 .optional()?,
@@ -1921,6 +1945,13 @@ impl Store {
             "UPDATE drafts SET thread_id=?1 WHERE id=?2",
             params![thread, id],
         )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+             SELECT ?1, tag_id FROM draft_tags WHERE draft_id=?2",
+            params![thread, id],
+        )?;
+        refresh_labels(&tx, thread)?;
+        tx.execute("DELETE FROM draft_tags WHERE draft_id=?1", [id])?;
         refresh_thread(&tx, thread)?;
         // A draft row reads better as its recipients than as its sender (which is always us).
         tx.execute(
@@ -2084,6 +2115,38 @@ impl Store {
     }
 }
 
+/// Account-scoped thread and provider ids cannot follow a draft's From account.
+fn rehome_draft(tx: &Transaction, id: Id, account: Id) -> Result<()> {
+    let old: Option<(Id, Option<String>)> = tx
+        .query_row(
+            "SELECT account_id, remote_id FROM drafts WHERE id=?1 AND account_id!=?2",
+            params![id, account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((old_account, remote)) = old else {
+        return Ok(());
+    };
+    // A deleted message's SQLite row id can be reused by the new account's draft.
+    tx.execute(
+        "UPDATE pending_ops SET message_id=NULL, draft_id=?1 WHERE account_id=?2
+         AND message_id IN (SELECT id FROM messages WHERE account_id=?2 AND remote_id=?3)",
+        params![id, old_account, draft_row_id(id)],
+    )?;
+    hide_draft_row(tx, id)?;
+    tx.execute(
+        "UPDATE drafts SET account_id=?1, thread_id=NULL, remote_id=NULL WHERE id=?2",
+        params![account, id],
+    )?;
+    if let Some(remote_id) = remote {
+        tx.execute(
+            "INSERT INTO pending_ops(account_id, op, at) VALUES (?1,?2,?3)",
+            params![old_account, json(&Op::DeleteDraft { remote_id })?, now_ms()],
+        )?;
+    }
+    Ok(())
+}
+
 fn insert_draft_message(
     tx: &Transaction,
     id: Id,
@@ -2236,6 +2299,11 @@ impl Store {
         // A saved draft leaves the Drafts mailbox the moment it is queued, so sending looks
         // immediate. The row stays for a cancel to restore and a successful send to delete.
         if let Some(id) = draft.id {
+            rehome_draft(&tx, id, draft.account_id)?;
+            tx.execute(
+                "UPDATE drafts SET draft=?1 WHERE id=?2",
+                params![json(draft)?, id],
+            )?;
             hide_draft_row(&tx, id)?;
         }
         tx.execute(

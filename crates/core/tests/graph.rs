@@ -186,8 +186,13 @@ async fn serve(
         headers,
         body,
     };
-    let reply = handler(&call, &base);
-    calls.lock().unwrap().push(call);
+    let reply = tokio::task::spawn_blocking(move || {
+        let reply = handler(&call, &base);
+        calls.lock().unwrap().push(call);
+        reply
+    })
+    .await
+    .unwrap();
     let head = format!(
         "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         reply.status,
@@ -1142,6 +1147,239 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
 }
 
 // -------------------------------------------------------- personal accounts
+
+#[derive(Default)]
+struct SwitchedDraftMailbox {
+    drafts: HashMap<(String, String), Vec<u8>>,
+    sent: Vec<(String, Vec<u8>)>,
+    creates: usize,
+}
+
+async fn wait_for_draft_switch(mut ready: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+    while !ready() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "draft switch did not finish"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn switch_draft_account(pending: bool, save_before_send: bool, tagged: bool) {
+    use kite_core::api::Mail;
+    use kite_core::engine::{Engine, Options, Secrets};
+    use kite_core::model::{Action, Draft, Provider, Settings, View};
+    use kite_core::store::Store;
+    use std::time::Duration;
+
+    let mailbox = Arc::new(Mutex::new(SwitchedDraftMailbox::default()));
+    let server_mailbox = mailbox.clone();
+    let (release, held) = std::sync::mpsc::channel();
+    let held = Mutex::new(held);
+    let fake = Fake::start(move |call, base| {
+        let account = call.header("authorization").unwrap_or_default().to_string();
+        if call.method == "POST" && call.path == "/me/messages" {
+            let id = {
+                let mut state = server_mailbox.lock().unwrap();
+                state.creates += 1;
+                let id = format!("draft-{}", state.creates);
+                state.drafts.insert((account.clone(), id.clone()), STANDARD.decode(&call.body).unwrap());
+                id
+            };
+            if pending && account == "Bearer a" {
+                held.lock().unwrap().recv_timeout(Duration::from_secs(8)).unwrap();
+            }
+            return Reply::json(201, json!({"id":id}));
+        }
+        if call.method == "DELETE" {
+            let id = call.path.strip_prefix("/me/messages/").unwrap().to_string();
+            let removed = server_mailbox.lock().unwrap().drafts.remove(&(account, id));
+            return Reply::empty(if removed.is_some() { 204 } else { 404 });
+        }
+        if call.path == "/me/sendMail" {
+            server_mailbox.lock().unwrap().sent.push((account, STANDARD.decode(&call.body).unwrap()));
+            return Reply::empty(202);
+        }
+        let state = server_mailbox.lock().unwrap();
+        let value = if call.path == "/me/mailFolders/sentitems/messages/delta" {
+            state.sent.iter().filter(|(owner, _)| owner == &account).enumerate().map(|(i, (_, mime))| {
+                let text = String::from_utf8_lossy(mime);
+                let message_id = text.lines().find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("message-id").then(|| value.trim().to_string())
+                }).expect("outgoing Message-ID");
+                json!({"id":format!("sent-{i}"),"internetMessageId":message_id,"internetMessageHeaders":[],
+                    "subject":"Switch account","bodyPreview":"body","body":{"contentType":"text","content":"body"},
+                    "receivedDateTime":"2026-10-20T10:00:00Z","from":{"emailAddress":{"address":"b@example.com"}},
+                    "toRecipients":[{"emailAddress":{"address":"recipient@example.com"}}]})
+            }).collect::<Vec<_>>()
+        } else { Vec::new() };
+        Reply::json(200, json!({"value":value,"@odata.deltaLink":format!("{base}{}",call.path)}))
+    }).await;
+    let dir = temp_dir::TempDir::new("draft-account-switch");
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    let a = store
+        .add_account(Provider::Microsoft, "a@example.com", "A")
+        .unwrap();
+    let b = store
+        .add_account(Provider::Microsoft, "b@example.com", "B")
+        .unwrap();
+    store
+        .set_settings(Settings {
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .unwrap();
+    let secrets = [(&a, "a"), (&b, "b")]
+        .into_iter()
+        .map(|(account, token)| {
+            (
+                format!("ms:{}", account.id),
+                serde_json::to_string(&Tokens {
+                    access: token.into(),
+                    refresh: "refresh".into(),
+                    expires_at: auth::now_ms() + 3_600_000,
+                })
+                .unwrap(),
+            )
+        })
+        .collect();
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(secrets)),
+        Options {
+            graph_base_url: Some(fake.base.clone()),
+            graph_authority: Some(fake.base.clone()),
+            poll: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut draft = Draft {
+        account_id: a.id,
+        to: vec![Addr {
+            name: String::new(),
+            email: "recipient@example.com".into(),
+        }],
+        subject: "Switch account".into(),
+        body: "body".into(),
+        ..Default::default()
+    };
+    draft.id = Some(engine.save_draft(draft.clone()).unwrap());
+    wait_for_draft_switch(|| mailbox.lock().unwrap().creates == 1).await;
+    if !pending {
+        wait_for_draft_switch(|| store.pending_ops(a.id, i64::MAX, 100).unwrap().is_empty()).await;
+    }
+    let view = |account, mailbox| View {
+        account_id: Some(account),
+        mailbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let old_thread = engine.threads(&view(a.id, Mailbox::Drafts), 0, 10).unwrap()[0].id;
+    if tagged {
+        engine
+            .act(
+                &[old_thread],
+                &Action::Label {
+                    tag: "Urgent".into(),
+                },
+            )
+            .unwrap();
+    }
+    draft.account_id = b.id;
+    if save_before_send {
+        assert_eq!(engine.save_draft(draft.clone()).unwrap(), draft.id.unwrap());
+        assert!(
+            engine
+                .threads(&view(a.id, Mailbox::Drafts), 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let rows = engine.threads(&view(b.id, Mailbox::Drafts), 0, 10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].account_id, b.id, "threads belong to one account");
+        assert_eq!(engine.draft(rows[0].id).unwrap().unwrap().account_id, b.id);
+        if tagged {
+            assert_eq!(rows[0].labels, vec!["Urgent"]);
+        }
+        if !pending {
+            wait_for_draft_switch(|| {
+                let state = mailbox.lock().unwrap();
+                state.drafts.len() == 1
+                    && state.drafts.keys().all(|(owner, _)| owner == "Bearer b")
+                    && store.pending_ops(b.id, i64::MAX, 100).unwrap().is_empty()
+            })
+            .await;
+            assert!(fake.calls().iter().any(|c| c.method == "DELETE"
+                && c.path == "/me/messages/draft-1"
+                && c.header("authorization") == Some("Bearer a")));
+            assert!(!fake.calls().iter().any(|c| c.method == "DELETE"
+                && c.path == "/me/messages/draft-1"
+                && c.header("authorization") == Some("Bearer b")));
+        }
+    }
+    engine.send(draft).unwrap();
+    if pending {
+        release.send(()).unwrap();
+    }
+    wait_for_draft_switch(|| {
+        let state = mailbox.lock().unwrap();
+        state.sent.len() == 1
+            && state.drafts.is_empty()
+            && store.pending_ops(a.id, i64::MAX, 100).unwrap().is_empty()
+            && store.pending_ops(b.id, i64::MAX, 100).unwrap().is_empty()
+    })
+    .await;
+    assert_eq!(mailbox.lock().unwrap().sent[0].0, "Bearer b");
+    assert!(
+        engine
+            .threads(&view(a.id, Mailbox::Drafts), 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        engine
+            .threads(&view(b.id, Mailbox::Drafts), 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    wait_for_draft_switch(|| {
+        !engine
+            .threads(&view(b.id, Mailbox::Sent), 0, 10)
+            .unwrap()
+            .is_empty()
+    })
+    .await;
+    let sent = engine.threads(&view(b.id, Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(sent.len(), 1);
+    if tagged {
+        assert_eq!(sent[0].labels, vec!["Urgent"]);
+    }
+    drop(engine);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_account_switch_creates_in_b_and_deletes_old_account_copy() {
+    switch_draft_account(false, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_account_switch_during_pending_save_sends_from_b_without_orphan() {
+    switch_draft_account(true, true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_account_switch_preserves_tags_on_sent_copy() {
+    switch_draft_account(false, false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn draft_account_switch_preserves_tags_through_autosave_and_send() {
+    switch_draft_account(false, true, true).await;
+}
 
 /// A personal Microsoft account answers `/me` with no `mail` and often no `displayName`;
 /// the MSA address arrives as `userPrincipalName`.
