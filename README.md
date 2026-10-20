@@ -113,3 +113,7 @@ git push origin v0.2.0
 
 - [Product spec](docs/SPEC.md) · [Design](docs/DESIGN.md) · [Architecture](docs/ARCHITECTURE.md)
 - [Contributor and agent guide](AGENTS.md)
+
+## License
+
+Kite is open source under the [MIT License](LICENSE).
