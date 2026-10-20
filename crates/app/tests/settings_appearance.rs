@@ -1,11 +1,12 @@
 //! Appearance: the theme gallery, typography and its live preview, through the real view.
 mod common;
 use common::{Fixture, mount, read_settings, update_content};
-use gpui_kit::test::TestWindowExt;
-use gpui_kit::{AppContext, ScrollDelta, TestAppContext, point, px};
+use gpui_kit::base::Root;
+use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+use gpui_kit::{AppContext, ScrollDelta, TestAppContext, WindowHandle, point, px};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 struct TempFile(PathBuf);
 impl TempFile {
@@ -33,6 +34,23 @@ impl Drop for TempFile {
 /// The resolved system font, which is what the preview names when no family is chosen.
 fn system_font() -> String {
     kite::theme::FONT.to_string()
+}
+
+/// Opens the font picker, types a query, and confirms the first match with the keyboard.
+async fn pick_font(window: WindowHandle<Root>, cx: &mut TestAppContext, query: &str) {
+    cx.update_window(window.into(), |_, window, cx| {
+        window.within("font-family").click("input", cx);
+        window.input(query, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    // Select commits through defer_in after the key dispatch returns.
+    cx.wait_for(window.into(), Duration::from_millis(500), |window, _| {
+        window.find("font-family").expanded() == Some(false)
+    })
+    .await;
 }
 
 #[gpui_kit::test]
@@ -85,6 +103,9 @@ fn choosing_a_theme_and_a_larger_text_size_persists_across_a_reopen(cx: &mut Tes
 #[gpui_kit::test]
 fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
+    // The headless text system reports no installed fonts; a saved family is the row
+    // the picker has to keep listing, and it is what the preview names.
+    fixture.settings.lock().unwrap().font_family = "Georgia".into();
     let (window, kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
@@ -101,8 +122,11 @@ fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut
             cx,
         );
         window.render_frame(cx);
-        window.click("font-family", cx);
-        window.input("Georgia", cx);
+        assert_eq!(
+            window.find("font-family").value(),
+            Some("Georgia"),
+            "a saved face is the selected value even when it is not installed"
+        );
         window.click("font-color", cx);
         window.input("#d8d8e8", cx);
         // The swatch mirrors the field as it is typed, without applying it.
@@ -156,6 +180,64 @@ fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut
     update_content(window, &kite, cx, |kite, _, _| {
         assert_eq!(kite.colours().0, "#e9e9ee", "Reset returns to Carbon's ink");
     });
+}
+
+#[gpui_kit::test]
+async fn a_font_is_picked_from_the_list_and_system_default_clears_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    // The headless text system installs no fonts, so a saved face is the one extra row:
+    // it has to show as the value and stay pickable instead of crashing.
+    fixture.settings.lock().unwrap().font_family = "Georgia".into();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("font-family").value(), Some("Georgia"));
+        assert_eq!(
+            window.find("typography-preview").label(),
+            Some("Georgia / 14 px")
+        );
+        window.scroll(
+            "settings-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(-480.))),
+            cx,
+        );
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("font-family").expanded(),
+            Some(false),
+            "the picker starts closed"
+        );
+    })
+    .unwrap();
+
+    // Choosing the first row applies it and repaints the preview in the system face.
+    pick_font(window, cx, "system").await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("font-family").value(), Some("System default"));
+        assert_eq!(
+            window.find("typography-preview").label(),
+            Some(format!("{} / 14 px", system_font()).as_str())
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().font_family, "");
+
+    // And picking a named face again saves it straight away.
+    pick_font(window, cx, "geor").await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("font-family").value(), Some("Georgia"));
+        assert_eq!(
+            window.find("typography-preview").label(),
+            Some("Georgia / 14 px")
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().font_family, "Georgia");
 }
 
 #[gpui_kit::test]

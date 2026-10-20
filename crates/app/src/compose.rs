@@ -6,11 +6,12 @@ use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable;
-use gpui_kit::component::button::Button;
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Action as MailAction, Addr, Draft, Id, Message, Ms};
+use kite_core::model::{Account, Action as MailAction, Addr, Draft, Id, Message, Ms, Provider};
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -564,6 +565,37 @@ impl Kite {
             .map(|message| (row.account_id, message.clone()))
     }
 
+    /// Picks the account the draft is sent from; the recipients and body stay untouched.
+    fn set_compose_account(&mut self, account: Id, cx: &mut Context<Self>) {
+        let changed = match &mut self.compose {
+            Some(compose) if compose.account_id != account => {
+                compose.account_id = account;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.compose_changed(cx);
+        }
+    }
+
+    /// Reveals a recipient field from the To row's quiet toggle, with the caret in it.
+    fn reveal_recipient(&mut self, field: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(compose) = &mut self.compose else {
+            return;
+        };
+        let input = if field == 1 {
+            compose.show_cc = true;
+            compose.cc.clone()
+        } else {
+            compose.show_bcc = true;
+            compose.bcc.clone()
+        };
+        let handle = input.read(cx).focus_handle(cx);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
     fn focus_compose(&self, window: &mut Window, cx: &mut Context<Self>, to: bool) {
         let Some(compose) = &self.compose else {
             return;
@@ -626,6 +658,7 @@ impl Kite {
         let errors = compose.recipient_errors.clone();
         let expanded = compose.expanded;
         let title = compose.title;
+        let from_id = compose.account_id;
         let ai = match &self.ai {
             Some(ai) if matches!(ai.target, crate::app::AiFor::Compose) => {
                 Some((ai.text.clone(), ai.done))
@@ -639,6 +672,7 @@ impl Kite {
         } else {
             ""
         };
+        let (send_ink, send_hover) = send_colors(&t);
         let pane_left = crate::sidebar::width(window);
         let pane_width = (window.viewport_size().width.as_f32() - pane_left).max(0.);
         let available_height = (window.viewport_size().height.as_f32() - BAR_H).max(0.);
@@ -720,64 +754,39 @@ impl Kite {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
-                        .child(field_row(&t, "To", &to, "compose-to", "To"))
+                        .when_some(from_row(&t, &self.accounts, from_id, cx), |d, row| {
+                            d.child(row)
+                        })
+                        .child(field_row(
+                            &t,
+                            "To",
+                            &to,
+                            "compose-to",
+                            "To",
+                            recipient_toggles(&t, show_cc, show_bcc, cx),
+                        ))
                         .when_some(errors[0].clone(), |d, error| {
                             d.child(recipient_error(&t, "compose-to-error", error))
                         })
                         .when(show_cc, |d| {
-                            d.child(field_row(&t, "Cc", &cc, "compose-cc", "Cc"))
+                            d.child(field_row(&t, "Cc", &cc, "compose-cc", "Cc", None))
                                 .when_some(errors[1].clone(), |d, error| {
                                     d.child(recipient_error(&t, "compose-cc-error", error))
                                 })
                         })
                         .when(show_bcc, |d| {
-                            d.child(field_row(&t, "Bcc", &bcc, "compose-bcc", "Bcc"))
+                            d.child(field_row(&t, "Bcc", &bcc, "compose-bcc", "Bcc", None))
                                 .when_some(errors[2].clone(), |d, error| {
                                     d.child(recipient_error(&t, "compose-bcc-error", error))
                                 })
                         })
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .justify_end()
-                                .px_4()
-                                .gap_3()
-                                .when(!show_bcc, |d| {
-                                    d.child(
-                                        Button::new("compose-show-bcc")
-                                            .label("Bcc")
-                                            .accessibility_label("Show Bcc")
-                                            .small()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(compose) = &mut this.compose {
-                                                    compose.show_bcc = true;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                })
-                                .when(!show_cc, |d| {
-                                    d.child(
-                                        Button::new("compose-show-cc")
-                                            .label("Cc")
-                                            .accessibility_label("Show Cc")
-                                            .small()
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(compose) = &mut this.compose {
-                                                    compose.show_cc = true;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                }),
-                        )
                         .child(field_row(
                             &t,
                             "Subject",
                             &subject,
                             "compose-subject",
                             "Subject",
+                            None,
                         ))
                         .when_some(ai, |d, (text, done)| {
                             d.child(
@@ -859,9 +868,10 @@ impl Kite {
                 .child(
                     div()
                         .flex()
-                        .flex_col()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
                         .flex_shrink_0()
-                        .gap_2()
                         .px_4()
                         .py_3()
                         .border_t_1()
@@ -870,20 +880,31 @@ impl Kite {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_3()
-                                .child(div().text_size(t.px(11.)).text_color(t.fg3).child(
-                                    match keys::hint_for(&self.settings, keys::cmd::COMPOSE_CLOSE) {
-                                        hint if hint.is_empty() => {
-                                            "Closing keeps this draft".to_string()
-                                        }
-                                        hint => format!("{hint} keeps this draft"),
-                                    },
-                                ))
+                                .gap_2()
+                                .min_w_0()
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_size(t.px(11.))
+                                        .text_color(t.fg3)
+                                        .child(
+                                            match keys::hint_for(
+                                                &self.settings,
+                                                keys::cmd::COMPOSE_CLOSE,
+                                            ) {
+                                                hint if hint.is_empty() => {
+                                                    "Closing keeps this draft".to_string()
+                                                }
+                                                hint => format!("{hint} keeps this draft"),
+                                            },
+                                        ),
+                                )
                                 .child(
                                     div()
                                         .id("compose-status")
                                         .test_support()
                                         .aria_label(status.to_string())
+                                        .flex_shrink_0()
                                         .text_size(t.px(11.))
                                         .text_color(t.fg3)
                                         .child(status),
@@ -893,16 +914,19 @@ impl Kite {
                             div()
                                 .flex()
                                 .items_center()
-                                .gap_3()
+                                .gap_2()
+                                .flex_shrink_0()
                                 .child(
                                     Button::new("compose-discard")
-                                        .label("Discard")
+                                        .icon(IconName::Trash)
                                         .tooltip(format!(
                                             "Discard - {}",
                                             keys::hint_for(&self.settings, keys::cmd::DISCARD)
                                         ))
                                         .accessibility_label("Discard draft")
                                         .small()
+                                        .ghost()
+                                        .text_color(t.fg2)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.discard_compose(window, cx)
                                         })),
@@ -910,26 +934,47 @@ impl Kite {
                                 .child(
                                     Button::new("compose-send-later")
                                         .label("Send later")
+                                        .tooltip(format!(
+                                            "Send later - {}",
+                                            keys::hint_for(&self.settings, keys::cmd::SEND_LATER)
+                                        ))
                                         .accessibility_label("Send later")
                                         .small()
+                                        .ghost()
+                                        .text_color(t.fg2)
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.schedule_send(window, cx)
                                         })),
                                 )
                                 .child(
-                                    Button::new("compose-send")
-                                        .label("Send")
-                                        .tooltip(format!(
-                                            "Send - {}",
-                                            keys::hint_for(&self.settings, keys::cmd::SEND)
-                                        ))
-                                        .accessibility_label("Send")
-                                        .small()
-                                        .bg(theme::accent_glow(&t))
-                                        .text_color(t.fg)
-                                        .on_click(cx.listener(|this, _, window, cx| {
-                                            this.send_compose(window, cx)
-                                        })),
+                                    // The accent fill lives on the wrapper: the component's
+                                    // custom variant paints only a tint of its colour.
+                                    div()
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .rounded(px(RADIUS))
+                                        .bg(t.accent)
+                                        .child(
+                                            Button::new("compose-send")
+                                                .label("Send")
+                                                .tooltip(format!(
+                                                    "Send - {}",
+                                                    keys::hint_for(&self.settings, keys::cmd::SEND)
+                                                ))
+                                                .accessibility_label("Send")
+                                                .small()
+                                                .font_weight(FontWeight(500.))
+                                                .custom(
+                                                    ButtonCustomVariant::new(cx)
+                                                        .color(transparent_black())
+                                                        .foreground(send_ink)
+                                                        .hover(send_hover)
+                                                        .active(send_hover),
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.send_compose(window, cx)
+                                                })),
+                                        ),
                                 ),
                         ),
                 )
@@ -938,13 +983,8 @@ impl Kite {
     }
 }
 
-fn field_row(
-    t: &Theme,
-    label: &'static str,
-    input: &Entity<InputState>,
-    id: &'static str,
-    aria: &'static str,
-) -> AnyElement {
+/// One compose field: the shared label column, then the caller's content.
+fn field(t: &Theme, label: &'static str, content: AnyElement) -> AnyElement {
     div()
         .flex()
         .flex_shrink_0()
@@ -962,17 +1002,172 @@ fn field_row(
                 .text_color(t.fg3)
                 .child(label),
         )
-        .child(
-            Input::new(input)
-                .id(id)
-                .aria_label(aria)
-                .appearance(false)
-                .bordered(false)
-                .text_size(t.px(14.))
-                .text_color(t.fg)
-                .w_full(),
-        )
+        .child(content)
         .into_any_element()
+}
+
+fn field_row(
+    t: &Theme,
+    label: &'static str,
+    input: &Entity<InputState>,
+    id: &'static str,
+    aria: &'static str,
+    trailing: Option<AnyElement>,
+) -> AnyElement {
+    field(
+        t,
+        label,
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div().flex_1().min_w_0().child(
+                    Input::new(input)
+                        .id(id)
+                        .aria_label(aria)
+                        .appearance(false)
+                        .bordered(false)
+                        .text_size(t.px(14.))
+                        .text_color(t.fg)
+                        .w_full(),
+                ),
+            )
+            .when_some(trailing, |d, trailing| d.child(trailing))
+            .into_any_element(),
+    )
+}
+
+/// The sending identity: a dropdown over every account, or plain text when there is only one.
+fn from_row(t: &Theme, accounts: &[Account], from: Id, cx: &Context<Kite>) -> Option<AnyElement> {
+    let account = accounts.iter().find(|account| account.id == from)?;
+    let identity = from_identity(account);
+    let address = account.email.clone();
+    let content = if accounts.len() > 1 {
+        let entity = cx.entity().downgrade();
+        let choices: Vec<(Id, String)> = accounts
+            .iter()
+            .map(|account| (account.id, from_choice(account)))
+            .collect();
+        let current = account.id;
+        Button::new("compose-from")
+            .label(identity)
+            .dropdown_caret(true)
+            .ghost()
+            .accessibility_label(address)
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu.min_w(px(280.));
+                for (id, label) in &choices {
+                    let entity = entity.clone();
+                    let id = *id;
+                    menu = menu.item(
+                        PopupMenuItem::new(label.clone())
+                            .checked(id == current)
+                            .on_click(move |_, _, cx| {
+                                let _ =
+                                    entity.update(cx, |kite, cx| kite.set_compose_account(id, cx));
+                            }),
+                    );
+                }
+                menu
+            })
+            .into_any_element()
+    } else {
+        div()
+            .id("compose-from")
+            .test_support()
+            .aria_label(address)
+            .flex()
+            .items_center()
+            .h(px(32.))
+            .min_w_0()
+            .truncate()
+            .text_size(t.px(14.))
+            .text_color(t.fg)
+            .child(identity)
+            .into_any_element()
+    };
+    Some(field(t, "From", content))
+}
+
+/// `Name <email>`, or just the address when the account has no name.
+fn from_identity(account: &Account) -> String {
+    let name = account.name.trim();
+    if name.is_empty() {
+        account.email.clone()
+    } else {
+        format!("{name} <{}>", account.email)
+    }
+}
+
+/// The menu row for an account: who it is, then the provider that carries it.
+fn from_choice(account: &Account) -> String {
+    let provider = match account.provider {
+        Provider::Proton => "Proton Mail",
+        Provider::Microsoft => "Microsoft Outlook",
+    };
+    format!("{} · {provider}", from_identity(account))
+}
+
+/// The quiet `Cc` / `Bcc` toggles that close the To row, gone once their field shows.
+fn recipient_toggles(
+    t: &Theme,
+    show_cc: bool,
+    show_bcc: bool,
+    cx: &mut Context<Kite>,
+) -> Option<AnyElement> {
+    if show_cc && show_bcc {
+        return None;
+    }
+    let cc = cx.listener(|this, _, window, cx| this.reveal_recipient(1, window, cx));
+    let bcc = cx.listener(|this, _, window, cx| this.reveal_recipient(2, window, cx));
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap_3()
+            .when(!show_cc, |d| {
+                d.child(recipient_toggle(t, "compose-show-cc", "Cc", cc))
+            })
+            .when(!show_bcc, |d| {
+                d.child(recipient_toggle(t, "compose-show-bcc", "Bcc", bcc))
+            })
+            .into_any_element(),
+    )
+}
+
+fn recipient_toggle(
+    t: &Theme,
+    id: &'static str,
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label(format!("Show {label}"))
+        .role(Role::Button)
+        .flex_shrink_0()
+        .cursor_pointer()
+        .text_size(t.px(12.))
+        .text_color(t.fg3)
+        .hover(|s| s.text_color(t.fg))
+        .on_click(on_click)
+        .child(label)
+        .into_any_element()
+}
+
+/// The ink that reads against the accent, and the veil that hovers over it: the
+/// tint moves away from the ink, so the label keeps its contrast on hover.
+fn send_colors(t: &Theme) -> (Hsla, Hsla) {
+    let (ink, away) = if theme::contrast(t.fg, t.accent) > theme::contrast(t.bg, t.accent) {
+        (t.fg, t.bg)
+    } else {
+        (t.bg, t.fg)
+    };
+    (ink.into(), Theme::alpha(away, 0.12))
 }
 
 /// `"Doe, Jane" <jane@example.com>, other@example.com`, as the fields hold it.

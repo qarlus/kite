@@ -1062,3 +1062,184 @@ fn closing_an_incomplete_draft_preserves_recipient_fields(cx: &mut TestAppContex
     assert_eq!(saved[0].cc, vec![addr("", "cc@")]);
     assert_eq!(saved[0].bcc, vec![addr("", "bcc@")]);
 }
+
+// ---- compose chrome ---------------------------------------------------------
+
+#[gpui_kit::test]
+fn the_cc_and_bcc_toggles_close_the_to_row_instead_of_adding_a_strip(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let to = window.find("compose-to").bounds();
+        let subject = window.find("compose-subject").bounds();
+        let cc = window.find("compose-show-cc").bounds();
+        let bcc = window.find("compose-show-bcc").bounds();
+        for (id, bounds) in [("compose-show-cc", cc), ("compose-show-bcc", bcc)] {
+            assert!(
+                bounds.center().y > to.origin.y && bounds.center().y < to.bottom_right().y,
+                "{id} sits on the To row, not on a strip under it"
+            );
+            assert!(
+                bounds.origin.x > to.origin.x,
+                "{id} is at the end of the To row"
+            );
+        }
+        assert!(cc.bottom_right().x < bcc.origin.x, "Cc comes before Bcc");
+        let gap = subject.origin.y - to.bottom_right().y;
+        assert!(
+            gap <= gpui_kit::px(20.),
+            "no row sits between To and Subject while the toggles are hidden (gap {gap:?})"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn clicking_cc_reveals_the_field_under_to_with_the_caret_in_it(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("compose-cc").is_none());
+        window.click("compose-show-cc", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("compose-show-cc").is_none(),
+            "the toggle goes once its field shows"
+        );
+        assert!(
+            window.try_find("compose-show-bcc").is_some(),
+            "Bcc stays one click away"
+        );
+        let to = window.find("compose-to").bounds();
+        let cc = window.find("compose-cc").bounds();
+        let subject = window.find("compose-subject").bounds();
+        assert!(cc.origin.y >= to.bottom_right().y, "Cc sits under To");
+        assert!(
+            cc.bottom_right().y <= subject.origin.y,
+            "Cc sits above Subject"
+        );
+        assert_eq!(
+            window.find("compose-cc").focused(),
+            Some(true),
+            "the revealed field takes the caret"
+        );
+        window.input("carol@example.com", cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("compose-cc").value(),
+            Some("carol@example.com"),
+            "typing goes into Cc"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn send_is_the_rightmost_action_on_the_footer_row(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let compose = window.find("compose").bounds();
+        let discard = window.find("compose-discard").bounds();
+        let later = window.find("compose-send-later").bounds();
+        let send = window.find("compose-send").bounds();
+        assert!(
+            discard.bottom_right().x < later.origin.x,
+            "Discard comes before Send later"
+        );
+        assert!(
+            later.bottom_right().x < send.origin.x,
+            "Send is the rightmost action"
+        );
+        assert!(
+            send.bottom_right().x > compose.bottom_right().x - gpui_kit::px(24.),
+            "Send sits at the footer's right edge"
+        );
+        for (id, bounds) in [("compose-discard", discard), ("compose-send-later", later)] {
+            assert!(
+                (bounds.center().y - send.center().y).abs() <= gpui_kit::px(1.),
+                "{id} shares Send's row"
+            );
+            assert_eq!(
+                bounds.size.height, send.size.height,
+                "{id} is the same height as Send"
+            );
+        }
+    })
+    .unwrap();
+}
+
+// ---- the sending account ----------------------------------------------------
+
+#[gpui_kit::test]
+fn a_reply_starts_from_the_threads_account_and_can_send_from_another(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let other = fixture.add_microsoft().unwrap();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), "r");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("compose-from").label(),
+            Some("me@example.com"),
+            "a reply is sent from the account the thread belongs to"
+        );
+        window.click("compose-from", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("popup-menu").is_some(),
+            "two accounts make From a dropdown"
+        );
+        window.within("popup-menu").click(1usize, cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("compose-from").label(),
+            Some(other.email.as_str()),
+            "the menu switched the sending account"
+        );
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].account_id, other.id,
+        "the mail goes out as the chosen account"
+    );
+    assert_eq!(
+        sent[0].to,
+        vec![addr("Sender 1", "sender1@example.com")],
+        "switching From leaves the recipients alone"
+    );
+    assert_eq!(sent[0].subject, "Re: Subject 1");
+    assert!(sent[0].body.contains("> Plain body for thread 1"));
+}
+
+#[gpui_kit::test]
+fn one_account_shows_the_from_row_without_a_dropdown(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("compose-from").label(),
+            Some("me@example.com"),
+            "the only account is named in the From row"
+        );
+        window.click("compose-from", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("popup-menu").is_none(),
+            "one account leaves nothing to choose"
+        );
+    })
+    .unwrap();
+}

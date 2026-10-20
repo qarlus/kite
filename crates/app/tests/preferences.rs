@@ -229,24 +229,46 @@ async fn an_unreadable_import_keeps_the_current_theme_and_shows_a_visible_error(
 }
 
 #[gpui_kit::test]
-fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
+async fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
     cx: &mut TestAppContext,
 ) {
     let fixture = Fixture::showcase();
+    // A saved face is the row the font picker has to show: the headless text system
+    // installs no fonts of its own.
+    fixture.settings.lock().unwrap().font_family = "Georgia".into();
     let (window, kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(("settings-tab", 1usize), cx);
         window.render_frame(cx);
+        assert_eq!(window.find("font-family").value(), Some("Georgia"));
         window.scroll(
             "settings-scroll",
             ScrollDelta::Pixels(point(px(0.), px(-480.))),
             cx,
         );
         window.render_frame(cx);
-        window.click("font-family", cx);
-        window.input("Georgia", cx);
+        // System default is the picker's first row, and it applies on confirm.
+        window.within("font-family").click("input", cx);
+        window.input("system", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| window.press("enter", cx))
+        .unwrap();
+    // Select commits through defer_in after the key dispatch returns.
+    cx.wait_for(window.into(), Duration::from_millis(500), |window, _| {
+        window.find("font-family").expanded() == Some(false)
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("typography-preview").label(),
+            Some(format!("{} / 14 px", kite::theme::FONT).as_str()),
+            "picking System default clears the family at once"
+        );
         window.click("font-color", cx);
         window.input("#d8d8e8", cx);
         window.scroll(
@@ -259,7 +281,7 @@ fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
         window.render_frame(cx);
         assert_eq!(
             window.find("typography-preview").label(),
-            Some("Georgia / 14 px")
+            Some(format!("{} / 14 px", kite::theme::FONT).as_str())
         );
         window.click("font-color", cx);
         window.press("secondary-a", cx);
@@ -281,6 +303,7 @@ fn typography_is_applied_and_bad_contrast_is_rejected_without_changing_mail(
         );
     })
     .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().font_family, "");
     assert_eq!(
         fixture.settings.lock().unwrap().font_color.as_deref(),
         Some("#d8d8e8")
