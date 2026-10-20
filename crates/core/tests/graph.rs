@@ -237,6 +237,441 @@ fn dial(redirect: &str) -> String {
 
 // ------------------------------------------------------------------- sync
 
+fn full_message(id: &str) -> Value {
+    json!({"id":id,"subject":"Delivery report","from":{"emailAddress":{"address":"sender@example.com"}},
+        "toRecipients":[],"receivedDateTime":"2026-10-20T10:00:00Z","isRead":false,
+        "flag":{"flagStatus":"notFlagged"},"importance":"normal",
+        "body":{"contentType":"text","content":"message body"},"internetMessageHeaders":[],
+        "internetMessageId":format!("<{id}@example.com>")})
+}
+
+#[tokio::test]
+async fn partial_deltas_round_trip_flags_without_read_actions_changing_them() {
+    use kite_core::model::{Action, Provider, View};
+    use kite_core::store::Store;
+    let remote = Arc::new(Mutex::new(full_message("flags")));
+    remote.lock().unwrap()["flag"]["flagStatus"] = json!("flagged");
+    let server = remote.clone();
+    let fake = Fake::start(move |c, base| {
+        if c.path == "/me/messages/flags" {
+            if c.method == "PATCH" {
+                let patch = c.json();
+                let mut message = server.lock().unwrap();
+                for (key, value) in patch.as_object().unwrap() {
+                    message[key] = value.clone();
+                }
+                return Reply::empty(200);
+            }
+            return Reply::json(200, server.lock().unwrap().clone());
+        }
+        Reply::json(
+            200,
+            json!({"value":if c.path.contains("/inbox/") {
+            vec![json!({"id":"flags","isRead":server.lock().unwrap()["isRead"]})]
+        } else {vec![]},"@odata.deltaLink":format!("{base}{}",c.path)}),
+        )
+    })
+    .await;
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    let view = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Inbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let mut g = graph(&fake);
+    let (deltas, mut cursor) = g.sync(None).await.unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let thread = store.threads(&view, 0, 10).unwrap()[0].id;
+    assert!(
+        store.threads(&view, 0, 10).unwrap()[0].starred,
+        "Outlook flag survives partial delta"
+    );
+    for (action, starred, is_read) in [
+        (Action::Read, true, true),
+        (Action::Unstar, false, true),
+        (Action::Star, true, true),
+        (Action::Unread, true, false),
+    ] {
+        store.act(&[thread], &action).unwrap();
+        for (id, op) in store.pending_ops(account.id, i64::MAX, 100).unwrap() {
+            g.apply(&op).await.unwrap();
+            store.op_done(id, None).unwrap();
+        }
+        assert_eq!(
+            remote.lock().unwrap()["flag"]["flagStatus"],
+            if starred { "flagged" } else { "notFlagged" }
+        );
+        assert_eq!(remote.lock().unwrap()["isRead"], is_read);
+        let (deltas, next) = g.sync(Some(cursor)).await.unwrap();
+        cursor = next;
+        store.apply_deltas(account.id, &deltas).unwrap();
+        let row = &store.threads(&view, 0, 10).unwrap()[0];
+        assert_eq!(row.starred, starred);
+        assert_eq!(row.unread, !is_read);
+        assert_eq!(store.thread(thread).unwrap()[0].text, "message body");
+    }
+    let patches: Vec<_> = fake
+        .path("/me/messages/flags")
+        .into_iter()
+        .filter(|c| c.method == "PATCH")
+        .collect();
+    assert_eq!(patches[0].json(), json!({"isRead":true}));
+    assert_eq!(patches[3].json(), json!({"isRead":false}));
+}
+
+#[tokio::test]
+async fn importance_uses_priority_and_repairs_legacy_cursor_once() {
+    use kite_core::model::{Provider, View};
+    use kite_core::store::Store;
+    let fake=Fake::start(|c,base| {
+        let items=if c.path=="/me/mailFolders/inbox/messages/delta" {
+            [("normal","focused"),("high","other"),("low","focused")].into_iter().map(|(priority,classification)| {
+                let mut item=full_message(priority); item["importance"]=json!(priority);
+                item["inferenceClassification"]=json!(classification); item
+            }).collect::<Vec<_>>()
+        } else {vec![]};
+        Reply::json(200,json!({"value":items,"@odata.deltaLink":format!("{base}/current/{}",c.path.split('/').nth(3).unwrap_or("empty"))}))
+    }).await;
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    let mut g = graph(&fake);
+    let (first, _) = g.sync(None).await.unwrap();
+    let mut legacy = upsert(&first, "normal").clone();
+    legacy.important = Some(true);
+    legacy.starred = true;
+    legacy.text.clear();
+    legacy.date = 0;
+    store
+        .apply_deltas(account.id, &[Delta::Upsert(Box::new(legacy))])
+        .unwrap();
+    let (fixed, cursor) = g
+        .sync(Some(
+            json!({"inbox":format!("{}/legacy",fake.base)}).to_string(),
+        ))
+        .await
+        .unwrap();
+    store.apply_deltas(account.id, &fixed).unwrap();
+    assert_eq!(upsert(&fixed, "normal").important, Some(false));
+    assert_eq!(upsert(&fixed, "high").important, Some(true));
+    assert_eq!(upsert(&fixed, "low").important, Some(false));
+    let view = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Inbox,
+        split: None,
+        query: Some("is:important".into()),
+        folder: None,
+    };
+    let rows = store.threads(&view, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        store
+            .reply_context(store.thread(rows[0].id).unwrap()[0].id)
+            .unwrap()
+            .unwrap()
+            .message_id_header,
+        "<high@example.com>"
+    );
+    let repaired = &store
+        .threads(
+            &View {
+                query: None,
+                ..view
+            },
+            0,
+            10,
+        )
+        .unwrap()
+        .into_iter()
+        .find(|row| {
+            store
+                .reply_context(store.thread(row.id).unwrap()[0].id)
+                .unwrap()
+                .unwrap()
+                .message_id_header
+                == "<normal@example.com>"
+        })
+        .unwrap();
+    assert!(!repaired.important);
+    assert!(!repaired.starred);
+    assert!(repaired.date > 0);
+    assert_eq!(store.thread(repaired.id).unwrap()[0].text, "message body");
+    assert!(fake.path("/legacy").is_empty());
+    assert!(fake.calls().iter().all(|c| c.method == "GET"));
+    let count = fake.path("/me/mailFolders/inbox/messages/delta").len();
+    g.sync(Some(cursor)).await.unwrap();
+    assert_eq!(
+        fake.path("/me/mailFolders/inbox/messages/delta").len(),
+        count,
+        "reset only once"
+    );
+}
+
+#[tokio::test]
+async fn delivery_reports_use_sender_date_and_body_fallbacks_in_the_store() {
+    use kite_core::model::{Provider, View};
+    use kite_core::store::Store;
+    let fake=Fake::start(|c,base| {
+        if let Some(id)=c.path.strip_prefix("/me/messages/") {
+            let mut item=full_message(id); item["from"]=Value::Null; item["receivedDateTime"]=Value::Null; item["body"]=Value::Null;
+            item["sender"]=json!({"emailAddress":{"name":"Microsoft Exchange","address":"exchange@example.com"}});
+            let date=match id {"sent"=>Some("sentDateTime"),"created"=>Some("createdDateTime"),"modified"=>Some("lastModifiedDateTime"),_=>None};
+            if let Some(date)=date {item[date]=json!("2026-10-20T10:00:00Z");}
+            if id=="sent" {item["uniqueBody"]=json!({"contentType":"html","content":"<p>Delivery failed &amp; retry</p>"});}
+            else {item["bodyPreview"]=json!("Delivery failed & retry");}
+            return Reply::json(200,item);
+        }
+        Reply::json(200,json!({"value":if c.path.contains("/junkemail/") {
+            ["sent","created","modified","unknown"].map(|id|json!({"id":id})).to_vec()
+        } else {vec![]},"@odata.deltaLink":format!("{base}{}",c.path)}))
+    }).await;
+    let before = auth::now_ms();
+    let (deltas, _) = graph(&fake).sync(None).await.unwrap();
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let rows = store
+        .threads(
+            &View {
+                account_id: Some(account.id),
+                mailbox: Mailbox::Spam,
+                split: None,
+                query: None,
+                folder: None,
+            },
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 4);
+    for row in rows {
+        let messages = store.thread(row.id).unwrap();
+        let m = &messages[0];
+        assert_eq!(m.from.email, "exchange@example.com");
+        assert_eq!(m.from.name, "Microsoft Exchange");
+        assert_eq!(m.text, "Delivery failed & retry");
+        assert!(m.date > 0);
+    }
+    for id in ["sent", "created", "modified"] {
+        assert_eq!(upsert(&deltas, id).date, 1_792_490_400_000);
+    }
+    assert!(upsert(&deltas, "unknown").date >= before);
+    assert!(fake.path("/me/messages/sent")[0].query_pairs()["$select"].contains("uniqueBody"));
+}
+
+#[tokio::test]
+async fn failed_partial_message_fetch_does_not_advance_or_overwrite_mail() {
+    let fake = Fake::start(|c, base| {
+        if c.path == "/me/messages/broken" {
+            return Reply::empty(503);
+        }
+        Reply::json(
+            200,
+            json!({"value":[{"id":"broken"}],"@odata.deltaLink":format!("{base}/next")}),
+        )
+    })
+    .await;
+    assert!(graph(&fake).sync(None).await.is_err());
+}
+
+#[tokio::test]
+async fn json_send_uses_exchange_headers_and_escapes_utf8_html_and_recipients() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/messages") => Reply::json(
+            201,
+            json!({"id":"authored","internetMessageId":"<exchange@example.com>"}),
+        ),
+        ("POST", "/me/messages/authored/send") => Reply::empty(202),
+        _ => Reply::empty(404),
+    })
+    .await;
+    let mime = mail_builder::MessageBuilder::new()
+        .from(("Karl Jönes", "me@example.com"))
+        .to(("Zoë", "to@example.com"))
+        .cc(("Carbon", "cc@example.com"))
+        .bcc(("Blind", "bcc@example.com"))
+        .subject("Kite Outlook Test ✓")
+        .message_id("custom@example.com")
+        .text_body("café & <tag>\nsecond line")
+        .write_to_vec()
+        .unwrap();
+    graph(&fake).apply(&Op::Send { mime }).await.unwrap();
+    let call = &fake.path("/me/messages")[0];
+    let message = call.json();
+    assert_eq!(call.header("content-type"), Some("application/json"));
+    assert_eq!(message["subject"], "Kite Outlook Test ✓");
+    assert_eq!(message["body"]["contentType"], "HTML");
+    assert!(
+        message["body"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("café &amp; &lt;tag&gt;<br>second line")
+    );
+    assert_eq!(
+        message["toRecipients"][0]["emailAddress"],
+        json!({"name":"Zoë","address":"to@example.com"})
+    );
+    assert_eq!(
+        message["ccRecipients"][0]["emailAddress"]["address"],
+        "cc@example.com"
+    );
+    assert_eq!(
+        message["bccRecipients"][0]["emailAddress"]["address"],
+        "bcc@example.com"
+    );
+    for name in [
+        "internetMessageId",
+        "internetMessageHeaders",
+        "from",
+        "sender",
+        "sentDateTime",
+    ] {
+        assert!(message.get(name).is_none());
+    }
+    assert_eq!(fake.path("/me/messages/authored/send").len(), 1);
+}
+
+#[tokio::test]
+async fn json_reply_uses_create_reply_and_preserves_the_stored_conversation() {
+    use kite_core::model::{Provider, View};
+    use kite_core::store::Store;
+    let fake=Fake::start(|c,base| {
+        match(c.method.as_str(),c.path.as_str()) {
+            ("GET","/me/messages")=>{assert_eq!(c.query_pairs()["$filter"],"internetMessageId eq '<parent@example.com>'");
+                return Reply::json(200,json!({"value":[{"id":"parent"}]}));},
+            ("POST","/me/messages/parent/createReply")=>return Reply::json(201,json!({"id":"reply-draft","internetMessageId":"<reply@example.com>"})),
+            ("PATCH","/me/messages/reply-draft")=>{
+                assert_eq!(c.json()["toRecipients"][0]["emailAddress"]["address"],"edited@example.com");
+                assert!(c.json().get("internetMessageHeaders").is_none());
+                return Reply::json(200,json!({"id":"reply-draft","internetMessageId":"<reply@example.com>"}));},
+            ("POST","/me/messages/reply-draft/send")=>return Reply::empty(202), _=>{}
+        }
+        let parent=full_message("parent"); let mut reply=full_message("reply");
+        reply["internetMessageHeaders"]=json!([{"name":"In-Reply-To","value":"<parent@example.com>"},{"name":"References","value":"<parent@example.com>"}]);
+        Reply::json(200,json!({"value":if c.path.contains("/inbox/") {vec![parent,reply]} else {vec![]},"@odata.deltaLink":format!("{base}{}",c.path)}))
+    }).await;
+    let mime = mail_builder::MessageBuilder::new()
+        .from("me@example.com")
+        .to("edited@example.com")
+        .subject("Re: test")
+        .message_id("custom@example.com")
+        .in_reply_to("parent@example.com")
+        .references(vec!["parent@example.com"])
+        .text_body("reply body")
+        .write_to_vec()
+        .unwrap();
+    let mut g = graph(&fake);
+    g.apply(&Op::Send { mime }).await.unwrap();
+    let (deltas, _) = g.sync(None).await.unwrap();
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    store.apply_deltas(account.id, &deltas).unwrap();
+    let rows = store
+        .threads(
+            &View {
+                account_id: Some(account.id),
+                mailbox: Mailbox::Inbox,
+                split: None,
+                query: None,
+                folder: None,
+            },
+            0,
+            10,
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 2);
+    assert_eq!(fake.path("/me/messages/parent/createReply").len(), 1);
+    assert_eq!(fake.path("/me/messages/reply-draft/send").len(), 1);
+}
+
+#[tokio::test]
+async fn cross_account_reply_keeps_mime_threading_but_lets_exchange_assign_message_id() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("GET", "/me/messages") => Reply::json(200, json!({"value":[]})),
+        ("POST", "/me/messages") => Reply::json(
+            201,
+            json!({"id":"cross-reply","internetMessageId":"<exchange@example.com>"}),
+        ),
+        ("POST", "/me/messages/cross-reply/send") => Reply::empty(202),
+        _ => Reply::empty(404),
+    })
+    .await;
+    let mime = mail_builder::MessageBuilder::new()
+        .from("me@example.com")
+        .to("to@example.com")
+        .subject("Re: elsewhere")
+        .message_id("custom@example.com")
+        .in_reply_to("other@example.com")
+        .references(vec!["root@example.com", "other@example.com"])
+        .text_body("café\nreply")
+        .html_body("<p>café<br>reply</p>")
+        .write_to_vec()
+        .unwrap();
+    graph(&fake).apply(&Op::Send { mime }).await.unwrap();
+    let create = &fake.path("/me/messages")[1];
+    assert_eq!(create.header("content-type"), Some("text/plain"));
+    let raw = STANDARD.decode(&create.body).unwrap();
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("MIME-Version: 1.0\r\n"));
+    assert!(text.contains("charset=\"utf-8\""));
+    assert!(
+        !text
+            .lines()
+            .any(|line| line.to_ascii_lowercase().starts_with("message-id:"))
+    );
+    assert!(
+        raw.iter()
+            .enumerate()
+            .all(|(i, b)| *b != b'\n' || i > 0 && raw[i - 1] == b'\r')
+    );
+    let parsed = mail_parser::MessageParser::default().parse(&raw).unwrap();
+    assert_eq!(parsed.in_reply_to().as_text(), Some("other@example.com"));
+    assert_eq!(parsed.references().as_text_list().unwrap().len(), 2);
+    assert!(parsed.body_html(0).unwrap().contains("café"));
+}
+
+#[tokio::test]
+async fn rejected_reply_update_cleans_up_its_send_draft() {
+    let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {
+        ("GET", "/me/messages") => Reply::json(200, json!({"value":[{"id":"parent"}]})),
+        ("POST", "/me/messages/parent/createReply") => {
+            Reply::json(201, json!({"id":"failed-draft"}))
+        }
+        ("PATCH", "/me/messages/failed-draft") => {
+            Reply::json(400, json!({"error":{"message":"Invalid recipient"}}))
+        }
+        ("DELETE", "/me/messages/failed-draft") => Reply::empty(204),
+        _ => Reply::empty(404),
+    })
+    .await;
+    let mime = mail_builder::MessageBuilder::new()
+        .from("me@example.com")
+        .to("to@example.com")
+        .subject("Re: test")
+        .in_reply_to("parent@example.com")
+        .text_body("reply")
+        .write_to_vec()
+        .unwrap();
+    assert!(graph(&fake).apply(&Op::Send { mime }).await.is_err());
+    assert!(
+        fake.calls()
+            .iter()
+            .any(|c| c.method == "DELETE" && c.path == "/me/messages/failed-draft")
+    );
+    assert!(fake.path("/me/messages/failed-draft/send").is_empty());
+}
+
 #[tokio::test]
 async fn delta_sync_pages_maps_fields_and_deletes() {
     let fake = Fake::start(|c, base| match c.path.as_str() {
@@ -255,6 +690,7 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
                     "isRead": true,
                     "flag": { "flagStatus": "flagged" },
                     "inferenceClassification": "focused",
+                    "importance": "high",
                     "hasAttachments": true,
                     "parentFolderId": "FOLDER_INBOX",
                     "body": { "contentType": "html", "content": "<html><body><p>Hello <b>world</b></p><script>bad()</script></body></html>" },
@@ -268,12 +704,14 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
             json!({
                 "value": [{
                     "id": "m2",
+                    "from": null, "toRecipients": [],
                     "conversationId": "conv2",
                     "subject": "Lunch?",
                     "receivedDateTime": "2024-05-02T09:30:00Z",
                     "isRead": false,
                     "flag": { "flagStatus": "notFlagged" },
                     "inferenceClassification": "other",
+                    "importance": "normal",
                     "hasAttachments": false,
                     "parentFolderId": "FOLDER_INBOX",
                     "body": { "contentType": "html", "content": "<div>See you at 12</div>" },
@@ -289,12 +727,14 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
                     { "id": "m2", "@removed": { "reason": "deleted" } },
                     {
                         "id": "m1",
+                        "from": null, "toRecipients": [],
                         "conversationId": "conv1",
                         "subject": "Q3 numbers",
                         "receivedDateTime": "2024-05-01T10:00:00Z",
                         "isRead": false,
                         "flag": { "flagStatus": "notFlagged" },
                         "inferenceClassification": "other",
+                    "importance": "normal",
                         "hasAttachments": false,
                         "parentFolderId": "FOLDER_INBOX",
                         "body": { "contentType": "html", "content": "<p>Hello world</p>" },
@@ -375,7 +815,7 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
     assert_eq!(
         m2.important,
         Some(false),
-        "Outlook \"Other\" is an explicit not-important signal"
+        "Normal importance is an explicit not-important signal"
     );
     assert!(m2.attachments.is_empty());
 
@@ -387,7 +827,8 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
     );
     let select = delta.query_pairs();
     for field in [
-        "inferenceClassification",
+        "importance",
+        "flag",
         "hasAttachments",
         "conversationId",
         "body",
@@ -429,11 +870,13 @@ async fn internet_message_headers_mark_bulk_mail() {
                 "value": [
                     {
                         "id": "b1",
+                        "from": null, "toRecipients": [],
                         "subject": "Weekly digest",
                         "receivedDateTime": "2024-05-01T10:00:00Z",
                         "isRead": true,
                         "flag": { "flagStatus": "notFlagged" },
                         "inferenceClassification": "other",
+                    "importance": "normal",
                         "hasAttachments": false,
                         "parentFolderId": "FOLDER_INBOX",
                         "body": { "contentType": "text", "content": "weekly" },
@@ -444,11 +887,13 @@ async fn internet_message_headers_mark_bulk_mail() {
                     },
                     {
                         "id": "b2",
+                        "from": null, "toRecipients": [],
                         "subject": "Mailing list post",
                         "receivedDateTime": "2024-05-02T10:00:00Z",
                         "isRead": true,
                         "flag": { "flagStatus": "notFlagged" },
                         "inferenceClassification": "other",
+                    "importance": "normal",
                         "hasAttachments": false,
                         "parentFolderId": "FOLDER_INBOX",
                         "body": { "contentType": "text", "content": "list" },
@@ -459,11 +904,13 @@ async fn internet_message_headers_mark_bulk_mail() {
                     },
                     {
                         "id": "b3",
+                        "from": null, "toRecipients": [],
                         "subject": "Lunch?",
                         "receivedDateTime": "2024-05-03T10:00:00Z",
                         "isRead": false,
                         "flag": { "flagStatus": "notFlagged" },
                         "inferenceClassification": "focused",
+                    "importance": "high",
                         "hasAttachments": false,
                         "parentFolderId": "FOLDER_INBOX",
                         "body": { "contentType": "text", "content": "lunch" },
@@ -528,7 +975,11 @@ async fn apply_moves_flags_and_sends_mime() {
         ("POST", "/me/messages/m1/move") => Reply::json(200, json!({ "id": "m1-archived" })),
         ("POST", "/me/messages/m3/move") => Reply::json(200, json!({ "id": "m3-moved" })),
         ("PATCH", "/me/messages/m1") => Reply::empty(200),
-        ("POST", "/me/sendMail") => Reply::empty(202),
+        ("POST", "/me/messages") => Reply::json(
+            201,
+            json!({"id":"send-1", "internetMessageId":"<exchange@example.com>"}),
+        ),
+        ("POST", "/me/messages/send-1/send") => Reply::empty(202),
         _ => Reply::empty(404),
     })
     .await;
@@ -587,13 +1038,16 @@ async fn apply_moves_flags_and_sends_mime() {
         .unwrap(),
         None
     );
-    let send = &fake.path("/me/sendMail")[0];
-    assert!(
-        send.header("content-type")
-            .unwrap()
-            .starts_with("text/plain")
+    let send = &fake.path("/me/messages")[0];
+    assert_eq!(send.header("content-type"), Some("application/json"));
+    assert_eq!(send.json()["subject"], "hi");
+    assert_eq!(send.json()["body"]["contentType"], "HTML");
+    assert_eq!(
+        send.json()["toRecipients"][0]["emailAddress"]["address"],
+        "a@b.c"
     );
-    assert_eq!(STANDARD.decode(send.body_str()).unwrap(), mime);
+    assert!(send.json().get("internetMessageId").is_none());
+    assert_eq!(fake.path("/me/messages/send-1/send").len(), 1);
 }
 
 // ------------------------------------------------------------------- folders
@@ -972,6 +1426,10 @@ async fn graph_headers_separate_independent_sends_and_unite_only_linked_replies(
                     m["internetMessageId"]=json!("<fallback2@x>");
                     m["internetMessageHeaders"]=json!([{"name":"In-Reply-To","value":"<fallback1@x>"}]);
                 }
+                m["isRead"]=json!(true);
+                m["flag"]=json!({"flagStatus":"notFlagged"});
+                m["importance"]=json!("normal");
+                m["body"]=json!({"contentType":"text","content":m["id"]});
                 m["subject"]=json!("test");
                 m["bodyPreview"]=m["id"].clone();
                 m["conversationId"]=json!("loose-conversation");
@@ -1071,7 +1529,7 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
     use std::time::{Duration, Instant};
     let fake = Fake::start(|call, _| match call.path.as_str() {
         "/me/mailFolders" => Reply::json(200, json!({"value":[]})),
-        "/me/sendMail" => Reply::json(400, json!({"error":{"message":"Invalid recipient"}})),
+        "/me/messages" => Reply::json(400, json!({"error":{"message":"Invalid recipient"}})),
         _ => Reply::empty(404),
     })
     .await;
@@ -1142,7 +1600,13 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert_eq!(engine.draft(row.id).unwrap().unwrap().body, "recover this");
-    assert_eq!(fake.path("/me/sendMail").len(), 1);
+    assert_eq!(
+        fake.path("/me/messages")
+            .iter()
+            .filter(|c| c.header("content-type") == Some("application/json"))
+            .count(),
+        1
+    );
     drop(engine);
 }
 
@@ -1151,7 +1615,7 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
 #[derive(Default)]
 struct SwitchedDraftMailbox {
     drafts: HashMap<(String, String), Vec<u8>>,
-    sent: Vec<(String, Vec<u8>)>,
+    sent: Vec<(String, Value)>,
     creates: usize,
 }
 
@@ -1184,32 +1648,37 @@ async fn switch_draft_account(pending: bool, save_before_send: bool, tagged: boo
                 let mut state = server_mailbox.lock().unwrap();
                 state.creates += 1;
                 let id = format!("draft-{}", state.creates);
-                state.drafts.insert((account.clone(), id.clone()), STANDARD.decode(&call.body).unwrap());
+                let body = if call.header("content-type") == Some("application/json") {
+                    call.body.clone()
+                } else { STANDARD.decode(&call.body).unwrap() };
+                state.drafts.insert((account.clone(), id.clone()), body);
                 id
             };
-            if pending && account == "Bearer a" {
+            if pending && account == "Bearer a" && call.header("content-type") != Some("application/json") {
                 held.lock().unwrap().recv_timeout(Duration::from_secs(8)).unwrap();
             }
-            return Reply::json(201, json!({"id":id}));
+            return Reply::json(201, json!({"internetMessageId":format!("<exchange-{id}@example.com>"),"id":id}));
         }
         if call.method == "DELETE" {
             let id = call.path.strip_prefix("/me/messages/").unwrap().to_string();
             let removed = server_mailbox.lock().unwrap().drafts.remove(&(account, id));
             return Reply::empty(if removed.is_some() { 204 } else { 404 });
         }
-        if call.path == "/me/sendMail" {
-            server_mailbox.lock().unwrap().sent.push((account, STANDARD.decode(&call.body).unwrap()));
+        if call.path.ends_with("/send") {
+            let id = call.path.strip_prefix("/me/messages/").unwrap().strip_suffix("/send").unwrap();
+            let mut state = server_mailbox.lock().unwrap();
+            let body = state.drafts.remove(&(account.clone(), id.to_string())).unwrap();
+            let mut message: Value = serde_json::from_slice(&body).unwrap();
+            message["internetMessageId"] = json!(format!("<exchange-{id}@example.com>"));
+            state.sent.push((account, message));
             return Reply::empty(202);
         }
         let state = server_mailbox.lock().unwrap();
         let value = if call.path == "/me/mailFolders/sentitems/messages/delta" {
             state.sent.iter().filter(|(owner, _)| owner == &account).enumerate().map(|(i, (_, mime))| {
-                let text = String::from_utf8_lossy(mime);
-                let message_id = text.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("message-id").then(|| value.trim().to_string())
-                }).expect("outgoing Message-ID");
+                let message_id = &mime["internetMessageId"];
                 json!({"id":format!("sent-{i}"),"internetMessageId":message_id,"internetMessageHeaders":[],
+                    "isRead":true,"flag":{"flagStatus":"notFlagged"},"importance":"normal",
                     "subject":"Switch account","bodyPreview":"body","body":{"contentType":"text","content":"body"},
                     "receivedDateTime":"2026-10-20T10:00:00Z","from":{"emailAddress":{"address":"b@example.com"}},
                     "toRecipients":[{"emailAddress":{"address":"recipient@example.com"}}]})

@@ -571,6 +571,28 @@ async fn send_due(
             slot.insert(backend_for(inner, account)?);
         }
         let backend = backend_mut(backends, account.id)?;
+        let prepared = if let Backend::Graph { client, .. } = backend {
+            match client.prepare_send(&mime).await {
+                Ok(prepared) => Some(prepared),
+                Err(e) => {
+                    failed_send(
+                        inner,
+                        outbox_id,
+                        &draft,
+                        &e,
+                        proton::permanent_send(&e),
+                        changed,
+                    )?;
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let sent_message_id = prepared
+            .as_ref()
+            .map(|(_, id)| id.as_str())
+            .unwrap_or(&outgoing_id);
         if let Some(id) = draft.id {
             inner.write(|s| {
                 s.remember_sent_tags(
@@ -578,12 +600,21 @@ async fn send_due(
                     account.id,
                     &format!(
                         "m:{}",
-                        outgoing_id.trim_matches(['<', '>']).to_ascii_lowercase()
+                        sent_message_id
+                            .trim_matches(['<', '>'])
+                            .to_ascii_lowercase()
                     ),
                 )
             })?;
         }
-        match backend.apply(&Op::Send { mime }).await {
+        let result = match (backend, &prepared) {
+            (Backend::Graph { client, .. }, Some((id, _))) => {
+                client.send_prepared(id).await.map(|()| None)
+            }
+            (backend, _) => backend.apply(&Op::Send { mime }).await,
+        };
+        let backend = backend_mut(backends, account.id)?;
+        match result {
             Ok(_) => {
                 persist_tokens(inner, account.id, backend)?;
                 if let Backend::Proton { client, .. } = backend
@@ -834,6 +865,9 @@ fn build_mime(inner: &Inner, account: &Account, draft: &Draft, msg_id: &str) -> 
         .message_id(msg_id)
         .date(auth::now_ms() / 1000)
         .text_body(draft.body.as_str());
+    if account.provider == Provider::Microsoft {
+        builder = builder.html_body(crate::sync::graph::text_html(&draft.body));
+    }
     if !draft.to.is_empty() {
         builder = builder.to(pairs(&draft.to));
     }

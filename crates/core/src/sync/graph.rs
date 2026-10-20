@@ -7,7 +7,7 @@ use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
-const SELECT: &str = "id,conversationId,internetMessageId,subject,from,toRecipients,ccRecipients,receivedDateTime,isRead,flag,inferenceClassification,hasAttachments,body,bodyPreview,parentFolderId,internetMessageHeaders";
+const SELECT: &str = "id,conversationId,internetMessageId,subject,from,sender,toRecipients,ccRecipients,receivedDateTime,sentDateTime,createdDateTime,lastModifiedDateTime,isRead,flag,importance,hasAttachments,body,bodyPreview,parentFolderId,internetMessageHeaders";
 const PREFER: &str = "odata.maxpagesize=100, outlook.body-content-type=\"html\"";
 /// Well-known folders synced per account, and the mailbox each maps to.
 const FOLDERS: [(&str, Mailbox); 6] = [
@@ -87,6 +87,12 @@ impl Graph {
             Some(c) => serde_json::from_str(c).context("graph cursor")?,
             None => BTreeMap::new(),
         };
+        // Delta tokens retain the old $select. Rewalk once to repair incomplete rows and
+        // replace the old Focused Inbox importance mapping without writing remote flags.
+        if links.get("__kite_schema").map(String::as_str) != Some("2") {
+            links.clear();
+            links.insert("__kite_schema".into(), "2".into());
+        }
         let mut deltas = Vec::new();
         for (folder, mailbox) in FOLDERS {
             let mut link = links.get(folder).cloned().unwrap_or_else(|| {
@@ -98,7 +104,56 @@ impl Graph {
             let mut seen = 0usize;
             loop {
                 let page = self.get_json(&link, PREFER).await?;
-                let items = page["value"].as_array().cloned().unwrap_or_default();
+                let mut items = page["value"].as_array().cloned().unwrap_or_default();
+                // Delta updates can contain only changed properties. Never upsert such
+                // a record as a full message: absent flags/body would erase local data.
+                for item in &mut items {
+                    if item.get("@removed").is_some() {
+                        continue;
+                    }
+                    let incomplete = [
+                        "subject",
+                        "from",
+                        "toRecipients",
+                        "receivedDateTime",
+                        "isRead",
+                        "flag",
+                        "importance",
+                        "body",
+                    ]
+                    .iter()
+                    .any(|field| item.get(field).is_none());
+                    let empty_body = item["body"]["content"].as_str().is_none_or(str::is_empty);
+                    if incomplete
+                        || empty_body
+                        || item["flag"]["flagStatus"].as_str().is_none()
+                        || item["isRead"].as_bool().is_none()
+                        || item["importance"].as_str().is_none()
+                    {
+                        let id = item["id"].as_str().context("Graph delta missing id")?;
+                        let url = format!(
+                            "{}/me/messages/{id}?$select={SELECT},uniqueBody",
+                            self.base_url
+                        );
+                        let res = self
+                            .auth_send(|http, token| {
+                                http.get(&url).bearer_auth(token).header("Prefer", PREFER)
+                            })
+                            .await?;
+                        if res.status() == reqwest::StatusCode::NOT_FOUND {
+                            // A move/delete raced the delta; its removal arrives separately.
+                            *item = Value::Null;
+                            continue;
+                        }
+                        *item = json_res(res, "GET full message").await?;
+                        if item["flag"]["flagStatus"].as_str().is_none()
+                            || item["isRead"].as_bool().is_none()
+                            || item["importance"].as_str().is_none()
+                        {
+                            bail!("Graph full message omitted flags or importance");
+                        }
+                    }
+                }
                 let attachments = self.page_attachments(&items).await?;
                 for item in &items {
                     if let Some(delta) = delta_for(item, folder, mailbox, &attachments) {
@@ -156,17 +211,8 @@ impl Graph {
                 Ok(None)
             }
             Op::Send { mime } => {
-                let url = format!("{}/me/sendMail", self.base_url);
-                let body = base64::engine::general_purpose::STANDARD.encode(mime);
-                let res = self
-                    .auth_send(|http, token| {
-                        http.post(&url)
-                            .bearer_auth(token)
-                            .header("Content-Type", "text/plain")
-                            .body(body.clone())
-                    })
-                    .await?;
-                check(res, "sendMail").await?;
+                let (id, _) = self.prepare_send(mime).await?;
+                self.send_prepared(&id).await?;
                 Ok(None)
             }
             // Posting MIME to /me/messages creates the message as a draft in Drafts.
@@ -195,6 +241,145 @@ impl Graph {
                 Ok(None)
             }
         }
+    }
+
+    /// Create an Exchange-authored draft so its real Message-ID is available for local
+    /// tag correlation before sending. JSON cannot set standard reply headers.
+    pub async fn prepare_send(&mut self, mime: &[u8]) -> Result<(String, String)> {
+        let parsed = mail_parser::MessageParser::default()
+            .parse(mime)
+            .context("parse outgoing Graph message")?;
+        let recipients = |addresses: Option<&mail_parser::Address<'_>>| -> Vec<Value> {
+            addresses.into_iter().flat_map(|a| a.iter()).filter_map(|a| {
+                Some(json!({"emailAddress": {
+                    "address": a.address.as_deref()?, "name": a.name.as_deref().unwrap_or_default()
+                }}))
+            }).collect()
+        };
+        let text = parsed.body_text(0).unwrap_or_default();
+        let message = json!({
+            "subject": parsed.subject().unwrap_or_default(),
+            "body": {"contentType":"HTML", "content": text_html(&text)},
+            "toRecipients": recipients(parsed.to()),
+            "ccRecipients": recipients(parsed.cc()),
+            "bccRecipients": recipients(parsed.bcc()),
+        });
+        let reply = parsed.in_reply_to().as_text().or_else(|| {
+            parsed
+                .in_reply_to()
+                .as_text_list()
+                .and_then(|ids| ids.first())
+                .map(|id| id.as_ref())
+        });
+        let mut reply_id = None;
+        if let Some(reply) = reply {
+            let header = format!("<{}>", reply.trim_matches(['<', '>']));
+            let mut url = reqwest::Url::parse(&format!("{}/me/messages", self.base_url))?;
+            url.query_pairs_mut()
+                .append_pair(
+                    "$filter",
+                    &format!("internetMessageId eq '{}'", header.replace('\'', "''")),
+                )
+                .append_pair("$select", "id");
+            let found = self.get_json(url.as_str(), "").await?;
+            reply_id = found["value"]
+                .as_array()
+                .and_then(|items| items.first())
+                .and_then(|item| item["id"].as_str())
+                .map(str::to_owned);
+        }
+        let url = match &reply_id {
+            Some(id) => format!("{}/me/messages/{id}/createReply", self.base_url),
+            None => format!("{}/me/messages", self.base_url),
+        };
+        let created = if reply.is_some() && reply_id.is_none() {
+            // A reply from another account cannot use createReply. MIME retains its
+            // In-Reply-To/References; omit our Message-ID so Exchange generates it.
+            let raw = String::from_utf8_lossy(mime);
+            let (headers, body) = raw
+                .split_once("\r\n\r\n")
+                .context("outgoing MIME headers")?;
+            let mut omit = false;
+            let headers = headers
+                .split("\r\n")
+                .filter(|line| {
+                    if !line.starts_with([' ', '\t']) {
+                        omit = line
+                            .split_once(':')
+                            .is_some_and(|(name, _)| name.eq_ignore_ascii_case("Message-ID"));
+                    }
+                    !omit
+                })
+                .collect::<Vec<_>>()
+                .join("\r\n");
+            let body = base64::engine::general_purpose::STANDARD
+                .encode(format!("{headers}\r\n\r\n{body}"));
+            let res = self
+                .auth_send(|http, token| {
+                    http.post(&url)
+                        .bearer_auth(token)
+                        .header("Content-Type", "text/plain")
+                        .body(body.clone())
+                })
+                .await?;
+            json_res(res, "create MIME send draft").await?
+        } else {
+            let payload = if reply_id.is_some() {
+                json!({})
+            } else {
+                message.clone()
+            };
+            let res = self
+                .auth_send(|http, token| http.post(&url).bearer_auth(token).json(&payload))
+                .await?;
+            json_res(res, "create send draft").await?
+        };
+        let id = created["id"]
+            .as_str()
+            .context("Graph send draft missing id")?
+            .to_string();
+        let result = async {
+            let created = if reply_id.is_some() {
+                let url = format!("{}/me/messages/{id}", self.base_url);
+                let res = self
+                    .auth_send(|http, token| http.patch(&url).bearer_auth(token).json(&message))
+                    .await?;
+                json_res(res, "update reply draft").await?
+            } else {
+                created
+            };
+            let message_id = created["internetMessageId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .context("Graph send draft missing internetMessageId")?
+                .to_string();
+            Ok((id.clone(), message_id))
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.delete_message(&id).await;
+        }
+        result
+    }
+
+    /// Sending a draft always saves its Sent Items copy (the sendMail flag is inapplicable).
+    pub async fn send_prepared(&mut self, id: &str) -> Result<()> {
+        let url = format!("{}/me/messages/{id}/send", self.base_url);
+        let result = async {
+            let res = self
+                .auth_send(|http, token| {
+                    http.post(&url)
+                        .bearer_auth(token)
+                        .header("Content-Length", "0")
+                })
+                .await?;
+            check(res, "send draft").await
+        }
+        .await;
+        if result.is_err() {
+            let _ = self.delete_message(id).await;
+        }
+        result
     }
 
     async fn delete_message(&mut self, remote_id: &str) -> Result<()> {
@@ -380,6 +565,19 @@ impl Graph {
     }
 }
 
+pub(crate) fn text_html(text: &str) -> String {
+    format!(
+        "<html><body><div>{}</div></body></html>",
+        text.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .replace('\n', "<br>")
+    )
+}
+
 fn delta_for(
     item: &Value,
     folder: &str,
@@ -392,13 +590,24 @@ fn delta_for(
             remote_id: id.to_string(),
         });
     }
-    let html = item["body"]["content"]
-        .as_str()
-        .filter(|c| !c.is_empty())
+    let body = [&item["body"], &item["uniqueBody"]]
+        .into_iter()
+        .find(|body| body["content"].as_str().is_some_and(|s| !s.is_empty()));
+    let html = body
+        .filter(|body| {
+            body["contentType"]
+                .as_str()
+                .is_some_and(|t| t.eq_ignore_ascii_case("html"))
+        })
+        .and_then(|body| body["content"].as_str())
         .map(str::to_owned);
     let text = match html.as_deref() {
         Some(html) => html_to_text(html),
-        None => item["bodyPreview"].as_str().unwrap_or_default().to_string(),
+        None => body
+            .and_then(|body| body["content"].as_str())
+            .or_else(|| item["bodyPreview"].as_str())
+            .unwrap_or_default()
+            .to_string(),
     };
     let headers = &item["internetMessageHeaders"];
     let header = |name: &str| {
@@ -451,21 +660,40 @@ fn delta_for(
             .as_ref()
             .map(|p| ids(p.references()))
             .unwrap_or_default(),
-        from: addr(&item["from"]["emailAddress"]),
+        from: addr(
+            if item["from"]["emailAddress"]["address"]
+                .as_str()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                &item["from"]["emailAddress"]
+            } else {
+                &item["sender"]["emailAddress"]
+            },
+        ),
         to: addrs(&item["toRecipients"]),
         cc: addrs(&item["ccRecipients"]),
-        date: item["receivedDateTime"]
-            .as_str()
-            .and_then(parse_iso_ms)
-            .unwrap_or_default(),
+        date: [
+            "receivedDateTime",
+            "sentDateTime",
+            "createdDateTime",
+            "lastModifiedDateTime",
+        ]
+        .into_iter()
+        .find_map(|field| {
+            item[field]
+                .as_str()
+                .and_then(parse_iso_ms)
+                .filter(|date| *date > 0)
+        })
+        .unwrap_or_else(auth::now_ms),
         subject: item["subject"].as_str().unwrap_or_default().to_string(),
         text,
         html,
         unread: !item["isRead"].as_bool().unwrap_or(false),
         starred: item["flag"]["flagStatus"].as_str() == Some("flagged"),
-        important: match item["inferenceClassification"].as_str() {
-            Some("focused") => Some(true),
-            Some("other") => Some(false),
+        important: match item["importance"].as_str() {
+            Some("high") => Some(true),
+            Some("normal" | "low") => Some(false),
             _ => None,
         },
         list_unsubscribe: has_bulk_header(&item["internetMessageHeaders"]),
@@ -524,9 +752,10 @@ fn well_known(mailbox: Mailbox) -> Option<&'static str> {
 
 async fn json_res(res: reqwest::Response, what: &str) -> Result<Value> {
     let status = res.status();
+    let error = res.error_for_status_ref().err();
     let text = res.text().await?;
-    if !status.is_success() {
-        bail!("{what} failed ({status}): {}", clip(&text));
+    if let Some(error) = error {
+        return Err(error).with_context(|| format!("{what} failed ({status}): {}", clip(&text)));
     }
     Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
 }
