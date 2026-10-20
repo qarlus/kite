@@ -6,12 +6,25 @@ use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::ContextMenuExt;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Action as MailAction, Id, Mailbox, Ms, ThreadSummary};
+use kite_core::model::{Action as MailAction, Id, Mailbox, Ms, Provider, ThreadSummary};
 use std::ops::Range;
 use std::time::Duration;
+
+/// The room the hover actions take at a row's right edge: four 24px buttons, their gaps and
+/// padding, plus a margin. Subject and snippet stop before it, so the buttons never cover a word.
+const ACTION_SLOT: f32 = 124.;
+
+/// The mark and brand ink that name a provider in the combined inbox.
+fn provider_mark(provider: Provider) -> (&'static str, Rgba) {
+    match provider {
+        Provider::Proton => ("providers/proton.svg", rgb(0x6d4aff)),
+        Provider::Microsoft => ("providers/outlook.svg", rgb(0x0078d4)),
+    }
+}
 
 /// A row's own timestamp: `9:41` today, `Yesterday`, a weekday inside the last week,
 /// then `Oct 2` this year and `Mar 3, 2025` across a year boundary.
@@ -324,8 +337,8 @@ fn help_section(t: &Theme, group: Group, commands: Vec<(&Cmd, String)>) -> AnyEl
         .into_any_element()
 }
 
-/// One list row: the sender and time, the subject and a two-line snippet.
-/// Borrows its summary, so painting a frame copies no threads.
+/// One list row: the sender, the account's mark (in a mixed inbox) and the time, the subject and
+/// a two-line snippet. Borrows its summary, so painting a frame copies no threads.
 fn row_element(
     kite: &Kite,
     row: &ThreadSummary,
@@ -351,9 +364,14 @@ fn row_element(
         sender.clone()
     };
     let combined = kite.view.account_id.is_none() && kite.accounts.len() > 1;
-    let account_email = account
-        .map(|account| account.email.clone())
-        .unwrap_or_default();
+    // Only a mixed inbox has to say where a row came from. It says it with the provider's mark,
+    // because a full address beside every row is noise; the address is the mark's tooltip.
+    let mark = combined.then_some(account).flatten().map(|account| {
+        (
+            SharedString::from(account.email.as_str()),
+            provider_mark(account.provider),
+        )
+    });
     div()
         .id(("row", ix))
         .test_support()
@@ -458,19 +476,34 @@ fn row_element(
                                         .text_color(t.fg)
                                         .child(sender),
                                 )
-                                .when(combined, |d| {
+                                // The row's right-hand meta fades out on hover, where the
+                                // actions take its place; leaving it in place keeps the row still.
+                                .when_some(mark, |d, (email, (path, ink))| {
                                     d.child(
                                         div()
                                             .id(("row-account", ix))
                                             .test_support()
-                                            .aria_label(account_email.clone())
-                                            .max_w(px(140.))
-                                            .min_w_0()
+                                            .aria_label(email.clone())
+                                            .flex()
+                                            .items_center()
                                             .flex_shrink_0()
-                                            .truncate()
-                                            .text_size(t.px(11.))
-                                            .text_color(t.fg2)
-                                            .child(account_email.clone()),
+                                            .group_hover("row", |s| s.opacity(0.))
+                                            .tooltip(move |window, cx| {
+                                                // The address in full, for a row that only has
+                                                // room to show the provider's mark.
+                                                let address = email.clone();
+                                                Tooltip::element(move |_, _| {
+                                                    div()
+                                                        .id("row-account-tip")
+                                                        .test_support()
+                                                        .aria_label(address.clone())
+                                                        .child(address.clone())
+                                                })
+                                                .build(window, cx)
+                                            })
+                                            .child(
+                                                svg().path(path).size(t.px(13.)).text_color(ink),
+                                            ),
                                     )
                                 })
                                 .child(
@@ -479,6 +512,7 @@ fn row_element(
                                         .test_support()
                                         .aria_label(when.clone())
                                         .flex_shrink_0()
+                                        .group_hover("row", |s| s.opacity(0.))
                                         .text_size(t.px(12.))
                                         .text_color(t.fg3)
                                         .child(when),
@@ -489,8 +523,14 @@ fn row_element(
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
+                                // Text stops before the action slot, so the buttons can never
+                                // cover a word.
+                                .mr(px(ACTION_SLOT))
                                 .child(
                                     div()
+                                        .id(("row-subject", ix))
+                                        .test_support()
+                                        .aria_label(row.subject.clone())
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
@@ -543,7 +583,12 @@ fn row_element(
                         )
                         .child(
                             div()
+                                .id(("row-snippet", ix))
+                                .test_support()
+                                .aria_label(row.snippet.clone())
+                                .mr(px(ACTION_SLOT))
                                 .line_clamp(2)
+                                .text_ellipsis()
                                 .text_size(t.px(12.))
                                 .line_height(relative(1.45))
                                 .text_color(t.fg2)
@@ -551,15 +596,16 @@ fn row_element(
                         ),
                 ),
         )
-        // DESIGN › Layout: hovering a row replaces the time with the actions a click-first
-        // client expects, so every triage action is reachable with the mouse.
+        // DESIGN › Layout: hovering a row replaces the meta with the actions a click-first
+        // client expects, so every triage action is reachable with the mouse. The strip sits in
+        // the slot the text leaves free, so it never hides what is being read.
         .child(
             div()
                 .id(("row-actions", ix))
                 .test_support()
                 .aria_label("Row actions")
                 .absolute()
-                .right_1()
+                .right(px(12.))
                 .top_0()
                 .h_full()
                 .flex()
@@ -583,14 +629,17 @@ fn row_element(
         }))
         // A right-click picks the row unless it is part of the multi-selection, which the
         // menu then acts on — the way desktop clients treat a secondary click.
-        .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, window, cx| {
-            if !this.multi.contains(&row_id) {
-                this.multi.clear();
-                this.sel = ix;
-            }
-            window.focus(&this.focus, cx);
-            cx.notify();
-        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, _, window, cx| {
+                if !this.multi.contains(&row_id) {
+                    this.multi.clear();
+                    this.sel = ix;
+                }
+                window.focus(&this.focus, cx);
+                cx.notify();
+            }),
+        )
         .context_menu({
             let entity = cx.entity().downgrade();
             move |menu, window, cx| {
