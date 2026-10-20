@@ -5,8 +5,13 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use kite_core::api::Mail;
 use kite_core::model::{Account, Folder, Id, Mailbox, View};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::UNIX_EPOCH;
 
 /// The icon rail: accounts down the left, window actions at the bottom.
 pub const RAIL_W: f32 = 64.;
@@ -50,6 +55,68 @@ pub fn width(window: &Window) -> f32 {
 
 pub(crate) fn set_pane(open: bool) {
     PANE.with(|pane| pane.set(open));
+}
+
+thread_local! {
+    /// Decoded account avatars, keyed by file path and rewrite time: a replaced file
+    /// decodes once, an unchanged one never re-decodes and no file is read per frame.
+    static AVATARS: RefCell<HashMap<PathBuf, (u128, Arc<RenderImage>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The account's avatar as a ready-to-paint image, or `None` for initials. `mail.avatar`
+/// only names a file; decoding is cached by path and mtime.
+pub(crate) fn avatar_image(mail: &dyn Mail, account: Id) -> Option<Arc<RenderImage>> {
+    let path = mail.avatar(account)?;
+    let stamp = std::fs::metadata(&path)
+        .and_then(|meta| meta.modified())
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    AVATARS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some((seen, image)) = cache.get(&path)
+            && *seen == stamp
+        {
+            return Some(image.clone());
+        }
+        let bytes = std::fs::read(&path).ok()?;
+        let rgba = image::load_from_memory(&bytes).ok()?.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        // GPUI's sprites are BGRA; `image` gives RGBA.
+        let mut bgra = rgba.into_raw();
+        for px in bgra.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+        let bgra = image::RgbaImage::from_raw(w, h, bgra)?;
+        let render = Arc::new(RenderImage::new([image::Frame::new(bgra)]));
+        cache.insert(path, (stamp, render.clone()));
+        Some(render)
+    })
+}
+
+/// A circular avatar: the decoded image when one exists, otherwise the initials circle.
+fn account_avatar(
+    picture: Option<Arc<RenderImage>>,
+    name: &str,
+    email: &str,
+    index: usize,
+    t: &Theme,
+) -> AnyElement {
+    if let Some(image) = picture {
+        return div()
+            .id(("account-avatar", index))
+            .test_support()
+            .aria_label("Account avatar")
+            .size(px(28.))
+            .flex_shrink_0()
+            .rounded_full()
+            .overflow_hidden()
+            .child(img(image).size_full())
+            .into_any_element();
+    }
+    avatar(name, email, index, t).into_any_element()
 }
 
 pub fn mailbox_name(mailbox: Mailbox) -> &'static str {
@@ -129,6 +196,8 @@ impl Kite {
 /// Account scope does not change when the list selection moves, so it stays a cached view.
 pub(crate) struct Sidebar {
     accounts: Vec<Account>,
+    /// Decoded avatar per account (`None` = initials), refreshed with the cached view.
+    avatars: HashMap<Id, Arc<RenderImage>>,
     unread: Vec<(Id, usize)>,
     view: View,
     theme: Theme,
@@ -144,6 +213,13 @@ impl Sidebar {
             unread_counts(kite.mail.as_ref(), &kite.accounts)
         };
         Self {
+            avatars: kite
+                .accounts
+                .iter()
+                .filter_map(|account| {
+                    avatar_image(kite.mail.as_ref(), account.id).map(|image| (account.id, image))
+                })
+                .collect(),
             accounts: kite.accounts.clone(),
             unread,
             view: kite.view.clone(),
@@ -215,6 +291,7 @@ impl Render for Sidebar {
                         let id = account.id;
                         let selected = !combined && self.view.account_id == Some(id);
                         let unread = self.unread(id);
+                        let picture = self.avatars.get(&id).cloned();
                         div()
                             .id(("rail-account", id as usize))
                             .test_support()
@@ -230,7 +307,13 @@ impl Render for Sidebar {
                             .cursor_pointer()
                             .when(selected, |d| d.bg(Theme::alpha(t.fg, 0.1)))
                             .when(!selected, |d| d.hover(|s| s.bg(Theme::alpha(t.fg, 0.06))))
-                            .child(avatar(&account.name, &account.email, index, &t))
+                            .child(account_avatar(
+                                picture,
+                                &account.name,
+                                &account.email,
+                                index,
+                                &t,
+                            ))
                             .when(unread > 0, |d| {
                                 d.child(
                                     div()
@@ -645,7 +728,13 @@ pub fn account_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
                 .cursor_pointer()
                 .when(selected == index, |d| d.bg(t.sel))
                 .hover(|s| s.bg(t.bg3))
-                .child(avatar(&name, &detail, index.saturating_sub(1), &t))
+                .child(account_avatar(
+                    id.and_then(|id| avatar_image(kite.mail.as_ref(), id)),
+                    &name,
+                    &detail,
+                    index.saturating_sub(1),
+                    &t,
+                ))
                 .child(
                     div()
                         .flex_1()

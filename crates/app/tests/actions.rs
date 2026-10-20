@@ -2,9 +2,10 @@
 //! engine is told only afterwards. `z` undoes the last action.
 mod common;
 use common::{Fixture, mount, update_content};
-use gpui_kit::test::TestWindowExt;
+use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
-use kite_core::model::Action;
+use kite_core::model::{Action, Event};
+use std::time::Duration;
 
 #[gpui_kit::test]
 fn archive_removes_the_row_selects_the_next_and_reaches_the_mail_trait(cx: &mut TestAppContext) {
@@ -145,4 +146,37 @@ fn the_row_action_strip_stars_without_opening_the_thread(cx: &mut TestAppContext
             "the click did not open the thread"
         );
     });
+}
+
+#[gpui_kit::test]
+async fn only_a_toast_that_undo_can_reverse_offers_the_undo_hint(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "e");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Marked done"));
+        assert!(
+            window.try_find("toast-undo-hint").is_some(),
+            "archiving is the action z reverses, so the toast offers it"
+        );
+    })
+    .unwrap();
+    // The engine reports a failure while that archive is still the undo target.
+    fixture.emit(Event::Error(
+        "AI: This conversation is private, so AI can't read it".into(),
+    ));
+    cx.wait_for(window.into(), Duration::from_millis(1_000), |window, _| {
+        window.find("toast").label()
+            == Some("AI: This conversation is private, so AI can't read it")
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("toast-undo-hint").is_none(),
+            "an error is not undoable, so the toast must not claim z applies"
+        );
+    })
+    .unwrap();
 }

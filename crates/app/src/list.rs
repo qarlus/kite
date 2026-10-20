@@ -241,9 +241,9 @@ impl Kite {
                         .bg(t.bg2)
                         .cursor_pointer()
                         .child("Add an account")
-                        .on_click(
-                            cx.listener(|this, _, window, cx| this.show_preferences(1, window, cx)),
-                        ),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.show_preferences(crate::preferences::OPEN_ACCOUNTS, window, cx)
+                        })),
                 )
             })
             .into_any_element()

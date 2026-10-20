@@ -183,6 +183,15 @@ pub struct CalEvent {
     pub all_day: bool,
 }
 
+/// Per-account extras that are not already on `Account`. Avatar image bytes never
+/// live in settings or SQLite: they are files under `data_dir()/avatars/`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct AccountProfile {
+    /// Plain-text signature for new drafts; empty adds nothing.
+    pub signature: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CustomTheme {
@@ -213,6 +222,8 @@ pub struct Settings {
     /// `true`: list and reading pane side by side. `false`: an opened conversation takes the
     /// full width (Superhuman style).
     pub reading_pane: bool,
+    /// Per-account profile (signature), keyed by account id. Display name is `Account.name`.
+    pub profiles: std::collections::BTreeMap<Id, AccountProfile>,
 }
 
 impl Default for Settings {
@@ -231,6 +242,7 @@ impl Default for Settings {
             input_mode: "keyboard".into(),
             shortcuts: Default::default(),
             reading_pane: true,
+            profiles: Default::default(),
         }
     }
 }

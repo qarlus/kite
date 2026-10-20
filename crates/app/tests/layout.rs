@@ -370,6 +370,8 @@ fn the_appearance_switch_turns_the_reading_pane_off_and_back_on(cx: &mut TestApp
         window.render_frame(cx);
         window.click("open-settings", cx);
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("reading-pane").selected(), Some(true));
         window.click("reading-pane", cx);
         window.render_frame(cx);

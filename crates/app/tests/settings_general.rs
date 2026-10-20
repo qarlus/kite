@@ -33,7 +33,7 @@ fn scroll_to_bottom(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
 fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 5);
+    open_section(window, cx, 6);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("remote-images").checked(), Some(false));
@@ -49,7 +49,7 @@ fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) 
 fn ai_settings_persist_and_the_key_goes_to_the_keychain(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 6);
+    open_section(window, cx, 7);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
@@ -97,7 +97,7 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 4usize), cx);
+        window.click(("settings-tab", 0usize), cx);
         window.render_frame(cx);
         let page = window.find("settings-page").bounds();
         for seconds in [0, 5, 10, 20, 30] {
@@ -115,7 +115,7 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
 fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 6);
+    open_section(window, cx, 7);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         scroll_to_bottom(window, cx);
@@ -141,7 +141,7 @@ fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
 fn the_input_mode_choice_is_shown_and_saved(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 4);
+    open_section(window, cx, 0);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
@@ -163,7 +163,7 @@ fn the_undo_send_window_from_settings_decides_whether_z_still_cancels(cx: &mut T
     // Off means send at once: by the time the writer can reach z, the mail is gone.
     let fixture = Fixture::new(2);
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 4);
+    open_section(window, cx, 0);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click("undo-send-0", cx);

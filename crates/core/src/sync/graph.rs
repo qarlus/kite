@@ -6,6 +6,7 @@ use anyhow::{Context, Result, bail};
 use base64::Engine as _;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 const SELECT: &str = "id,conversationId,internetMessageId,subject,from,sender,toRecipients,ccRecipients,receivedDateTime,sentDateTime,createdDateTime,lastModifiedDateTime,isRead,flag,importance,hasAttachments,body,bodyPreview,parentFolderId,internetMessageHeaders";
 const PREFER: &str = "odata.maxpagesize=100, outlook.body-content-type=\"html\"";
@@ -394,6 +395,24 @@ impl Graph {
         check(res, "delete draft").await
     }
 
+    /// The user's profile photo bytes, or `None` when the account has none (404).
+    /// `User.Read`, already in the sign-in scopes, covers it.
+    pub async fn photo(&mut self) -> Result<Option<Vec<u8>>> {
+        let url = format!("{}/me/photo/$value", self.base_url);
+        let res = self
+            .auth_send(|http, token| http.get(&url).bearer_auth(token))
+            .await?;
+        if res.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            bail!("profile photo failed ({status}): {}", clip(&text));
+        }
+        Ok(Some(res.bytes().await?.to_vec()))
+    }
+
     pub async fn attachment(
         &mut self,
         remote_msg_id: &str,
@@ -565,17 +584,64 @@ impl Graph {
     }
 }
 
-pub(crate) fn text_html(text: &str) -> String {
+/// Plain text to the escaped HTML body Graph sends; URLs and addresses become links.
+pub fn text_html(text: &str) -> String {
+    let escaped = text
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
     format!(
         "<html><body><div>{}</div></body></html>",
-        text.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
+        linkify(&escaped)
             .replace("\r\n", "\n")
             .replace('\r', "\n")
             .replace('\n', "<br>")
     )
+}
+
+/// Wraps URLs and mail addresses in anchors after escaping, so signatures (and any
+/// other plain text) keep working links in the HTML Graph sends. Tokens are split on
+/// whitespace; escaped entities contain no spaces, so they stay inside one token.
+fn linkify(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len() + 32);
+    let mut token = String::new();
+    let flush = |out: &mut String, token: &mut String| {
+        // Trailing punctuation typed next to a link is not part of it.
+        let bare = token.trim_end_matches(['.', ',', ';', ':', '!', '?', ')']);
+        let rest = &token[bare.len()..];
+        if bare.starts_with("http://") || bare.starts_with("https://") {
+            let _ = write!(out, "<a href=\"{bare}\">{bare}</a>{rest}");
+        } else if is_email(bare) {
+            let _ = write!(out, "<a href=\"mailto:{bare}\">{bare}</a>{rest}");
+        } else {
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for c in escaped.chars() {
+        if c.is_whitespace() {
+            flush(&mut out, &mut token);
+            out.push(c);
+        } else {
+            token.push(c);
+        }
+    }
+    flush(&mut out, &mut token);
+    out
+}
+
+/// `local@domain.tld` in already-escaped text: one '@', no separators, a dot after it.
+fn is_email(token: &str) -> bool {
+    let Some((local, domain)) = token.split_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !local.contains(['/', '<', '>', '&', '"', '\''])
+        && domain.contains('.')
+        && domain
+            .split('.')
+            .all(|part| !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '-'))
 }
 
 fn delta_for(

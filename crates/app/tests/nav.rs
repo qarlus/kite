@@ -334,3 +334,96 @@ fn palette_navigation_keeps_the_selected_command_visible(cx: &mut TestAppContext
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn the_list_edges_say_so_and_do_not_stack_toasts(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, kite) = mount(cx, fixture);
+    // k at the first row.
+    cx.simulate_keystrokes(window.into(), "k");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 0, "k at the top keeps the first row")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Top of Inbox"));
+        assert!(
+            window.try_find("toast-undo-hint").is_none(),
+            "an edge notice is information, not an action to undo"
+        );
+    })
+    .unwrap();
+    // j past the last row.
+    cx.simulate_keystrokes(window.into(), "j j j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 2, "the last row stays selected")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+    // Repeating it refreshes the one toast instead of stacking another. `find` asserts the
+    // ElementId is unique, so a second toast would fail this frame.
+    cx.simulate_keystrokes(window.into(), "j j j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 3, "nothing moved")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_mailbox_other_than_the_inbox_names_itself_at_the_edge(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "s g s");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 1, "one starred thread")
+    });
+    cx.simulate_keystrokes(window.into(), "j");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Starred"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn walking_conversations_at_the_end_of_the_list_says_so(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "j enter");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), Some(2), "the last conversation is open")
+    });
+    cx.simulate_keystrokes(window.into(), "j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), Some(2), "there is no next conversation")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_empty_list_says_nothing_about_its_edges(cx: &mut TestAppContext) {
+    let (window, kite) = mount(cx, Fixture::new(0));
+    cx.simulate_keystrokes(window.into(), "j k");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 0)
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("toast").is_none(),
+            "the empty state already says the mailbox is empty"
+        );
+    })
+    .unwrap();
+}

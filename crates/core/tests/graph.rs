@@ -482,6 +482,76 @@ async fn failed_partial_message_fetch_does_not_advance_or_overwrite_mail() {
     assert!(graph(&fake).sync(None).await.is_err());
 }
 
+// ---- profile ---------------------------------------------------------------
+
+#[tokio::test]
+async fn profile_photo_returns_the_image_bytes() {
+    let photo = b"\x89PNG fake photo bytes".to_vec();
+    let served = photo.clone();
+    let fake = Fake::start(move |c, _| {
+        if c.method == "GET" && c.path == "/me/photo/$value" {
+            assert_eq!(c.header("authorization"), Some("Bearer token"));
+            return Reply::raw(200, "image/jpeg", served.clone());
+        }
+        Reply::empty(404)
+    })
+    .await;
+    let found = graph(&fake).photo().await.unwrap();
+    assert_eq!(found, Some(photo));
+    assert_eq!(fake.path("/me/photo/$value").len(), 1);
+}
+
+#[tokio::test]
+async fn profile_photo_404_means_the_account_has_no_photo() {
+    let fake = Fake::start(|_, _| Reply::empty(404)).await;
+    assert_eq!(graph(&fake).photo().await.unwrap(), None);
+}
+
+#[test]
+fn profile_settings_round_trip_through_the_store() {
+    use kite_core::model::Provider;
+    use kite_core::store::Store;
+    let store = Store::memory().unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    // Old settings JSON without `profiles` keeps loading.
+    let before = store.settings().unwrap();
+    assert!(before.profiles.is_empty());
+    let mut settings = before;
+    settings
+        .profiles
+        .entry(account.id)
+        .or_default()
+        .signature = "Regards,\nMe".into();
+    store.set_settings(settings.clone()).unwrap();
+    assert_eq!(
+        store.settings().unwrap().profiles[&account.id].signature,
+        "Regards,\nMe"
+    );
+    store.set_account_name(account.id, "Me Myself").unwrap();
+    assert_eq!(store.accounts().unwrap()[0].name, "Me Myself");
+}
+
+#[tokio::test]
+async fn signature_urls_and_emails_become_links_in_outgoing_html() {
+    let html = kite_core::sync::graph::text_html(
+        "See https://example.com/?a=1&b=2, or write me@example.com.",
+    );
+    assert!(
+        html.contains(
+            "<a href=\"https://example.com/?a=1&amp;b=2\">https://example.com/?a=1&amp;b=2</a>,"
+        ),
+        "{html}"
+    );
+    assert!(
+        html.contains("<a href=\"mailto:me@example.com\">me@example.com</a>."),
+        "{html}"
+    );
+    // Escaping still holds: no raw tag or unescaped ampersand leaks.
+    assert!(!html.contains("<tag>"));
+}
+
 #[tokio::test]
 async fn json_send_uses_exchange_headers_and_escapes_utf8_html_and_recipients() {
     let fake = Fake::start(|c, _| match (c.method.as_str(), c.path.as_str()) {

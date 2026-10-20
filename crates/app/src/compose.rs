@@ -36,6 +36,9 @@ pub struct Compose {
     send_at: Option<Ms>,
     remind_at: Option<Ms>,
     title: &'static str,
+    /// The signature block this draft carries ("\n\n-- \n…"), so switching From swaps
+    /// it only while its text is untouched. Empty means no swappable signature.
+    signature: String,
     /// Unsaved edits exist since the last successful save.
     dirty: bool,
     /// The draft has been saved at least once, so the panel can say "Saved".
@@ -55,6 +58,8 @@ struct Parts {
     bcc: Vec<Addr>,
     subject: String,
     body: String,
+    /// The signature block tracked in `body` (already included when composing fresh).
+    signature: String,
     reply_to: Option<Id>,
     send_at: Option<Ms>,
     remind_at: Option<Ms>,
@@ -120,6 +125,7 @@ impl Compose {
             recipient_errors: Default::default(),
             send_at: parts.send_at,
             remind_at: parts.remind_at,
+            signature: parts.signature,
             title: parts.title,
             dirty: false,
             saved: parts.id.is_some(),
@@ -128,11 +134,17 @@ impl Compose {
         }
     }
 
-    fn from_draft(window: &mut Window, cx: &mut Context<Kite>, draft: Draft) -> Self {
+    fn from_draft(
+        window: &mut Window,
+        cx: &mut Context<Kite>,
+        draft: Draft,
+        signature: String,
+    ) -> Self {
         Self::new(
             window,
             cx,
             Parts {
+                signature,
                 account_id: draft.account_id,
                 id: draft.id,
                 title: if draft.reply_to.is_some()
@@ -170,10 +182,14 @@ impl Compose {
     }
 
     fn is_empty(&self, cx: &App) -> bool {
+        let body = self.body.read(cx).value();
+        // A draft holding only its signature has nothing the user wrote yet.
+        let empty_body = body.trim().is_empty()
+            || (!self.signature.is_empty() && body.trim_end() == self.signature.trim_end());
         self.to.read(cx).value().trim().is_empty()
             && self.cc.read(cx).value().trim().is_empty()
             && self.subject.read(cx).value().trim().is_empty()
-            && self.body.read(cx).value().trim().is_empty()
+            && empty_body
             && self.bcc.read(cx).value().trim().is_empty()
     }
 }
@@ -218,6 +234,7 @@ impl Kite {
                 .account_id
                 .or_else(|| self.accounts.first().map(|account| account.id))
                 .unwrap_or(0);
+            let signature = signature_block(&self.settings, account_id);
             self.compose = Some(Compose::new(
                 window,
                 cx,
@@ -229,7 +246,8 @@ impl Kite {
                     cc: Vec::new(),
                     bcc: Vec::new(),
                     subject: String::new(),
-                    body: String::new(),
+                    body: signature.clone(),
+                    signature,
                     reply_to: None,
                     send_at: None,
                     remind_at: None,
@@ -281,11 +299,13 @@ impl Kite {
             (reply_to(&message, &own), Vec::new())
         };
         let reply_to = Some(message.id);
-        let body = if forward {
-            forward_body(&message)
-        } else {
-            quote(&message)
-        };
+        let signature = signature_block(&self.settings, account_id);
+        let body = signature.clone()
+            + &if forward {
+                forward_body(&message)
+            } else {
+                quote(&message)
+            };
         self.compose = Some(Compose::new(
             window,
             cx,
@@ -298,6 +318,7 @@ impl Kite {
                 bcc: Vec::new(),
                 subject: prefixed(&message.subject, prefix),
                 body,
+                signature,
                 reply_to,
                 send_at: None,
                 remind_at: None,
@@ -460,7 +481,7 @@ impl Kite {
                 self.compose = None;
                 self.compose_open = false;
                 window.focus(&self.focus, cx);
-                self.toast(
+                self.toast_undo(
                     if scheduled {
                         "Send scheduled"
                     } else {
@@ -540,7 +561,8 @@ impl Kite {
             cx.notify();
             return false;
         }
-        self.compose = Some(Compose::from_draft(window, cx, draft));
+        let signature = signature_block(&self.settings, draft.account_id);
+        self.compose = Some(Compose::from_draft(window, cx, draft, signature));
         self.compose_open = true;
         self.focus_compose(window, cx, false);
         cx.notify();
@@ -566,8 +588,14 @@ impl Kite {
             .map(|message| (row.account_id, message.clone()))
     }
 
-    /// Picks the account the draft is sent from; the recipients and body stay untouched.
-    fn set_compose_account(&mut self, account: Id, cx: &mut Context<Self>) {
+    /// Picks the account the draft is sent from; the recipients and body stay untouched,
+    /// except an untouched signature, which swaps to the new account's.
+    pub fn set_compose_account(
+        &mut self,
+        account: Id,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let changed = match &mut self.compose {
             Some(compose) if compose.account_id != account => {
                 compose.account_id = account;
@@ -575,9 +603,23 @@ impl Kite {
             }
             _ => false,
         };
-        if changed {
-            self.compose_changed(cx);
+        if !changed {
+            return;
         }
+        let old = std::mem::replace(
+            &mut self.compose.as_mut().unwrap().signature,
+            signature_block(&self.settings, account),
+        );
+        if let Some(compose) = &self.compose {
+            let body = compose.body.read(cx).value().to_string();
+            if !old.is_empty() && body.contains(&old) {
+                let next = body.replacen(&old, &compose.signature, 1);
+                compose.body.update(cx, |body, cx| {
+                    body.set_value(next, window, cx);
+                });
+            }
+        }
+        self.compose_changed(cx);
     }
 
     /// Reveals a recipient field from the To row's quiet toggle, with the caret in it.
@@ -640,7 +682,8 @@ impl Kite {
         // is opened here rather than inside `open_thread`.
         if let Some(draft) = self.open_draft.take() {
             self.open = None;
-            self.compose = Some(Compose::from_draft(window, cx, draft));
+            let signature = signature_block(&self.settings, draft.account_id);
+            self.compose = Some(Compose::from_draft(window, cx, draft, signature));
             self.compose_open = true;
             self.focus_compose(window, cx, false);
         }
@@ -792,9 +835,10 @@ impl Kite {
                         .overflow_y_scroll()
                         .flex()
                         .flex_col()
-                        .when_some(from_row(&t, &self.accounts, from_id, cx), |d, row| {
-                            d.child(row)
-                        })
+                        .when_some(
+                            from_row(&t, self.mail.as_ref(), &self.accounts, from_id, cx),
+                            |d, row| d.child(row),
+                        )
                         .child(field_row(
                             &t,
                             "To",
@@ -1080,11 +1124,39 @@ fn field_row(
     )
 }
 
+/// The signature block a draft for `account` starts with: a blank line under the
+/// typing point, then the standard "-- " separator, then the text. Empty adds nothing.
+fn signature_block(settings: &kite_core::model::Settings, account: Id) -> String {
+    let signature = settings
+        .profiles
+        .get(&account)
+        .map(|profile| profile.signature.trim_end())
+        .unwrap_or_default();
+    if signature.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n-- \n{signature}")
+    }
+}
+
 /// The sending identity: a dropdown over every account, or plain text when there is only one.
-fn from_row(t: &Theme, accounts: &[Account], from: Id, cx: &Context<Kite>) -> Option<AnyElement> {
+fn from_row(
+    t: &Theme,
+    mail: &dyn kite_core::api::Mail,
+    accounts: &[Account],
+    from: Id,
+    cx: &Context<Kite>,
+) -> Option<AnyElement> {
     let account = accounts.iter().find(|account| account.id == from)?;
     let identity = from_identity(account);
     let address = account.email.clone();
+    let picture = crate::sidebar::avatar_image(mail, from).map(|image| {
+        img(image)
+            .size(px(18.))
+            .rounded_full()
+            .flex_shrink_0()
+            .into_any_element()
+    });
     let content = if accounts.len() > 1 {
         let entity = cx.entity().downgrade();
         let choices: Vec<(Id, String)> = accounts
@@ -1105,9 +1177,10 @@ fn from_row(t: &Theme, accounts: &[Account], from: Id, cx: &Context<Kite>) -> Op
                     menu = menu.item(
                         PopupMenuItem::new(label.clone())
                             .checked(id == current)
-                            .on_click(move |_, _, cx| {
-                                let _ =
-                                    entity.update(cx, |kite, cx| kite.set_compose_account(id, cx));
+                            .on_click(move |_, window, cx| {
+                                let _ = entity.update(cx, |kite, cx| {
+                                    kite.set_compose_account(id, window, cx)
+                                });
                             }),
                     );
                 }
@@ -1128,6 +1201,18 @@ fn from_row(t: &Theme, accounts: &[Account], from: Id, cx: &Context<Kite>) -> Op
             .text_color(t.fg)
             .child(identity)
             .into_any_element()
+    };
+    let content = if let Some(picture) = picture {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .min_w_0()
+            .child(picture)
+            .child(content)
+            .into_any_element()
+    } else {
+        content
     };
     Some(field(t, "From", content))
 }

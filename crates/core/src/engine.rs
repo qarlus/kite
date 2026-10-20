@@ -184,6 +184,8 @@ pub(crate) struct Inner {
     opts: Options,
     /// Every `Event::Error`, so a failure that only flashed by as a toast can be read later.
     errors_log: PathBuf,
+    /// The data dir the store was opened in; avatars live under `<dir>/avatars/`.
+    dir: PathBuf,
 }
 
 impl Inner {
@@ -279,6 +281,7 @@ impl Engine {
             secrets,
             opts,
             errors_log: dir.join("errors.log"),
+            dir: dir.to_path_buf(),
         });
         let _ = std::thread::Builder::new()
             .name("kite-engine".into())
@@ -535,7 +538,54 @@ async fn sync_account(
         inner.write(|s| s.ensure_folder(account.id, &id, &name))?;
         changed |= !existed;
     }
+    if let Backend::Graph { client, .. } = backend {
+        changed |= fetch_photo(inner, account.id, client).await;
+    }
     Ok(changed)
+}
+
+/// `GET /me/photo/$value`, at most once a day per account (tracked in the store, so a
+/// restart does not re-ask). A 404 or a failed fetch never fails the sync; errors just
+/// retry on the next pass.
+async fn fetch_photo(inner: &Inner, account: Id, client: &mut Graph) -> bool {
+    const DAY: Ms = 86_400_000;
+    let checked = inner.read(|s| s.photo_checked(account)).ok().flatten();
+    if checked.is_some_and(|at| auth::now_ms() - at < DAY) {
+        return false;
+    }
+    let bytes = match client.photo().await {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    let _ = inner.write(|s| s.set_photo_checked(account, auth::now_ms()));
+    let Some(png) = bytes.and_then(|bytes| avatar_png(&bytes)) else {
+        return false;
+    };
+    write_avatar(&inner.dir.join("avatars"), account, "-provider", &png)
+}
+
+/// Decodes an image, centre-crops it to a square and downsizes it to 128×128 PNG.
+/// Avatars are always this shape, so the chosen-image picker and the provider
+/// photo fetch share the one pipeline.
+pub fn avatar_png(bytes: &[u8]) -> Option<Vec<u8>> {
+    let image = image::load_from_memory(bytes).ok()?;
+    let image = image.resize_to_fill(128, 128, image::imageops::FilterType::Lanczos3);
+    let mut out = std::io::Cursor::new(Vec::new());
+    image.write_to(&mut out, image::ImageFormat::Png).ok()?;
+    Some(out.into_inner())
+}
+
+/// Atomically writes `<dir>/<id><suffix>.png` (suffix "" for the user's choice,
+/// "-provider" for the fetched photo).
+fn write_avatar(dir: &Path, account: Id, suffix: &str, png: &[u8]) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let file = dir.join(format!("{account}{suffix}.png"));
+    let tmp = dir.join(format!("{account}{suffix}.tmp"));
+    std::fs::write(&tmp, png)
+        .and_then(|()| std::fs::rename(&tmp, &file))
+        .is_ok()
 }
 
 async fn send_due(
@@ -923,6 +973,44 @@ fn run_async<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
 impl Mail for Engine {
     fn accounts(&self) -> Result<Vec<Account>> {
         self.inner.read(Store::accounts)
+    }
+
+    fn avatar(&self, account: Id) -> Option<PathBuf> {
+        let dir = self.inner.dir.join("avatars");
+        // The user's choice always wins over the provider photo.
+        [format!("{account}.png"), format!("{account}-provider.png")]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    fn save_avatar(&self, account: Id, png: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            write_avatar(&self.inner.dir.join("avatars"), account, "", png),
+            "could not save the avatar image"
+        );
+        self.emit_changed()?;
+        Ok(())
+    }
+
+    fn remove_avatar(&self, account: Id) -> Result<()> {
+        let file = self
+            .inner
+            .dir
+            .join("avatars")
+            .join(format!("{account}.png"));
+        match std::fs::remove_file(&file) {
+            Ok(()) => self.emit_changed()?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    fn set_account_name(&self, id: Id, name: &str) -> Result<()> {
+        self.inner.write(|s| s.set_account_name(id, name))?;
+        self.emit_changed()?;
+        Ok(())
     }
 
     fn add_microsoft(&self) -> Result<Account> {

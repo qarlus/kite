@@ -106,7 +106,7 @@ impl Kite {
         match self.mail.act(&ids, &action) {
             Ok(token) => {
                 self.record_undo(token);
-                self.toast(
+                self.toast_undo(
                     if on {
                         format!("Removed {name}")
                     } else {

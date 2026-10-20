@@ -26,7 +26,7 @@ fn open_shortcuts(window: WindowHandle<Root>, cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 7usize), cx);
+        window.click(("settings-tab", 5usize), cx);
         window.render_frame(cx);
     })
     .unwrap();

@@ -96,7 +96,7 @@ fn switching_back_to_keyboard_mode_re_enables_single_keys_without_a_restart(
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 4usize), cx);
+        window.click(("settings-tab", 0usize), cx);
         window.render_frame(cx);
         assert_eq!(
             window.find("input-mode-classic").selected(),

@@ -5,7 +5,7 @@ use common::{Fixture, mount, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
 use kite_core::api::Mail;
-use kite_core::model::{Addr, Draft};
+use kite_core::model::{Addr, Draft, Id};
 use std::time::Duration;
 
 fn addr(name: &str, email: &str) -> Addr {
@@ -1428,4 +1428,106 @@ fn one_account_shows_the_from_row_without_a_dropdown(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+// ---- signatures --------------------------------------------------------------
+
+fn signature(fixture: &Fixture, account: Id, text: &str) {
+    fixture
+        .settings
+        .lock()
+        .unwrap()
+        .profiles
+        .entry(account)
+        .or_default()
+        .signature = text.into();
+}
+
+fn second_account(fixture: &Fixture) {
+    fixture
+        .accounts
+        .lock()
+        .unwrap()
+        .push(kite_core::model::Account {
+            id: 2,
+            provider: kite_core::model::Provider::Microsoft,
+            email: "me@outlook.com".into(),
+            name: "Me Two".into(),
+        });
+}
+
+#[gpui_kit::test]
+fn a_new_message_starts_with_the_accounts_signature(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    signature(&fixture, 1, "Cheers, Me");
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert!(kite.compose_open());
+        assert_eq!(
+            kite.compose_body(cx),
+            "\n\n-- \nCheers, Me",
+            "the body starts as only the signature block"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_reply_puts_the_signature_above_the_quote(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    signature(&fixture, 1, "Cheers, Me");
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.simulate_keystrokes(window.into(), "r");
+    update_content(window, &kite, cx, |kite, _, cx| {
+        let body = kite.compose_body(cx);
+        let sig = body.find("-- \nCheers, Me").expect("signature in reply");
+        let quote = body.find("wrote:").expect("quote in reply");
+        assert!(sig < quote, "signature sits above the quote: {body:?}");
+    });
+}
+
+#[gpui_kit::test]
+fn switching_from_swaps_an_untouched_signature(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    signature(&fixture, 1, "From One");
+    signature(&fixture, 2, "From Two");
+    second_account(&fixture);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    update_content(window, &kite, cx, |kite, window, cx| {
+        assert!(kite.compose_body(cx).contains("-- \nFrom One"));
+        kite.set_compose_account(2, window, cx);
+        let body = kite.compose_body(cx);
+        assert!(body.contains("-- \nFrom Two"), "swapped: {body:?}");
+        assert!(!body.contains("From One"), "old signature gone: {body:?}");
+    });
+}
+
+#[gpui_kit::test]
+fn switching_from_keeps_an_edited_signature(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    signature(&fixture, 1, "From One");
+    signature(&fixture, 2, "From Two");
+    second_account(&fixture);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-body", cx);
+        // Deleting the last letter of the signature edits it: a later switch
+        // must leave the user's own text alone.
+        window.press("backspace", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, window, cx| {
+        kite.set_compose_account(2, window, cx);
+        let body = kite.compose_body(cx);
+        assert!(
+            body.contains("From On"),
+            "an edited signature is never swapped: {body:?}"
+        );
+        assert!(!body.contains("From Two"), "{body:?}");
+    });
 }

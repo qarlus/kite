@@ -3,11 +3,30 @@
 //! Slow work (account setup, OAuth) is called by the UI from a background executor.
 use crate::model::*;
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub trait Mail: Send + Sync + 'static {
     fn accounts(&self) -> Result<Vec<Account>>;
     fn add_microsoft(&self) -> Result<Account>;
     fn remove_account(&self, id: Id) -> Result<()>;
+
+    /// The avatar image file for an account: the user's choice first, then the
+    /// provider's photo. `None` shows initials. Local files only; never blocks.
+    fn avatar(&self, _account: Id) -> Option<PathBuf> {
+        None
+    }
+    /// Replaces the account's chosen avatar with an already-encoded PNG.
+    fn save_avatar(&self, _account: Id, _png: &[u8]) -> Result<()> {
+        anyhow::bail!("Avatars are not available")
+    }
+    /// Removes the chosen avatar; a provider photo, when one exists, takes over.
+    fn remove_avatar(&self, _account: Id) -> Result<()> {
+        anyhow::bail!("Avatars are not available")
+    }
+    /// Changes the display name used as the From name.
+    fn set_account_name(&self, _id: Id, _name: &str) -> Result<()> {
+        anyhow::bail!("Renaming is not available")
+    }
 
     /// Starts a native Proton sign-in with the account password. Blocking; run off the UI thread.
     /// The password is used for SRP and key unlock and is never stored.

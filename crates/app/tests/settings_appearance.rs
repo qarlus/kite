@@ -65,12 +65,14 @@ fn choosing_a_theme_and_a_larger_text_size_persists_across_a_reopen(cx: &mut Tes
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("theme-dark").selected(), Some(true));
         window.click("theme-midnight", cx);
         window.render_frame(cx);
         assert_eq!(window.find("theme-midnight").selected(), Some(true));
         assert_eq!(window.find("theme-dark").selected(), Some(false));
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         window.click("font-larger", cx);
         window.render_frame(cx);
@@ -89,9 +91,11 @@ fn choosing_a_theme_and_a_larger_text_size_persists_across_a_reopen(cx: &mut Tes
     cx.simulate_keystrokes(reopened.into(), "secondary-,");
     cx.update_window(reopened.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("theme-midnight").selected(), Some(true));
         assert_eq!(window.find("theme-dark").selected(), Some(false));
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         assert_eq!(window.find("font-size-value").label(), Some("15 px"));
         assert_eq!(
@@ -112,7 +116,7 @@ fn the_live_preview_and_its_colour_swatch_follow_the_applied_typography(cx: &mut
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         assert_eq!(
             window.find("font-color-swatch").label(),
@@ -194,7 +198,7 @@ async fn a_font_is_picked_from_the_list_and_system_default_clears_it(cx: &mut Te
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         assert_eq!(window.find("font-family").value(), Some("Georgia"));
         assert_eq!(
@@ -256,7 +260,7 @@ fn font_picker_group_headers_own_a_row_and_never_overlap_their_items(cx: &mut Te
     let (default_header, current_header, default_row, current_row) = cx
         .update_window(window.into(), |_, window, cx| {
             window.render_frame(cx);
-            window.click(("settings-tab", 1usize), cx);
+            window.click(("settings-tab", 4usize), cx);
             window.render_frame(cx);
             window.scroll(
                 "settings-scroll",
@@ -359,6 +363,8 @@ fn the_ember_theme_can_be_picked_and_persists(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         window.click("theme-ember", cx);
         window.render_frame(cx);
         assert_eq!(
@@ -386,6 +392,8 @@ fn the_ember_theme_can_be_picked_and_persists(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(reopened.into(), "secondary-,");
     cx.update_window(reopened.into(), |_, window, cx| {
         window.render_frame(cx);
+        window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
         assert_eq!(window.find("theme-ember").selected(), Some(true));
     })
     .unwrap();
@@ -407,7 +415,7 @@ fn a_larger_text_size_reflows_the_real_list_and_reading_pane(cx: &mut TestAppCon
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 1usize), cx);
+        window.click(("settings-tab", 4usize), cx);
         window.render_frame(cx);
         window.click("font-larger", cx);
         window.click("font-larger", cx);

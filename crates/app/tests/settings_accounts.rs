@@ -3,6 +3,7 @@ mod common;
 use common::{Fixture, mount};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
+use kite_core::api::Mail;
 use kite_core::model::ProtonAuth;
 use std::time::Duration;
 
@@ -15,7 +16,7 @@ fn the_connections_page_offers_proton_and_outlook_without_bridge_or_app_id_field
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 3usize), cx);
+        window.click(("settings-tab", 2usize), cx);
         window.render_frame(cx);
         assert!(
             window.try_find("proton-native").is_some(),
@@ -54,11 +55,11 @@ async fn outlook_connect_adds_the_account(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 3usize), cx);
+        window.click(("settings-tab", 2usize), cx);
         window.render_frame(cx);
         window.click("add-microsoft", cx);
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", 1usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -93,7 +94,7 @@ async fn a_native_proton_sign_in_takes_the_second_step_and_adds_the_account(
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 3usize), cx);
+        window.click(("settings-tab", 2usize), cx);
         window.render_frame(cx);
         window.click("proton-address", cx);
         window.input("kite@proton.me", cx);
@@ -116,7 +117,7 @@ async fn a_native_proton_sign_in_takes_the_second_step_and_adds_the_account(
         window.input("123456", cx);
         window.click("proton-step", cx);
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", 1usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -155,7 +156,7 @@ async fn human_verification_finishes_without_asking_for_a_token(cx: &mut TestApp
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 3usize), cx);
+        window.click(("settings-tab", 2usize), cx);
         window.render_frame(cx);
         window.click("proton-address", cx);
         window.input("kite@proton.me", cx);
@@ -173,7 +174,7 @@ async fn human_verification_finishes_without_asking_for_a_token(cx: &mut TestApp
         assert!(window.try_find("proton-answer").is_none());
         window.click("proton-step", cx);
         window.render_frame(cx);
-        window.click(("settings-tab", 2usize), cx);
+        window.click(("settings-tab", 1usize), cx);
     })
     .unwrap();
     cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
@@ -185,4 +186,145 @@ async fn human_verification_finishes_without_asking_for_a_token(cx: &mut TestApp
         vec![String::new()],
         "the retry carries no typed answer; the engine reuses Proton's challenge"
     );
+}
+
+// ---- per-account profile -----------------------------------------------------
+
+#[gpui_kit::test]
+fn the_accounts_page_shows_profile_fields_per_account(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
+        for id in [1, 2] {
+            assert!(
+                window.try_find(format!("settings-account-{id}")).is_some(),
+                "account {id} card"
+            );
+            assert!(
+                window.try_find(format!("account-signature-{id}")).is_some(),
+                "account {id} signature field"
+            );
+            assert!(
+                window.try_find(format!("choose-avatar-{id}")).is_some(),
+                "account {id} avatar picker"
+            );
+            assert!(
+                window.try_find(format!("account-name-{id}")).is_some(),
+                "account {id} display name field"
+            );
+        }
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn editing_the_signature_persists_it_through_settings(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
+        window.click("account-signature-1", cx);
+        window.input("Regards, Karl", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture
+            .settings
+            .lock()
+            .unwrap()
+            .profiles
+            .get(&1)
+            .map(|profile| profile.signature.clone())
+            .unwrap_or_default(),
+        "Regards, Karl",
+        "the signature reached Mail::set_settings"
+    );
+}
+
+#[gpui_kit::test]
+fn editing_the_display_name_renames_the_account(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+        window.render_frame(cx);
+        window.click("account-name-1", cx);
+        // The field holds the current name; clear it before typing the new one.
+        for _ in 0..20 {
+            window.press("backspace", cx);
+        }
+        window.input("Karl M", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(
+        fixture.accounts.lock().unwrap()[0].name,
+        "Karl M",
+        "the display name reached the store through Mail::set_account_name"
+    );
+}
+
+#[gpui_kit::test]
+async fn a_late_added_accounts_remove_button_stays_reachable(cx: &mut TestAppContext) {
+    // The account cards grow when profile fields exist, but a freshly connected
+    // account's Remove button must stay above the notice bar (regression).
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 2usize), cx);
+        window.render_frame(cx);
+        window.click("add-microsoft", cx);
+        window.render_frame(cx);
+        window.click(("settings-tab", 1usize), cx);
+    })
+    .unwrap();
+    cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+        window.try_find("settings-account-3").is_some()
+    })
+    .await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click("remove-account-3", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("confirm-remove-account").is_some(),
+            "confirm appears"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_rail_shows_the_avatar_image_only_when_the_file_exists(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    assert!(
+        fixture.avatar(1).is_none(),
+        "no avatar file yet: initials must show"
+    );
+    // The user-picked file: a real PNG under the fixture's own data dir.
+    fixture.save_avatar(1, common::PNG).unwrap();
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find(("account-avatar", 0usize)).is_some(),
+            "the rail shows the avatar image when the file exists"
+        );
+        assert!(
+            window.try_find(("account-avatar", 1usize)).is_none(),
+            "the second account still shows initials"
+        );
+    })
+    .unwrap();
 }

@@ -196,7 +196,6 @@ fn inbox_preview(palette: Theme) -> Div {
 
 pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
-    let narrow = window.viewport_size().width < px(1000.);
 
     let mut themes = vec![
         ("dark", "Carbon", theme::CARBON),
@@ -211,8 +210,21 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         themes.push(("custom", custom.name.as_str(), palette));
     }
 
+    // Tiles keep one width in every row: the grid wraps at the count that fits the content
+    // column at TILE_MIN, and a short last row stays left-aligned instead of stretching.
+    const TILE_MIN: f32 = 124.;
+    const GAP: f32 = 12.;
+    let content = super::content_width(window);
+    let columns = if super::compact(window) {
+        2
+    } else {
+        ((content + GAP) / (TILE_MIN + GAP)) as usize
+    }
+    .clamp(1, themes.len());
+    let tile_w = (content - GAP * (columns - 1) as f32) / columns as f32;
+
     let mut grid = div().flex().flex_col().gap_3();
-    for group in themes.chunks(if narrow { 2 } else { 4 }) {
+    for group in themes.chunks(columns) {
         grid = grid.child(div().flex().gap_3().children(group.iter().map(
             |(id, name, palette)| {
                 let id = *id;
@@ -229,8 +241,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .test_support()
                     .aria_label(format!("{name} theme"))
                     .aria_selected(selected)
-                    .flex_1()
-                    .min_w_0()
+                    .w(px(tile_w))
+                    .flex_shrink_0()
                     .p(px(1.))
                     .rounded(px(RADIUS))
                     .bg(ring)

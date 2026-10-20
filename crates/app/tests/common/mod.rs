@@ -1,6 +1,11 @@
 //! Test fixture: an in-memory `Mail` that serves synthetic threads, applies actions
 //! to its own data and records every call the UI makes.
 #![allow(dead_code)]
+// engine_boot.rs declares its own copy at its crate root; each test binary compiles
+// `common` as a nested module, so the fixture needs the path declared here too.
+#[allow(clippy::duplicate_mod)]
+#[path = "temp_dir.rs"]
+pub mod temp_dir;
 use gpui_kit::{
     App, AppContext, Bounds, Entity, Point, Render, Size, TestAppContext, Window, WindowBounds,
     WindowHandle, WindowOptions, base::Root, px,
@@ -13,6 +18,7 @@ use kite_core::model::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use temp_dir::TempDir;
 
 pub const SPLITS: [Id; 4] = [1, 2, 3, 4];
 /// The seeded split set, in tab order: the plain inbox lens, then the categories.
@@ -88,6 +94,8 @@ pub struct Fixture {
     draft_seq: AtomicI64,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
+    /// The fixture's own data dir; avatars are files under `<dir>/avatars/`.
+    pub dir: TempDir,
 }
 
 impl Fixture {
@@ -193,6 +201,7 @@ impl Fixture {
             draft_seq: AtomicI64::new(1),
             senders: Mutex::new(Vec::new()),
             next_token: AtomicI64::new(1),
+            dir: TempDir::new("fixture"),
         })
     }
 
@@ -631,6 +640,41 @@ impl Mail for Fixture {
         };
         accounts.push(account.clone());
         Ok(account)
+    }
+
+    fn avatar(&self, account: Id) -> Option<std::path::PathBuf> {
+        let dir = self.dir.join("avatars");
+        [format!("{account}.png"), format!("{account}-provider.png")]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .find(|path| path.is_file())
+    }
+
+    fn save_avatar(&self, account: Id, png: &[u8]) -> anyhow::Result<()> {
+        let dir = self.dir.join("avatars");
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join(format!("{account}.png")), png)?;
+        Ok(())
+    }
+
+    fn remove_avatar(&self, account: Id) -> anyhow::Result<()> {
+        let file = self.dir.join("avatars").join(format!("{account}.png"));
+        match std::fs::remove_file(&file) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    fn set_account_name(&self, id: Id, name: &str) -> anyhow::Result<()> {
+        let mut accounts = self.accounts.lock().unwrap();
+        let account = accounts
+            .iter_mut()
+            .find(|account| account.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Unknown account"))?;
+        account.name = name.trim().to_string();
+        Ok(())
     }
 
     fn remove_account(&self, id: Id) -> anyhow::Result<()> {

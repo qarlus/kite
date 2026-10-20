@@ -74,6 +74,8 @@ pub(crate) struct Toast {
     seq: u64,
     /// A completed state change, which gets the DESIGN › Icons draw acknowledgement.
     mark: bool,
+    /// The action just taken is the one Undo would reverse, so the hint is truthful.
+    undo: bool,
 }
 
 pub struct Open {
@@ -455,13 +457,24 @@ impl Kite {
     }
 
     pub(crate) fn toast(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
-        self.show_toast(text.into(), false, cx);
+        self.show_toast(text.into(), false, false, cx);
     }
 
-    fn show_toast(&mut self, text: String, mark: bool, cx: &mut Context<Self>) {
+    /// A toast for an action Undo can still reverse, so it carries the `z` hint.
+    pub(crate) fn toast_undo(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        self.show_toast(text.into(), false, true, cx);
+    }
+
+    fn show_toast(&mut self, text: String, mark: bool, undo: bool, cx: &mut Context<Self>) {
         self.seq += 1;
         let seq = self.seq;
-        self.toast = Some(Toast { text, seq, mark });
+        self.toast = Some(Toast {
+            text,
+            seq,
+            mark,
+            undo,
+        });
+        cx.notify();
         let timer = cx.background_executor().timer(Duration::from_secs(4));
         cx.spawn(async move |this, cx| {
             timer.await;
@@ -506,7 +519,16 @@ impl Kite {
             return;
         }
         let last = self.rows.len() - 1;
-        self.sel = (self.sel as isize + delta).clamp(0, last as isize) as usize;
+        let target = (self.sel as isize + delta).clamp(0, last as isize) as usize;
+        if target == self.sel {
+            // At the edge: say so rather than swallowing the key. Repeating it refreshes the
+            // one toast instead of stacking another.
+            let edge = if delta > 0 { "End of " } else { "Top of " };
+            let name = self.view_name().to_string();
+            self.toast(format!("{edge}{name}"), cx);
+            return;
+        }
+        self.sel = target;
         // In the reading pane, moving in the list does not change the open conversation.
         if self.open.is_some() && self.pane == Pane::Thread {
             self.open_thread(cx);
@@ -515,6 +537,25 @@ impl Kite {
                 .scroll_to_item(self.sel, ScrollStrategy::Nearest);
         }
         cx.notify();
+    }
+
+    /// The list column's title: the folder, the search, the split tab or the mailbox.
+    fn view_name(&self) -> &str {
+        if let Some(folder) = self.folders.iter().find(|folder| {
+            Some(folder.account_id) == self.view.account_id
+                && Some(&folder.id) == self.view.folder.as_ref()
+        }) {
+            return folder.name.as_str();
+        }
+        if self.view.query.is_some() {
+            return "Search results";
+        }
+        if let Some(split) = self.view.split
+            && let Some(tab) = self.tabs.iter().find(|tab| tab.split == Some(split))
+        {
+            return tab.name.as_str();
+        }
+        crate::sidebar::mailbox_name(self.view.mailbox)
     }
 
     pub fn open_thread(&mut self, cx: &mut Context<Self>) {
@@ -650,7 +691,7 @@ impl Kite {
             }
         }
         let mark = matches!(action, MailAction::Archive);
-        self.show_toast(text.into(), mark, cx);
+        self.show_toast(text.into(), mark, true, cx);
     }
 
     fn star(&mut self, cx: &mut Context<Self>) {
@@ -742,7 +783,7 @@ impl Kite {
             return;
         }
         if id == cmd::SETTINGS {
-            self.show_preferences(crate::preferences::OPEN_APPEARANCE, window, cx);
+            self.show_preferences(crate::preferences::OPEN_GENERAL, window, cx);
             return;
         }
         if id == cmd::ACCOUNT_SWITCHER {
@@ -1603,16 +1644,7 @@ impl Kite {
     /// The list column header: the mailbox title with its picker, the account identity and compose.
     fn render_inbox_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let t = self.theme;
-        let title = if let Some(folder) = self.folders.iter().find(|folder| {
-            Some(folder.account_id) == self.view.account_id
-                && Some(&folder.id) == self.view.folder.as_ref()
-        }) {
-            folder.name.as_str()
-        } else if self.view.query.is_some() {
-            "Search results"
-        } else {
-            crate::sidebar::mailbox_name(self.view.mailbox)
-        };
+        let title = self.view_name();
         let account = self
             .view
             .account_id
@@ -1756,7 +1788,7 @@ impl Kite {
     fn render_toast(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let toast = self.toast.as_ref()?;
         let t = self.theme;
-        let can_undo = self.sent.is_some() || self.undo.is_some();
+        let can_undo = toast.undo;
         Some(
             div()
                 .absolute()
@@ -1815,15 +1847,26 @@ impl Kite {
                                     )
                                 })
                                 .child(toast.text.clone())
-                                .when_some(
-                                    Kbd::binding_for_action(
-                                        &Act { cmd: cmd::UNDO },
-                                        Some("Kite"),
-                                        window,
-                                    ),
-                                    |d, hint| d.child(hint.outline()),
-                                )
-                                .child(div().text_color(t.fg3).child("to undo")),
+                                .when(can_undo, |d| {
+                                    d.child(
+                                        div()
+                                            .id("toast-undo-hint")
+                                            .test_support()
+                                            .aria_label("Undo")
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .when_some(
+                                                Kbd::binding_for_action(
+                                                    &Act { cmd: cmd::UNDO },
+                                                    Some("Kite"),
+                                                    window,
+                                                ),
+                                                |d, hint| d.child(hint.outline()),
+                                            )
+                                            .child(div().text_color(t.fg3).child("to undo")),
+                                    )
+                                }),
                         ),
                 )
                 .into_any_element(),

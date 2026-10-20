@@ -516,6 +516,36 @@ impl Store {
         Ok(())
     }
 
+    /// The display name used as the From name.
+    pub fn set_account_name(&self, id: Id, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET name=?1 WHERE id=?2",
+            params![name.trim(), id],
+        )?;
+        Ok(())
+    }
+
+    /// When the account's provider photo was last fetched, for the once-a-day cap.
+    pub fn photo_checked(&self, id: Id) -> Result<Option<Ms>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM kv WHERE k=?1",
+                [format!("photo_checked:{id}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
+    }
+
+    pub fn set_photo_checked(&self, id: Id, at: Ms) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            params![format!("photo_checked:{id}"), at.to_string()],
+        )?;
+        Ok(())
+    }
+
     pub fn account_provider(&self, id: Id) -> Result<Option<Provider>> {
         let p = self
             .conn
