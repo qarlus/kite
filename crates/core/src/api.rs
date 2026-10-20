@@ -6,22 +6,8 @@ use anyhow::Result;
 
 pub trait Mail: Send + Sync + 'static {
     fn accounts(&self) -> Result<Vec<Account>>;
-    fn add_proton(&self, login: ProtonLogin) -> Result<Account>;
     fn add_microsoft(&self) -> Result<Account>;
     fn remove_account(&self, id: Id) -> Result<()>;
-
-    /// Proton Bridge accounts found on this machine, ready to pass to [`Mail::add_proton`].
-    /// Reads only local files and the OS keychain, so callers must run it off the UI thread.
-    fn discover_proton(&self) -> Result<Vec<ProtonLogin>> {
-        crate::bridge::discover()
-    }
-
-    /// Starts Proton Bridge when it is installed, returning whether an install was launched.
-    /// Blocking; callers must run it off the UI thread. Bridge keeps the Proton sign-in itself,
-    /// so a locked Bridge still needs the user in its own window.
-    fn start_proton_bridge(&self) -> Result<bool> {
-        crate::bridge::launch()
-    }
 
     /// Starts a native Proton sign-in with the account password. Blocking; run off the UI thread.
     /// The password is used for SRP and key unlock and is never stored.

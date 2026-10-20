@@ -1,4 +1,6 @@
 //! Graph backend and OAuth tests, driven by a local fake HTTP server.
+#[path = "common/temp_dir.rs"]
+mod temp_dir;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use kite_core::auth::{self, Tokens};
@@ -1068,8 +1070,7 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
         _ => Reply::empty(404),
     })
     .await;
-    let dir = std::env::temp_dir().join(format!("kite-graph-rejected-send-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::TempDir::new("graph-rejected-send");
     let store = Store::open(&dir.join("kite.db")).unwrap();
     let account = store
         .add_account(Provider::Microsoft, "me@example.com", "Me")

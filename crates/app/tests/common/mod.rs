@@ -8,7 +8,7 @@ use gpui_kit::{
 use kite_core::api::Mail;
 use kite_core::model::{
     Account, Action, Addr, AiRequest, Attachment, CalEvent, Draft, Event, Folder, Id, Mailbox,
-    Message, Ms, ProtonAuth, ProtonLogin, Settings, Split, Tag, ThreadSummary, View,
+    Message, Ms, ProtonAuth, Settings, Split, Tag, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -42,14 +42,6 @@ pub struct Fixture {
     pub locations: Mutex<Locations>,
     pub folder_error: Mutex<Option<String>>,
     pub account_error: Mutex<Option<String>>,
-    /// What `discover_proton` returns; set by settings tests to fake a local Bridge.
-    pub discovered: Mutex<Vec<ProtonLogin>>,
-    pub discover_error: Mutex<Option<String>>,
-    /// Whether `start_proton_bridge` finds an install, and how many times it was asked.
-    pub bridge_installed: Mutex<bool>,
-    pub bridge_started: Mutex<usize>,
-    /// Accounts that become discoverable once Bridge has been started.
-    pub bridge_accounts: Mutex<Vec<ProtonLogin>>,
     /// What `proton_sign_in` answers instead of an account (2FA, mailbox password, HV).
     pub proton_step: Mutex<Option<ProtonAuth>>,
     /// Address and password the native Proton form submitted.
@@ -151,11 +143,6 @@ impl Fixture {
             locations: Mutex::new(HashMap::new()),
             folder_error: Mutex::new(None),
             account_error: Mutex::new(None),
-            discovered: Mutex::new(Vec::new()),
-            discover_error: Mutex::new(None),
-            bridge_installed: Mutex::new(false),
-            bridge_started: Mutex::new(0),
-            bridge_accounts: Mutex::new(Vec::new()),
             proton_step: Mutex::new(None),
             proton_attempts: Mutex::new(Vec::new()),
             proton_answers: Mutex::new(Vec::new()),
@@ -610,23 +597,7 @@ fn draft_participants(draft: &Draft) -> String {
 
 impl Fixture {
     /// The account a finished native Proton sign-in creates.
-    fn add_native_proton(&self, email: &str, password: &str) -> anyhow::Result<ProtonAuth> {
-        Ok(ProtonAuth::Done(self.add_proton(ProtonLogin {
-            email: email.to_string(),
-            password: password.to_string(),
-            host: None,
-            imap_port: None,
-            smtp_port: None,
-        })?))
-    }
-}
-
-impl Mail for Fixture {
-    fn accounts(&self) -> anyhow::Result<Vec<Account>> {
-        Ok(self.accounts.lock().unwrap().clone())
-    }
-
-    fn add_proton(&self, login: ProtonLogin) -> anyhow::Result<Account> {
+    fn add_native_proton(&self, email: &str, _password: &str) -> anyhow::Result<ProtonAuth> {
         if let Some(error) = self.account_error.lock().unwrap().clone() {
             anyhow::bail!(error);
         }
@@ -634,32 +605,17 @@ impl Mail for Fixture {
         let account = Account {
             id: accounts.iter().map(|a| a.id).max().unwrap_or(0) + 1,
             provider: kite_core::model::Provider::Proton,
-            email: login.email,
+            email: email.to_string(),
             name: "Karl".into(),
         };
         accounts.push(account.clone());
-        Ok(account)
+        Ok(ProtonAuth::Done(account))
     }
+}
 
-    fn discover_proton(&self) -> anyhow::Result<Vec<ProtonLogin>> {
-        if let Some(error) = self.discover_error.lock().unwrap().clone() {
-            anyhow::bail!(error);
-        }
-        Ok(self.discovered.lock().unwrap().clone())
-    }
-
-    fn start_proton_bridge(&self) -> anyhow::Result<bool> {
-        *self.bridge_started.lock().unwrap() += 1;
-        if !*self.bridge_installed.lock().unwrap() {
-            return Ok(false);
-        }
-        // Bridge is up: its vault is readable again and its port answers.
-        *self.discover_error.lock().unwrap() = None;
-        let accounts = self.bridge_accounts.lock().unwrap().clone();
-        if !accounts.is_empty() {
-            *self.discovered.lock().unwrap() = accounts;
-        }
-        Ok(true)
+impl Mail for Fixture {
+    fn accounts(&self) -> anyhow::Result<Vec<Account>> {
+        Ok(self.accounts.lock().unwrap().clone())
     }
 
     fn add_microsoft(&self) -> anyhow::Result<Account> {

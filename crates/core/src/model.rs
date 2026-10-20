@@ -235,15 +235,6 @@ impl Default for Settings {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ProtonLogin {
-    pub email: String,
-    pub password: String,
-    pub host: Option<String>,
-    pub imap_port: Option<u16>,
-    pub smtp_port: Option<u16>,
-}
-
 /// The next step of a native Proton sign-in (Proton's API directly, no Bridge; works on free plans).
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum ProtonAuth {

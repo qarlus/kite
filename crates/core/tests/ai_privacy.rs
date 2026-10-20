@@ -1,4 +1,6 @@
 //! Privacy enforcement through the production Mail API and real SQLite, without an AI service.
+#[path = "common/temp_dir.rs"]
+mod temp_dir;
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -10,8 +12,7 @@ use kite_core::store::Store;
 
 #[test]
 fn private_conversations_and_their_replies_never_reach_the_ai_endpoint() {
-    let dir = std::env::temp_dir().join(format!("kite-ai-privacy-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = temp_dir::TempDir::new("ai-privacy");
     let store = Store::open(&dir.join("kite.db")).unwrap();
     let account = store
         .add_account(Provider::Proton, "me@example.com", "Me")

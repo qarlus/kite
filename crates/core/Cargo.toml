@@ -12,9 +12,6 @@ serde_json.workspace = true
 async-channel = "2"
 tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
 reqwest.workspace = true
-native-tls.workspace = true
-tokio-native-tls.workspace = true
-async-imap.workspace = true
 mail-parser.workspace = true
 mail-builder.workspace = true
 chrono.workspace = true
@@ -23,20 +20,12 @@ futures-util.workspace = true
 sha2.workspace = true
 base64.workspace = true
 getrandom.workspace = true
-aes-gcm.workspace = true
 # Native Proton Mail (API, not Bridge): SRP login and OpenPGP message bodies.
 bcrypt.workspace = true
 num-bigint-dig.workspace = true
 pgp.workspace = true
 rand.workspace = true
 
-[target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32_Foundation", "Win32_Security_Credentials"] }
-
 [dev-dependencies]
-# Fake Graph/IMAP/SMTP servers and `#[tokio::test]` need a runtime.
+# Fake Graph/Proton HTTP servers and `#[tokio::test]` need a runtime.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
-# Only the bridge tests need a full codec: they build real msgpack vaults for the
-# focused reader in `bridge.rs`. Keeping it out of `[dependencies]` keeps the
-# shipped binary inside its 20 MB budget.
-rmp-serde.workspace = true

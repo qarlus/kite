@@ -2,9 +2,9 @@
 //! local fake Proton API that speaks SRP, OpenPGP and Proton's event batches.
 mod common;
 
+use common::temp_dir::TempDir;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -24,13 +24,8 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("runtime")
 }
 
-fn temp_dir() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("kite-proton-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+fn temp_dir() -> TempDir {
+    TempDir::new("proton")
 }
 
 fn open_engine(dir: &Path, api_url: &str) -> Arc<Engine> {
@@ -112,7 +107,7 @@ fn signed_in_with_mail(
     rt: &tokio::runtime::Runtime,
     world: World,
     count: usize,
-) -> (Arc<Engine>, fake::Server, Account) {
+) -> (TempDir, Arc<Engine>, fake::Server, Account) {
     let server = rt.block_on(fake::serve(world));
     let dir = temp_dir();
     let engine = open_engine(&dir, &server.url);
@@ -125,7 +120,7 @@ fn signed_in_with_mail(
         (threads.len() >= count).then_some(threads)
     });
     assert!(threads.len() >= count);
-    (engine, server, account)
+    (dir, engine, server, account)
 }
 
 // -------------------------------------------------------------------- tests
@@ -148,7 +143,7 @@ fn sign_in_unlocks_the_keys_and_delivers_decrypted_mail() {
         &["0", "5"],
     );
 
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 2);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 2);
 
     let threads = engine.threads(&inbox(account.id), 0, 50).expect("threads");
     let mut subjects: Vec<&str> = threads.iter().map(|t| t.subject.as_str()).collect();
@@ -281,7 +276,7 @@ fn threading_uses_the_references_chain() {
         &["0", "5"],
     );
     world.add_reply("Re: Quarterly numbers", &parent, "Second");
-    let (engine, _server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, _server, account) = signed_in_with_mail(&rt, world, 1);
 
     let threads = engine.threads(&inbox(account.id), 0, 50).expect("threads");
     assert_eq!(threads.len(), 1, "a reply belongs to its parent's thread");
@@ -294,7 +289,7 @@ fn the_event_loop_applies_flag_changes_and_deletions() {
     let mut world = World::new();
     let kept = world.add_message("Keep me", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
     let gone = world.add_message("Delete me", ("Bob", "bob@example.com"), "two", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 2);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 2);
 
     {
         let mut world = server.world();
@@ -325,7 +320,7 @@ fn archiving_relabels_the_message_on_the_server() {
         "one",
         &["0", "5"],
     );
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
 
     let thread = engine.threads(&inbox(account.id), 0, 5).expect("threads")[0].id;
     engine.act(&[thread], &Action::Archive).expect("archive");
@@ -363,7 +358,7 @@ fn sending_encrypts_for_proton_recipients_and_sends_cleartext_outside() {
     let rt = runtime();
     let mut world = World::new();
     world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
     // Send immediately: no undo window in this test.
     let mut settings = engine.settings().expect("settings");
     settings.undo_send_secs = 0;
@@ -442,7 +437,7 @@ fn a_draft_is_saved_and_discarded_on_the_server() {
     let rt = runtime();
     let mut world = World::new();
     world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
 
     let draft = Draft {
         id: None,
@@ -517,7 +512,7 @@ fn removing_an_account_revokes_the_session() {
     let rt = runtime();
     let mut world = World::new();
     world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
 
     engine.remove_account(account.id).expect("remove");
     assert!(server.world().logged_out, "the session must be revoked");
@@ -529,7 +524,7 @@ fn a_created_folder_is_a_proton_label() {
     let rt = runtime();
     let mut world = World::new();
     world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
 
     let folder = engine.create_folder(account.id, "Travel").expect("folder");
     assert_eq!(folder.name, "Travel");
@@ -589,7 +584,7 @@ fn star_and_read_state_round_trip_through_the_api() {
     let rt = runtime();
     let mut world = World::new();
     let message = world.add_message("Star me", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
     let thread = engine.threads(&inbox(account.id), 0, 5).expect("threads")[0].id;
 
     engine.act(&[thread], &Action::Star).expect("star");
@@ -726,7 +721,7 @@ fn a_synced_draft_can_be_trashed_and_restored_with_undo() {
         "Keep this text",
         &["1", "8"],
     );
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 0);
     let view = mailbox(account.id, Mailbox::Drafts);
     let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
     // Opening and closing compose adopts the provider draft without changing its identity.
@@ -776,7 +771,7 @@ fn discarding_a_reopened_provider_draft_deletes_it_locally_and_on_proton() {
         "Started on the web",
         &["1", "8"],
     );
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 0);
     let view = mailbox(account.id, Mailbox::Drafts);
     let row = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
     let draft = engine.draft(row.id).expect("draft").expect("editable");
@@ -799,7 +794,7 @@ fn sent_is_visible_as_soon_as_proton_accepts_the_send_and_does_not_duplicate_on_
     let rt = runtime();
     let mut world = World::new();
     world.add_message("Hi", ("Alice", "alice@proton.me"), "one", &["0", "5"]);
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 1);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 1);
     server.world().pause_events = true;
     let mut settings = engine.settings().expect("settings");
     settings.undo_send_secs = 0;
@@ -854,7 +849,7 @@ fn external_sending_uses_protons_clock_even_when_the_computer_is_ahead() {
     let mut world = World::new();
     world.clock_skew_secs = -120;
     world.sign_external = false;
-    let (engine, server, account) = signed_in_with_mail(&rt, world, 0);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, world, 0);
     let mut settings = engine.settings().expect("settings");
     settings.undo_send_secs = 0;
     engine.set_settings(settings).expect("settings");
@@ -882,7 +877,7 @@ fn external_sending_uses_protons_clock_even_when_the_computer_is_ahead() {
 #[test]
 fn independent_sends_in_one_proton_conversation_stay_separate_but_composed_replies_join() {
     let rt = runtime();
-    let (engine, server, account) = signed_in_with_mail(&rt, World::new(), 0);
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, World::new(), 0);
     server.world().pause_events = true;
     let mut settings = engine.settings().expect("settings");
     settings.undo_send_secs = 0;
@@ -957,11 +952,11 @@ fn native_engine(
     world: World,
     poll: Duration,
 ) -> (
+    TempDir,
     tokio::runtime::Runtime,
     fake::Server,
     Arc<Engine>,
     Account,
-    PathBuf,
 ) {
     use kite_core::sync::proton::{SignIn, Step};
     let rt = runtime();
@@ -992,7 +987,7 @@ fn native_engine(
         },
     )
     .unwrap();
-    (rt, server, engine, account, dir)
+    (dir, rt, server, engine, account)
 }
 
 fn stored_cursor(dir: &Path, account: Id) -> serde_json::Value {
@@ -1023,7 +1018,7 @@ fn startup_syncs_existing_accounts_before_the_first_poll() {
         "ready",
         &["0", "5"],
     );
-    let (_rt, _server, engine, account, dir) = native_engine(world, Duration::from_secs(300));
+    let (dir, _rt, _server, engine, account) = native_engine(world, Duration::from_secs(300));
     wait_live(&dir, account.id);
     assert_eq!(
         engine.threads(&inbox(account.id), 0, 10).unwrap()[0].subject,
@@ -1033,7 +1028,7 @@ fn startup_syncs_existing_accounts_before_the_first_poll() {
 
 #[test]
 fn live_creates_use_fetched_metadata_and_announce_new_inbox_mail() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     let events = engine.events();
@@ -1066,7 +1061,7 @@ fn live_creates_use_fetched_metadata_and_announce_new_inbox_mail() {
 
 #[test]
 fn missing_signed_and_undecryptable_bodies_do_not_wedge_the_event_cursor() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     let (missing, last) = {
@@ -1123,7 +1118,7 @@ fn refresh_reconciles_metadata_and_deletions_without_downloading_stored_bodies()
     let mut world = World::new();
     let kept = world.add_message("Keep body", ("A", "a@x"), "cached body", &["0", "5"]);
     let gone = world.add_message("Gone", ("B", "b@x"), "old", &["0", "5"]);
-    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    let (dir, _rt, server, engine, account) = native_engine(world, Duration::from_millis(20));
     wait_live(&dir, account.id);
     let body_path = format!("/api/mail/v4/messages/{kept}");
     let before = server
@@ -1169,7 +1164,7 @@ fn refresh_reconciles_metadata_and_deletions_without_downloading_stored_bodies()
 
 #[test]
 fn label_events_discover_folders_created_on_the_web() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     eventually(|| {
@@ -1204,7 +1199,7 @@ fn label_events_discover_folders_created_on_the_web() {
 
 #[test]
 fn forced_sync_is_limited_to_one_request_per_ten_seconds() {
-    let (_rt, server, engine, account, dir) = native_engine(World::new(), Duration::from_secs(300));
+    let (dir, _rt, server, engine, account) = native_engine(World::new(), Duration::from_secs(300));
     wait_live(&dir, account.id);
     server
         .world()
@@ -1231,7 +1226,7 @@ fn forced_sync_is_limited_to_one_request_per_ten_seconds() {
 
 #[test]
 fn permanent_send_rejection_stops_and_restores_a_draft_without_leaking_remote_drafts() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     server.world().send_rejection = true;
@@ -1277,7 +1272,7 @@ fn permanent_send_rejection_stops_and_restores_a_draft_without_leaking_remote_dr
 
 #[test]
 fn retry_after_blocks_refresh_and_local_wakes_until_the_provider_deadline() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     let path = format!(
@@ -1328,7 +1323,7 @@ fn retry_after_blocks_refresh_and_local_wakes_until_the_provider_deadline() {
 fn unrelated_event_errors_back_off_without_resetting_or_redownloading_the_mailbox() {
     let mut world = World::new();
     world.add_message("Stored", ("A", "a@x"), "body", &["0", "5"]);
-    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    let (dir, _rt, server, engine, account) = native_engine(world, Duration::from_millis(20));
     wait_live(&dir, account.id);
     let cursor = stored_cursor(&dir, account.id);
     let path = format!("/api/core/v4/events/{}", cursor["event"].as_str().unwrap());
@@ -1368,7 +1363,7 @@ fn unrelated_event_errors_back_off_without_resetting_or_redownloading_the_mailbo
 fn an_expired_event_id_reconciles_using_stored_bodies() {
     let mut world = World::new();
     let kept = world.add_message("Stored", ("A", "a@x"), "cached", &["0", "5"]);
-    let (_rt, server, engine, account, dir) = native_engine(world, Duration::from_millis(20));
+    let (dir, _rt, server, engine, account) = native_engine(world, Duration::from_millis(20));
     wait_live(&dir, account.id);
     let path = format!(
         "/api/core/v4/events/{}",
@@ -1411,7 +1406,7 @@ fn an_expired_event_id_reconciles_using_stored_bodies() {
 
 #[test]
 fn package_build_failure_deletes_the_created_send_draft() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     server.world().faults.insert(
@@ -1454,7 +1449,7 @@ fn package_build_failure_deletes_the_created_send_draft() {
 
 #[test]
 fn service_unavailable_honours_an_http_date_retry_deadline() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     let path = format!(
@@ -1493,7 +1488,7 @@ fn service_unavailable_honours_an_http_date_retry_deadline() {
 
 #[test]
 fn the_eighth_transient_send_failure_returns_the_message_to_drafts() {
-    let (_rt, server, engine, account, dir) =
+    let (dir, _rt, server, engine, account) =
         native_engine(World::new(), Duration::from_millis(20));
     wait_live(&dir, account.id);
     server.world().faults.insert(
@@ -1536,4 +1531,90 @@ fn the_eighth_transient_send_failure_returns_the_message_to_drafts() {
     assert_eq!(count, 0);
     assert!(server.world().messages.is_empty());
     assert_eq!(server.world().drafts.len(), 1);
+}
+
+#[test]
+fn a_private_saved_draft_stays_private_after_native_send_and_event_sync() {
+    let rt = runtime();
+    let (_dir, engine, server, account) = signed_in_with_mail(&rt, World::new(), 0);
+    let endpoint = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    endpoint.set_nonblocking(true).unwrap();
+    engine.set_ai_key("test-only").unwrap();
+    engine
+        .set_settings(Settings {
+            ai_enabled: true,
+            ai_base_url: format!("http://{}", endpoint.local_addr().unwrap()),
+            undo_send_secs: 0,
+            ..Settings::default()
+        })
+        .unwrap();
+    server.world().pause_events = true;
+    let id = engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: "Alice".into(),
+                email: "alice@proton.me".into(),
+            }],
+            subject: "Private fresh compose".into(),
+            body: "Synthetic private body".into(),
+            ..Draft::default()
+        })
+        .unwrap();
+    let view = mailbox(account.id, Mailbox::Drafts);
+    let row = engine.threads(&view, 0, 10).unwrap().remove(0);
+    for tag in [PRIVATE_TAG, "Urgent"] {
+        engine
+            .act(&[row.id], &Action::Label { tag: tag.into() })
+            .unwrap();
+    }
+    let draft = engine.draft(row.id).unwrap().unwrap();
+    assert_eq!(draft.id, Some(id));
+    assert_eq!(draft.reply_to, None);
+    engine.send(draft).unwrap();
+    let view = mailbox(account.id, Mailbox::Sent);
+    let sent = eventually(|| engine.threads(&view, 0, 10).ok()?.into_iter().next());
+    for tag in [PRIVATE_TAG, "Urgent"] {
+        assert!(
+            sent.labels.iter().any(|label| label == tag),
+            "missing {tag}"
+        );
+    }
+    {
+        let mut world = server.world();
+        world.pause_events = false;
+        world.add_message(
+            "Sync barrier",
+            ("Alice", "alice@proton.me"),
+            "barrier",
+            &["0", "5"],
+        );
+    }
+    eventually(|| {
+        engine
+            .threads(&inbox(account.id), 0, 10)
+            .ok()?
+            .iter()
+            .any(|row| row.subject == "Sync barrier")
+            .then_some(())
+    });
+    let rows = engine.threads(&view, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    for tag in [PRIVATE_TAG, "Urgent"] {
+        assert!(
+            rows[0].labels.iter().any(|label| label == tag),
+            "missing {tag} after sync"
+        );
+    }
+    let error = engine
+        .ai(91, AiRequest::Summary { thread: rows[0].id })
+        .unwrap_err();
+    assert!(
+        error.to_string().to_lowercase().contains("private"),
+        "{error}"
+    );
+    assert_eq!(
+        endpoint.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }

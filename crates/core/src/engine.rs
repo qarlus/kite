@@ -19,7 +19,6 @@ use crate::auth::{self, Tokens};
 use crate::model::*;
 use crate::store::Store;
 use crate::sync::graph::Graph;
-use crate::sync::imap::{Imap, ImapConfig};
 use crate::sync::proton::{self, Credentials as ProtonSession, Proton, SignIn, Step as ProtonStep};
 use crate::sync::{Delta, Op};
 
@@ -153,8 +152,6 @@ pub struct Options {
     pub graph_authority: Option<String>,
     pub proton_api_url: Option<String>,
     pub poll: Duration,
-    /// Send STARTTLS on Proton connections. Tests set false to reach a local plaintext fake server.
-    pub proton_tls: bool,
     /// Fetch remote images from loopback/private addresses. Tests set true to reach a local fake.
     pub local_images: bool,
 }
@@ -166,7 +163,6 @@ impl Default for Options {
             graph_authority: None,
             proton_api_url: None,
             poll: Duration::from_secs(30),
-            proton_tls: true,
             local_images: false,
         }
     }
@@ -518,8 +514,7 @@ async fn sync_account(
             // Show mail as it lands: a first sync can run many steps before the tick ends.
             inner.emit(Event::Changed(vec![account.id]));
         }
-        // Keep going only while the cursor advances (backfill/paging). IMAP without CONDSTORE
-        // returns flag deltas on every call, so "got deltas" alone would loop every tick.
+        // Keep going only while the cursor advances (backfill/paging).
         let advanced = cursor.as_deref() != Some(next.as_str());
         inner.write(|s| s.set_cursor(account.id, &next))?;
         let pending_walk = matches!(backend, Backend::Proton { .. }) && Proton::has_more(&next);
@@ -682,48 +677,16 @@ fn failed_send(
 
 // ------------------------------------------------------------------- backends
 
-/// Stored Proton credentials. `ImapConfig` is not serializable, so this mirrors its fields.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct ProtonCreds {
-    host: String,
-    imap_port: u16,
-    smtp_port: u16,
-    user: String,
-    password: String,
-    tls: bool,
-}
-
-impl ProtonCreds {
-    fn imap(&self) -> ImapConfig {
-        ImapConfig {
-            host: self.host.clone(),
-            imap_port: self.imap_port,
-            smtp_port: self.smtp_port,
-            user: self.user.clone(),
-            password: self.password.clone(),
-            tls: self.tls,
-        }
-    }
-}
-
 enum Backend {
-    Imap(Box<Imap>),
     /// `saved` is the token JSON last written to the keychain, so a refresh is persisted once.
-    Graph {
-        client: Box<Graph>,
-        saved: String,
-    },
+    Graph { client: Box<Graph>, saved: String },
     /// Native Proton (API, not Bridge). Same reason for `saved`.
-    Proton {
-        client: Box<Proton>,
-        saved: String,
-    },
+    Proton { client: Box<Proton>, saved: String },
 }
 
 impl Backend {
     async fn sync(&mut self, cursor: Option<String>) -> Result<(Vec<Delta>, String)> {
         match self {
-            Backend::Imap(imap) => imap.sync(cursor).await,
             Backend::Graph { client, .. } => client.sync(cursor).await,
             Backend::Proton { client, .. } => client.sync(cursor).await,
         }
@@ -731,7 +694,6 @@ impl Backend {
 
     async fn apply(&mut self, op: &Op) -> Result<Option<String>> {
         match self {
-            Backend::Imap(imap) => imap.apply(op).await,
             Backend::Graph { client, .. } => client.apply(op).await,
             Backend::Proton { client, .. } => client.apply(op).await,
         }
@@ -739,18 +701,17 @@ impl Backend {
 
     async fn attachment(&mut self, message: &str, attachment: &str) -> Result<Vec<u8>> {
         match self {
-            Backend::Imap(imap) => imap.attachment(message, attachment).await,
             Backend::Graph { client, .. } => client.attachment(message, attachment).await,
             Backend::Proton { client, .. } => client.attachment(message, attachment).await,
         }
     }
 
-    /// Folders only the provider can enumerate. IMAP and Graph folders reach the store
+    /// Folders only the provider can enumerate. Graph folders reach the store
     /// through `create_folder`, so only Proton has anything to add.
     async fn folders(&mut self) -> Result<Vec<(String, String)>> {
         match self {
             Backend::Proton { client, .. } => client.folders().await,
-            Backend::Imap(_) | Backend::Graph { .. } => Ok(Vec::new()),
+            Backend::Graph { .. } => Ok(Vec::new()),
         }
     }
 }
@@ -769,22 +730,21 @@ fn backend_for(inner: &Inner, account: &Account) -> Result<Backend> {
                 .secrets
                 .get(&key)?
                 .with_context(|| format!("no Proton credentials for {}", account.email))?;
-            // The same keychain entry holds either native-API credentials or a Bridge
-            // login; `kind` tells them apart, and Bridge entries have no `kind` at all.
-            if let Some(session) = ProtonSession::parse(&raw)? {
-                let client = Proton::new(
-                    &proton_api_url(inner),
-                    PROTON_APP_VERSION,
-                    &account.email,
-                    &session,
-                );
-                return Ok(Backend::Proton {
-                    client: Box::new(client),
-                    saved: raw,
-                });
-            }
-            let creds: ProtonCreds = serde_json::from_str(&raw).context("Proton credentials")?;
-            Ok(Backend::Imap(Box::new(Imap::new(creds.imap()))))
+            let reconnect =
+                "This Proton account used Bridge; sign in again in Settings › Connections";
+            let session = ProtonSession::parse(&raw)
+                .context(reconnect)?
+                .context(reconnect)?;
+            let client = Proton::new(
+                &proton_api_url(inner),
+                PROTON_APP_VERSION,
+                &account.email,
+                &session,
+            );
+            Ok(Backend::Proton {
+                client: Box::new(client),
+                saved: raw,
+            })
         }
         Provider::Microsoft => {
             let raw = inner
@@ -811,7 +771,6 @@ fn proton_api_url(inner: &Inner) -> String {
 
 fn persist_tokens(inner: &Inner, account: Id, backend: &mut Backend) -> Result<()> {
     match backend {
-        Backend::Imap(_) => {}
         Backend::Graph { client, saved } => {
             let current = serde_json::to_string(client.tokens())?;
             if current != *saved {
@@ -932,30 +891,6 @@ impl Mail for Engine {
         self.inner.read(Store::accounts)
     }
 
-    fn add_proton(&self, login: ProtonLogin) -> Result<Account> {
-        let creds = ProtonCreds {
-            host: login.host.unwrap_or_else(|| "127.0.0.1".into()),
-            imap_port: login.imap_port.unwrap_or(1143),
-            smtp_port: login.smtp_port.unwrap_or(1025),
-            user: login.email.clone(),
-            password: login.password,
-            tls: self.inner.opts.proton_tls,
-        };
-        run_async(Imap::new(creds.imap()).verify())?;
-        let name = login
-            .email
-            .split('@')
-            .next()
-            .unwrap_or(&login.email)
-            .to_string();
-        self.add_account(
-            Provider::Proton,
-            &login.email,
-            &name,
-            &serde_json::to_string(&creds)?,
-        )
-    }
-
     fn add_microsoft(&self) -> Result<Account> {
         let client_id = ms_client_id();
         let tokens = run_async(auth::ms_login(&client_id))?;
@@ -1058,7 +993,6 @@ impl Mail for Engine {
         // create never leaves a phantom folder in the local catalog.
         let id = run_async(async {
             match &mut backend {
-                Backend::Imap(imap) => imap.create_folder(name).await,
                 Backend::Graph { client, .. } => client.create_folder(name).await,
                 Backend::Proton { client, .. } => client.create_folder(name).await,
             }
@@ -1301,7 +1235,7 @@ impl Mail for Engine {
         let events = run_async(async {
             match &mut backend {
                 Backend::Graph { client, .. } => client.calendar_today(offset).await,
-                Backend::Imap(_) | Backend::Proton { .. } => Ok(Vec::new()),
+                Backend::Proton { .. } => Ok(Vec::new()),
             }
         })?;
         // A calendar call can refresh the access token; keep the keychain current.

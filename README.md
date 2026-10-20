@@ -2,7 +2,7 @@
 
 # Kite
 
-A keyboard-first, fully native email client that aims to be faster than Superhuman. It's pure Rust: GPUI for the UI, Blitz for HTML mail and SQLite for local-first storage. It supports Proton Mail (via Proton Bridge) and Microsoft 365 / Outlook (via Graph).
+A keyboard-first, fully native email client that aims to be faster than Superhuman. It's pure Rust: GPUI for the UI, Blitz for HTML mail and SQLite for local-first storage. It supports Proton Mail (native Proton API, free and paid accounts) and Microsoft 365 / Outlook (via Graph).
 
 - Product spec: [docs/SPEC.md](docs/SPEC.md)
 - Design: [docs/DESIGN.md](docs/DESIGN.md)
@@ -41,4 +41,4 @@ The current UI-shell build still starts without a connected mail engine. Setting
 5. Under **API permissions**, add Microsoft Graph delegated permissions: `offline_access`, `Mail.ReadWrite`, `Mail.Send`, `Calendars.Read`, `User.Read`.
 
 ## Proton setup
-Install and sign in to [Proton Mail Bridge](https://proton.me/mail/bridge). In Kite, add a Proton account using the Bridge-generated password (not your Proton password).
+In Settings › Connections, sign in with your Proton address and password. Free and paid accounts are supported through the native Proton API.

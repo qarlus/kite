@@ -13,7 +13,6 @@ use crate::model::{Addr, Mailbox, Ms};
 use serde::{Deserialize, Serialize};
 
 pub mod graph;
-pub mod imap;
 pub mod proton;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -26,7 +25,7 @@ pub struct RemoteAttachment {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteMsg {
-    /// Stable per account. IMAP: "{folder}/{uidvalidity}/{uid}". Graph: message id.
+    /// Stable provider message id per account.
     pub remote_id: String,
     /// Remote folder id/path the message lives in.
     pub folder: String,

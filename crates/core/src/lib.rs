@@ -1,6 +1,5 @@
 //! Kite core: storage, sync backends, auth, engine. No UI code lives here.
 pub mod ai;
-pub mod bridge;
 pub mod api;
 pub mod auth;
 pub mod engine;
