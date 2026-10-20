@@ -14,25 +14,66 @@ const SCOPES: &str = "offline_access Mail.ReadWrite Mail.Send Calendars.Read Use
 const SERVICE: &str = "app.kite.mail";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Windows Credential Manager caps a secret at 2560 bytes of UTF-16; Microsoft's tokens are
+/// longer, so a secret is stored as `key`, `key#1`, `key#2`, … in UTF-16 units under the cap.
+const SECRET_CHUNK: usize = 1280;
+
+fn chunk_key(key: &str, i: usize) -> String {
+    if i == 0 {
+        key.to_string()
+    } else {
+        format!("{key}#{i}")
+    }
+}
+
 /// Stores a secret in the OS keychain (Windows Credential Manager, macOS Keychain).
 pub fn secret_set(key: &str, val: &str) -> Result<()> {
-    keyring::Entry::new(SERVICE, key)?.set_password(val)?;
-    Ok(())
+    let mut chunks = vec![String::new()];
+    for c in val.chars() {
+        if chunks
+            .last()
+            .is_some_and(|s| s.encode_utf16().count() + c.len_utf16() > SECRET_CHUNK)
+        {
+            chunks.push(String::new());
+        }
+        if let Some(last) = chunks.last_mut() {
+            last.push(c);
+        }
+    }
+    for (i, chunk) in chunks.iter().enumerate() {
+        keyring::Entry::new(SERVICE, &chunk_key(key, i))?.set_password(chunk)?;
+    }
+    // A shorter value must not pick up the tail of a longer one stored before it.
+    delete_chunks(key, chunks.len())
 }
 
 pub fn secret_get(key: &str) -> Result<Option<String>> {
-    match keyring::Entry::new(SERVICE, key)?.get_password() {
-        Ok(v) => Ok(Some(v)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
+    let mut val = String::new();
+    for i in 0.. {
+        match keyring::Entry::new(SERVICE, &chunk_key(key, i))?.get_password() {
+            Ok(v) => val.push_str(&v),
+            Err(keyring::Error::NoEntry) if i == 0 => return Ok(None),
+            Err(keyring::Error::NoEntry) => break,
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(Some(val))
 }
 
 pub fn secret_del(key: &str) -> Result<()> {
-    match keyring::Entry::new(SERVICE, key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
+    delete_chunks(key, 0)
+}
+
+/// Deletes chunk `from` and every chunk after it.
+fn delete_chunks(key: &str, from: usize) -> Result<()> {
+    for i in from.. {
+        match keyring::Entry::new(SERVICE, &chunk_key(key, i))?.delete_credential() {
+            Ok(()) => {}
+            Err(keyring::Error::NoEntry) => break,
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }
 
 /// Tokens for one account. Serialize them into the keychain; the engine persists refreshed ones.

@@ -241,6 +241,32 @@ impl Engine {
         Engine::open_with(dir, Secrets::Os, Options::default())
     }
 
+    /// Adds an account with its secret. An account whose secret could not be stored can never
+    /// sync, so a new one is removed again rather than left behind.
+    fn add_account(
+        &self,
+        provider: Provider,
+        email: &str,
+        name: &str,
+        secret: &str,
+    ) -> Result<Account> {
+        let before = self.inner.read(Store::accounts)?;
+        let account = self.inner.write(|s| s.add_account(provider, email, name))?;
+        let key = match provider {
+            Provider::Proton => format!("proton:{}", account.id),
+            Provider::Microsoft => format!("ms:{}", account.id),
+        };
+        if let Err(e) = self.inner.secrets.set(&key, secret) {
+            // Signing in again to an existing account must never delete its mail.
+            if !before.iter().any(|a| a.id == account.id) {
+                self.inner.write(|s| s.remove_account(account.id))?;
+            }
+            return Err(e);
+        }
+        self.wake();
+        Ok(account)
+    }
+
     pub fn open_with(dir: &Path, secrets: Secrets, opts: Options) -> Result<Arc<Engine>> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         let path = dir.join("kite.db");
@@ -313,14 +339,12 @@ impl Engine {
                 let signed = sign_in
                     .take()
                     .context("Proton sign-in returned no session")?;
-                let account = self
-                    .inner
-                    .write(|s| s.add_account(Provider::Proton, &signed.email, &signed.name))?;
-                let key = format!("proton:{}", account.id);
-                self.inner
-                    .secrets
-                    .set(&key, &serde_json::to_string(&signed.credentials)?)?;
-                self.wake();
+                let account = self.add_account(
+                    Provider::Proton,
+                    &signed.email,
+                    &signed.name,
+                    &serde_json::to_string(&signed.credentials)?,
+                )?;
                 Ok(ProtonAuth::Done(account))
             }
         }
@@ -929,15 +953,12 @@ impl Mail for Engine {
             .next()
             .unwrap_or(&login.email)
             .to_string();
-        let account = self
-            .inner
-            .write(|s| s.add_account(Provider::Proton, &login.email, &name))?;
-        let key = format!("proton:{}", account.id);
-        self.inner
-            .secrets
-            .set(&key, &serde_json::to_string(&creds)?)?;
-        self.wake();
-        Ok(account)
+        self.add_account(
+            Provider::Proton,
+            &login.email,
+            &name,
+            &serde_json::to_string(&creds)?,
+        )
     }
 
     fn add_microsoft(&self) -> Result<Account> {
@@ -945,15 +966,12 @@ impl Mail for Engine {
         let tokens = run_async(auth::ms_login(&client_id))?;
         let mut client = graph(&self.inner, &client_id, tokens);
         let (email, name) = run_async(client.me())?;
-        let account = self
-            .inner
-            .write(|s| s.add_account(Provider::Microsoft, &email, &name))?;
-        let key = format!("ms:{}", account.id);
-        self.inner
-            .secrets
-            .set(&key, &serde_json::to_string(client.tokens())?)?;
-        self.wake();
-        Ok(account)
+        self.add_account(
+            Provider::Microsoft,
+            &email,
+            &name,
+            &serde_json::to_string(client.tokens())?,
+        )
     }
 
     fn remove_account(&self, id: Id) -> Result<()> {

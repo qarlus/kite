@@ -1165,11 +1165,7 @@ async fn me_reads_a_personal_account_shape() {
         g.me().await.unwrap(),
         ("karl@outlook.com".to_string(), "karl".to_string())
     );
-    assert!(
-        fake.path("/me")[0]
-            .query_pairs()["$select"]
-            .contains("userPrincipalName")
-    );
+    assert!(fake.path("/me")[0].query_pairs()["$select"].contains("userPrincipalName"));
 }
 
 /// An empty or malformed `mail` must not suppress the `userPrincipalName` fallback.
@@ -1297,4 +1293,24 @@ async fn token_error_bodies_are_clipped_on_character_boundaries() {
         .to_string();
     assert!(err.contains("é"), "{err}");
     assert!(err.chars().count() <= 450, "{err}");
+}
+
+/// Microsoft's tokens are longer than one Windows credential holds; sign-in must still store
+/// them, and a shorter secret written later must not inherit the old one's tail.
+#[cfg(any(windows, target_os = "macos"))]
+#[test]
+fn microsoft_sized_tokens_round_trip_through_the_os_keychain() {
+    let key = format!("test:long-secret:{}", std::process::id());
+    let long: String = (0..6000)
+        .map(|i| char::from(b'a' + (i % 26) as u8))
+        .collect();
+    auth::secret_set(&key, &long).unwrap();
+    assert_eq!(
+        auth::secret_get(&key).unwrap().as_deref(),
+        Some(long.as_str())
+    );
+    auth::secret_set(&key, "short").unwrap();
+    assert_eq!(auth::secret_get(&key).unwrap().as_deref(), Some("short"));
+    auth::secret_del(&key).unwrap();
+    assert_eq!(auth::secret_get(&key).unwrap(), None);
 }
