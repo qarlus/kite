@@ -3,6 +3,8 @@ mod common;
 use common::{Fixture, mount};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, Bounds, Pixels, TestAppContext, px};
+use kite_core::api::Mail as _;
+use kite_core::model::{Action, Id};
 
 fn overlaps(a: Bounds<Pixels>, b: Bounds<Pixels>) -> bool {
     a.origin.x < b.right()
@@ -111,4 +113,89 @@ fn hovering_the_account_mark_names_the_account(cx: &mut TestAppContext) {
         );
     })
     .unwrap();
+}
+
+/// Tags are a set, so a row shows all of them — not just the first — and the ones that do not fit
+/// become a `+N` chip. Either way the row keeps its fixed height, which `uniform_list` depends on.
+#[gpui_kit::test]
+fn a_row_shows_every_tag_that_fits_and_counts_the_rest(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    tag(&fixture, 1, &["Team", "Urgent", "Work"]);
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        for (chip, name) in ["Team", "Urgent", "Work"].into_iter().enumerate() {
+            let expected = format!("Tag: {name}");
+            assert_eq!(
+                window.find(kite::list::row_tag_id(0, chip)).label(),
+                Some(expected.as_str()),
+                "every tag on the conversation paints, chip {chip}"
+            );
+        }
+        assert!(
+            window.try_find(("row-tag-more", 0usize)).is_none(),
+            "three short tags all fit, so there is nothing left to count"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_row_with_more_tags_than_fit_counts_the_remainder(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let tags = [
+        "Newsletter",
+        "To Reply",
+        "Waiting on Reply",
+        "Accounting 2026",
+        "Travel",
+        "Receipts",
+    ];
+    tag(&fixture, 1, &tags);
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let shown = (0..tags.len())
+            .take_while(|chip| window.try_find(kite::list::row_tag_id(0, *chip)).is_some())
+            .count();
+        assert!(
+            shown >= 2,
+            "a row shows every tag that fits, not just the first: {shown} of {}",
+            tags.len()
+        );
+        let more = window
+            .find(("row-tag-more", 0usize))
+            .label()
+            .map(str::to_string);
+        assert_eq!(
+            more,
+            Some(format!("+{}", tags.len() - shown)),
+            "the tags that do not fit are counted"
+        );
+        assert_eq!(
+            window.find(("row", 0usize)).bounds().size.height,
+            window.find(("row", 1usize)).bounds().size.height,
+            "tag chips never make a row taller than the list expects"
+        );
+        let subject = window.find(("row-subject", 0usize)).bounds();
+        assert!(
+            subject.size.width > px(0.),
+            "the subject keeps its room beside the chips: {subject:?}"
+        );
+    })
+    .unwrap();
+}
+
+/// Tags a conversation the way the tag menu does, through `Mail::act`.
+fn tag(fixture: &std::sync::Arc<Fixture>, thread: Id, tags: &[&str]) {
+    for name in tags {
+        fixture
+            .act(
+                &[thread],
+                &Action::Label {
+                    tag: (*name).into(),
+                },
+            )
+            .unwrap();
+    }
 }

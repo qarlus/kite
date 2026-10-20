@@ -1265,25 +1265,22 @@ impl Kite {
         let t = self.theme;
         let pane = self.settings.reading_pane && self.preferences.is_none();
         let settings_open = self.preferences.is_some();
-        let panel = theme::panel(&t);
         let wide = if pane {
             crate::sidebar::list_width(window)
         } else {
             0.
         };
-        // The list fills the width only when no reading pane sits beside it.
-        let under = if pane || self.open.is_some() || self.preferences.is_some() {
-            t.bg.into()
-        } else {
-            panel
-        };
+        // One opaque fill under the whole strip. Ember paints a gradient behind the rail and the
+        // list, so a segment with a fill of its own met the next one in a visible seam and every
+        // control showed a different colour behind it.
         let mut strip = div()
             .id("window-strip")
             .test_support()
             .flex_shrink_0()
             .h(px(STRIP_H))
             .flex()
-            .items_center();
+            .items_center()
+            .bg(t.bg);
         // The list/reading-pane toggle opens the strip at the list column's left edge, and stays
         // on that spot when the list steps aside, so the control never jumps under the pointer.
         strip = if wide > 0. {
@@ -1294,7 +1291,6 @@ impl Kite {
                     .flex()
                     .items_center()
                     .pl(px(STRIP_PAD))
-                    .bg(panel)
                     .children((!settings_open).then(|| self.pane_toggle(cx))),
             )
         } else {
@@ -1315,7 +1311,6 @@ impl Kite {
                     .id("window-drag")
                     .flex_1()
                     .h_full()
-                    .bg(under)
                     .window_control_area(WindowControlArea::Drag)
                     // Windows moves the window through the hit test; other platforms need this.
                     .when(!cfg!(target_os = "windows"), |d| {
@@ -1323,30 +1318,20 @@ impl Kite {
                             window.start_window_move()
                         })
                     })
-                    .on_double_click(|_, window, _| window.titlebar_double_click()),
+                    .on_double_click(|_, window, _| window.titlebar_double_click())
+                    .test_support(),
             )
             .child(
-                div()
+                strip_chip(&t)
                     .id("open-settings")
                     .test_support()
                     .aria_label("Settings")
                     .aria_selected(settings_open)
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    // Same box as a window button, so the icons share one line.
-                    .w(px(WINDOW_CONTROL_W))
-                    .h_full()
                     // Only there when the OS draws no controls: keep it off the edge.
                     .when(!cfg!(target_os = "windows"), |d| d.mr_2())
-                    .cursor_pointer()
                     .text_color(if settings_open { t.fg } else { t.fg2 })
-                    .when(settings_open, |d| d.bg(Theme::alpha(t.fg, 0.1)))
-                    .when(!settings_open, |d| {
-                        d.hover(|s| s.bg(Theme::alpha(t.fg, 0.08)).text_color(t.fg))
-                    })
-                    .child(Icon::new(IconName::Settings).with_size(px(14.)))
+                    .when(settings_open, |d| d.bg(Theme::alpha(t.fg, CHIP_HOVER)))
+                    .child(Icon::new(IconName::Settings).with_size(px(16.)))
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
             )
             .child(self.window_controls(window))
@@ -1354,26 +1339,18 @@ impl Kite {
     }
 
     /// Side by side, or one at a time: `settings.reading_pane`, saved like any preference. It is
-    /// a strip control above the list column it acts on, in the same box as the cog and the
-    /// window buttons, so the icons share one line.
+    /// a strip control above the list column it acts on, in the same chip as the cog, so the two
+    /// icons share one line.
     fn pane_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let shown = self.settings.reading_pane;
-        div()
+        strip_chip(&t)
             .id("toggle-reading-pane")
             .test_support()
             .aria_label("Toggle list and reading pane")
             .aria_selected(shown)
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .w(px(WINDOW_CONTROL_W))
-            .h_full()
-            .cursor_pointer()
             .text_color(if shown { t.fg } else { t.fg2 })
-            .hover(move |s| s.bg(Theme::alpha(t.fg, 0.08)).text_color(t.fg))
-            .child(Icon::new(IconName::PanelRight).with_size(px(14.)))
+            .child(Icon::new(IconName::PanelRight).with_size(px(16.)))
             .on_click(cx.listener(|this, _, window, cx| {
                 let mut settings = this.settings.clone();
                 settings.reading_pane = !settings.reading_pane;
@@ -1855,6 +1832,10 @@ impl Kite {
 }
 
 const WINDOW_CONTROL_W: f32 = 46.;
+/// A strip icon button is a chip the size of the list header's icons.
+const STRIP_CHIP: f32 = 30.;
+/// Every hover fill in the strip uses the alpha the list header's icon buttons use.
+const CHIP_HOVER: f32 = 0.06;
 /// The window strip's inset before its first control, so the pane toggle sits at the list
 /// column's left edge rather than against the rail.
 const STRIP_PAD: f32 = 4.;
@@ -1866,6 +1847,21 @@ fn body_column(window: &Window) -> f32 {
         .max(120.)
 }
 
+/// A strip icon button: a rounded hover chip, never a full-height square, so it matches the icon
+/// buttons in the list header and the thread toolbar. It paints nothing until the pointer arrives.
+fn strip_chip(t: &Theme) -> Div {
+    let t = *t;
+    div()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .size(px(STRIP_CHIP))
+        .rounded(px(RADIUS_SM))
+        .cursor_pointer()
+        .hover(move |s| s.bg(Theme::alpha(t.fg, CHIP_HOVER)).text_color(t.fg))
+}
+
 /// One window button. Windows resolves the click through its hit test, so no handler is needed.
 fn window_control(
     t: &Theme,
@@ -1875,10 +1871,11 @@ fn window_control(
     label: &'static str,
 ) -> impl IntoElement {
     let t = *t;
+    // Windows keeps the full-height hover for its own buttons; only the fill is shared.
     let hover = if area == WindowControlArea::Close {
         Theme::alpha(t.danger, 0.85)
     } else {
-        Theme::alpha(t.fg, 0.08)
+        Theme::alpha(t.fg, CHIP_HOVER)
     };
     div()
         .id(id)

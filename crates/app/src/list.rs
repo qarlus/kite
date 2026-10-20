@@ -18,6 +18,18 @@ use std::time::Duration;
 /// padding, plus a margin. Subject and snippet stop before it, so the buttons never cover a word.
 const ACTION_SLOT: f32 = 124.;
 
+/// How much of its subject line a row's tags may take. The list is virtualised and `j`/`k` must fit
+/// in 4 ms, so how many chips fit is estimated from the tag names rather than shaped, which would
+/// cost a text layout per tag on every repaint. `TAG_INSET` is what the row spends around the
+/// subject: the card's padding, the multi-select box and its gap, and the subject's own minimum.
+const TAG_INSET: f32 = 126.;
+/// An 11px UI glyph's average advance, and what a chip spends on its padding and gaps.
+const TAG_CHAR: f32 = 5.6;
+const TAG_PAD: f32 = 12.;
+const TAG_GAP: f32 = 4.;
+/// The longest a chip gets; a longer name is ellipsised instead of pushing the subject out.
+const TAG_MAX: f32 = 104.;
+
 /// The mark and brand ink that name a provider in the combined inbox.
 fn provider_mark(provider: Provider) -> (&'static str, Rgba) {
     match provider {
@@ -63,18 +75,26 @@ impl Kite {
             cx.processor(
                 move |this: &mut Kite,
                       range: Range<usize>,
-                      _window: &mut Window,
+                      window: &mut Window,
                       cx: &mut Context<Kite>| {
                     if !this.loaded_all && range.end + 50 >= this.rows.len() {
                         this.load_more(cx);
                     }
                     let now = Local::now();
+                    // Tags ride the subject's line, so they may take what the column has left once
+                    // the multi-select box, the hover actions and the subject have their room.
+                    let column = if this.settings.reading_pane {
+                        crate::sidebar::list_width(window)
+                    } else {
+                        window.viewport_size().width.as_f32() - crate::sidebar::RAIL_W
+                    };
+                    let tags = (column - ACTION_SLOT - TAG_INSET).max(0.);
                     let mut items = Vec::with_capacity(range.len());
                     for ix in range {
                         let Some(row) = this.rows.get(ix) else {
                             continue;
                         };
-                        items.push(row_element(this, row, ix, now, cx));
+                        items.push(row_element(this, row, ix, now, tags, cx));
                     }
                     items
                 },
@@ -344,6 +364,7 @@ fn row_element(
     row: &ThreadSummary,
     ix: usize,
     now: DateTime<Local>,
+    tags: f32,
     cx: &mut Context<Kite>,
 ) -> AnyElement {
     let t = kite.theme;
@@ -538,34 +559,9 @@ fn row_element(
                                         .text_color(t.fg)
                                         .child(row.subject.clone()),
                                 )
-                                .children(row.labels.iter().take(1).map(|label| {
-                                    let private =
-                                        label.eq_ignore_ascii_case(kite_core::model::PRIVATE_TAG);
-                                    div()
-                                        .id(("row-tag", ix))
-                                        .test_support()
-                                        .aria_label(format!("Tag: {label}"))
-                                        .max_w(px(120.))
-                                        .min_w_0()
-                                        .flex_shrink_0()
-                                        .flex()
-                                        .items_center()
-                                        .gap_1()
-                                        .truncate()
-                                        .px_2()
-                                        .rounded(px(RADIUS_SM))
-                                        .bg(t.bg3)
-                                        .text_size(t.px(11.))
-                                        .text_color(t.fg2)
-                                        .when(private, |d| {
-                                            d.child(
-                                                Icon::new(IconName::Lock)
-                                                    .with_size(px(10.))
-                                                    .text_color(t.fg2),
-                                            )
-                                        })
-                                        .child(label.clone())
-                                }))
+                                .when(!row.labels.is_empty(), |d| {
+                                    d.child(row_tags(&t, ix, &row.labels, tags))
+                                })
                                 .when(row.attachments, |d| {
                                     d.child(
                                         Icon::new(IconName::Paperclip)
@@ -658,6 +654,122 @@ fn row_element(
             }
         })
         .into_any_element()
+}
+
+/// Every tag a row can show, then a `+N` for the rest. DESIGN › Layout fixes the row at 88px, so
+/// the chips ride the subject's line instead of adding one.
+fn row_tags(t: &Theme, ix: usize, labels: &[String], slot: f32) -> AnyElement {
+    let (shown, hidden) = visible_tags(labels, slot);
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .flex_shrink_0()
+        .children(
+            labels
+                .iter()
+                .take(shown)
+                .enumerate()
+                .map(|(chip, label)| row_tag(t, ix, chip, label)),
+        )
+        .when(hidden > 0, |d| {
+            let more = format!("+{hidden}");
+            d.child(
+                tag_pill(t)
+                    .id(("row-tag-more", ix))
+                    .test_support()
+                    .aria_label(more.clone())
+                    .child(more),
+            )
+        })
+        .into_any_element()
+}
+
+/// A row tag chip's identity: `("row-tag", row, chip)`. `ElementId` names its third part, so a
+/// fixed digit table keeps the id allocation-free on every repaint.
+pub fn row_tag_id(ix: usize, chip: usize) -> ElementId {
+    const DIGITS: [&str; 10] = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"];
+    (
+        ElementId::from(("row-tag", ix)),
+        DIGITS[chip.min(DIGITS.len() - 1)],
+    )
+        .into()
+}
+
+/// One tag of a conversation, named so a test can count them.
+fn row_tag(t: &Theme, ix: usize, chip: usize, label: &str) -> AnyElement {
+    let private = label.eq_ignore_ascii_case(kite_core::model::PRIVATE_TAG);
+    tag_pill(t)
+        .id(row_tag_id(ix, chip))
+        .test_support()
+        .aria_label(format!("Tag: {label}"))
+        .when(private, |d| {
+            d.child(
+                Icon::new(IconName::Lock)
+                    .with_size(px(10.))
+                    .text_color(t.fg2),
+            )
+        })
+        .child(label.to_string())
+        .into_any_element()
+}
+
+/// How many of a row's tags fit on its subject line, and how many are left to a `+N` chip.
+fn visible_tags(labels: &[String], slot: f32) -> (usize, usize) {
+    let mut used = 0.;
+    for (ix, label) in labels.iter().enumerate() {
+        let rest = labels.len() - ix - 1;
+        let width = tag_width(label) + if ix == 0 { 0. } else { TAG_GAP };
+        // Whatever this chip pushes out needs the `+N` chip's own room.
+        let overflow = match rest {
+            0 => 0.,
+            _ => TAG_GAP + TAG_PAD + TAG_CHAR * (1. + digits(rest) as f32),
+        };
+        if used + width + overflow > slot {
+            // One tag still beats a bare `+N`, even where the first chip has to clip.
+            let shown = ix.max(1);
+            return (shown, labels.len() - shown);
+        }
+        used += width;
+    }
+    (labels.len(), 0)
+}
+
+fn tag_width(label: &str) -> f32 {
+    let lock = if label.eq_ignore_ascii_case(kite_core::model::PRIVATE_TAG) {
+        TAG_CHAR * 2.
+    } else {
+        0.
+    };
+    (label.chars().count() as f32 * TAG_CHAR + TAG_PAD + lock).min(TAG_MAX)
+}
+
+fn digits(mut n: usize) -> usize {
+    let mut count = 1;
+    while n > 9 {
+        n /= 10;
+        count += 1;
+    }
+    count
+}
+
+/// The look every row chip shares: 11px on `bg3`, as high as the subject's line rather than taller.
+fn tag_pill(t: &Theme) -> Div {
+    let t = *t;
+    div()
+        .h(t.px(16.))
+        .max_w(t.px(TAG_MAX))
+        .min_w_0()
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .gap_1()
+        .truncate()
+        .px_1p5()
+        .rounded(px(RADIUS_SM))
+        .bg(t.bg3)
+        .text_size(t.px(11.))
+        .text_color(t.fg2)
 }
 
 /// One button in a row's hover action strip.

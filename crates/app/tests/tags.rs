@@ -34,7 +34,7 @@ fn private_tag_toggles_on_the_clicked_row_without_opening_it(cx: &mut TestAppCon
         window.within("popup-menu").click(2usize, cx);
         window.render_frame(cx);
         assert_eq!(
-            window.find(("row-tag", 1usize)).label(),
+            window.find(kite::list::row_tag_id(1, 0)).label(),
             Some("Tag: Private")
         );
     })
@@ -51,7 +51,7 @@ fn private_tag_toggles_on_the_clicked_row_without_opening_it(cx: &mut TestAppCon
     );
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        assert!(window.try_find(("row-tag", 1usize)).is_none());
+        assert!(window.try_find(kite::list::row_tag_id(1, 0)).is_none());
     })
     .unwrap();
     assert!(fixture.opened.lock().unwrap().is_empty());
@@ -103,7 +103,7 @@ fn right_click_opens_the_menu_and_a_tag_reaches_the_row(cx: &mut TestAppContext)
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find(("row-tag", 0usize)).label(),
+            window.find(kite::list::row_tag_id(0, 0)).label(),
             Some("Tag: Newsletter"),
             "the row paints the chip"
         );
@@ -186,7 +186,7 @@ fn new_tag_creates_and_applies_a_tag(cx: &mut TestAppContext) {
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find(("row-tag", 0usize)).label(),
+            window.find(kite::list::row_tag_id(0, 0)).label(),
             Some("Tag: Receipts")
         );
     })

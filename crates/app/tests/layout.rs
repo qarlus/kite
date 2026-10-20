@@ -246,6 +246,61 @@ fn the_settings_cog_is_centred_on_the_window_strip(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// The strip's own buttons are hover chips, not full-height squares: the cog and the pane toggle
+/// share one box, the size of the list header's icons, and it leaves the strip's edges visible.
+/// Windows' min/max/close keep their full-height hover, but every control sits on the one flat
+/// fill the strip paints, so no segment of it can show a seam or a colour of its own.
+#[gpui_kit::test]
+fn the_strip_icon_buttons_are_chips_on_one_flat_strip(cx: &mut TestAppContext) {
+    let (window, _) = mount(cx, Fixture::showcase());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        let strip = window.find("window-strip").bounds();
+        let cog = window.find("open-settings").bounds();
+        let toggle = window.find("toggle-reading-pane").bounds();
+        let refresh = window.find("refresh-mail").bounds();
+        assert_eq!(
+            cog.size, toggle.size,
+            "the cog and the pane toggle share one chip: {cog:?} vs {toggle:?}"
+        );
+        assert_eq!(
+            cog.size.width, refresh.size.width,
+            "and it is the list header's icon size: {cog:?} vs {refresh:?}"
+        );
+        assert!(
+            cog.size.height < strip.size.height,
+            "a rounded chip, not a full-height square: {cog:?} of {strip:?}"
+        );
+        assert_eq!(cog.center().y, strip.center().y);
+        assert_eq!(toggle.center().y, strip.center().y);
+        // The strip's segments meet edge to edge, so one fill shows behind every control.
+        let drag = window.find("window-drag").bounds();
+        assert_eq!(drag.size.height, strip.size.height);
+        assert_eq!(
+            drag.right(),
+            cog.origin.x,
+            "the drag area hands over to the cog"
+        );
+        if cfg!(target_os = "windows") {
+            let controls = window.find("window-controls").bounds();
+            assert_eq!(cog.right(), controls.origin.x);
+            assert_eq!(controls.right(), strip.right());
+            for id in ["window-minimize", "window-maximize", "window-close"] {
+                let control = window.find(id).bounds();
+                assert_eq!(
+                    control.size.height, strip.size.height,
+                    "{id} keeps Windows' full-height hover"
+                );
+                assert!(
+                    control.right() <= strip.right(),
+                    "{id} sits inside the strip"
+                );
+            }
+        }
+    })
+    .unwrap();
+}
+
 /// The list/reading-pane toggle is a control of the window strip, at the list column's left
 /// edge — not a button in the reading pane's own toolbar — and it keeps that spot when the list
 /// steps aside, so the control never moves under the pointer.
