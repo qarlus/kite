@@ -12,8 +12,8 @@ use gpui_kit::{
 };
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action, Addr, AiRequest, Attachment, CalEvent, Draft, Event, Folder, Id, Mailbox,
-    Message, Ms, ProtonAuth, Settings, Split, Tag, ThreadSummary, View,
+    Account, Action, Addr, AiModel, AiRequest, Attachment, CalEvent, Draft, Event, Folder, Id,
+    Mailbox, Message, Ms, ProtonAuth, Settings, Split, Tag, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -63,6 +63,12 @@ pub struct Fixture {
     pub image_bytes: Mutex<Vec<u8>>,
     /// Every `ai` request the UI made, with the prompt it sent.
     pub ai_requests: Mutex<Vec<(u32, AiRequest)>>,
+    /// The model list `ai_models` answers with.
+    pub ai_models: Mutex<Vec<AiModel>>,
+    /// What `ai_models` answers instead of a list.
+    pub ai_models_error: Mutex<Option<String>>,
+    /// Every `ai_models` call, so refetches are visible.
+    pub ai_model_calls: Mutex<u32>,
     /// The tag list `tags`/`set_tags` keep, mirroring the store's seeded set.
     pub tags: Mutex<Vec<Tag>>,
     pub settings: Mutex<Settings>,
@@ -160,6 +166,9 @@ impl Fixture {
             image_bytes: Mutex::new(PNG.to_vec()),
             refreshes: AtomicI64::new(0),
             ai_requests: Mutex::new(Vec::new()),
+            ai_models: Mutex::new(Vec::new()),
+            ai_models_error: Mutex::new(None),
+            ai_model_calls: Mutex::new(0),
             tags: Mutex::new(
                 ["Newsletter", "To Reply", "Private"]
                     .into_iter()
@@ -1103,6 +1112,14 @@ impl Mail for Fixture {
         }
         self.ai_requests.lock().unwrap().push((req, request));
         Ok(())
+    }
+
+    fn ai_models(&self) -> anyhow::Result<Vec<AiModel>> {
+        *self.ai_model_calls.lock().unwrap() += 1;
+        if let Some(error) = self.ai_models_error.lock().unwrap().clone() {
+            anyhow::bail!(error);
+        }
+        Ok(self.ai_models.lock().unwrap().clone())
     }
 
     fn sync_now(&self) {

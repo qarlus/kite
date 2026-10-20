@@ -61,6 +61,9 @@ fn ai_settings_persist_and_the_key_goes_to_the_keychain(cx: &mut TestAppContext)
         window.render_frame(cx);
         assert_eq!(window.find("ai-enabled").checked(), Some(true));
         scroll_to_bottom(window, cx);
+        window.click("ai-provider-custom", cx);
+        window.render_frame(cx);
+        scroll_to_bottom(window, cx);
         window.click("ai-base-url", cx);
         window.press("secondary-a", cx);
         window.input("https://example.com/v1", cx);
@@ -120,6 +123,9 @@ fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
         window.render_frame(cx);
         scroll_to_bottom(window, cx);
         window.click("ai-enabled", cx);
+        window.render_frame(cx);
+        scroll_to_bottom(window, cx);
+        window.click("ai-provider-custom", cx);
         window.render_frame(cx);
         scroll_to_bottom(window, cx);
         window.click("ai-base-url", cx);

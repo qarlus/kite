@@ -149,3 +149,217 @@ fn ctrl_j_writes_a_draft_that_can_be_inserted_into_compose(cx: &mut TestAppConte
         assert_eq!(kite.compose_body(cx), "Happy to help with the plan.");
     });
 }
+
+/// AI on, on the OpenCode preset, with the given models and a saved selection.
+fn ai_on_with(models: Vec<kite_core::model::AiModel>, saved: &str) -> std::sync::Arc<Fixture> {
+    let fixture = Fixture::new(2);
+    *fixture.ai_models.lock().unwrap() = models;
+    let mut settings = fixture.settings.lock().unwrap();
+    settings.ai_enabled = true;
+    settings.ai_base_url = "https://opencode.ai/zen/go/v1".into();
+    settings.ai_model = saved.into();
+    drop(settings);
+    fixture
+}
+
+fn models() -> Vec<kite_core::model::AiModel> {
+    [
+        ("kite-test", "Kite Test"),
+        ("other-model", "Other Model"),
+        ("third-model", "Third Model"),
+    ]
+    .into_iter()
+    .map(|(id, name)| kite_core::model::AiModel {
+        id: id.into(),
+        name: name.into(),
+        free: true,
+        zdr: true,
+    })
+    .collect()
+}
+
+/// Opens Settings on the AI page and lets the model fetch land.
+fn open_ai(window: gpui_kit::WindowHandle<gpui_kit::base::Root>, cx: &mut TestAppContext) {
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("settings-tab", 7usize), cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+fn the_ai_page_lists_the_endpoints_models_with_the_saved_switch_on(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        for (ix, name) in ["Kite Test", "Other Model", "Third Model"]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(window.find(("ai-model", ix)).label(), Some(name));
+        }
+        assert_eq!(
+            window.find(("ai-model-switch", 0usize)).checked(),
+            Some(true)
+        );
+        assert_eq!(
+            window.find(("ai-model-switch", 1usize)).checked(),
+            Some(false)
+        );
+        assert_eq!(
+            window.find(("ai-model-switch", 2usize)).checked(),
+            Some(false)
+        );
+    })
+    .unwrap();
+    assert_eq!(*fixture.ai_model_calls.lock().unwrap(), 1);
+}
+
+#[gpui_kit::test]
+fn turning_another_switch_on_saves_it_and_leaves_exactly_one_on(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("ai-model-switch", 1usize), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("ai-model-switch", 0usize)).checked(),
+            Some(false)
+        );
+        assert_eq!(
+            window.find(("ai-model-switch", 1usize)).checked(),
+            Some(true)
+        );
+        assert_eq!(
+            window.find(("ai-model-switch", 2usize)).checked(),
+            Some(false)
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().ai_model, "other-model");
+}
+
+#[gpui_kit::test]
+fn clicking_the_active_switch_keeps_it_on_and_the_model_unchanged(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("ai-model-switch", 0usize), cx);
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("ai-model-switch", 0usize)).checked(),
+            Some(true)
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().ai_model, "kite-test");
+}
+
+#[gpui_kit::test]
+fn a_saved_model_outside_the_list_gets_a_notice_that_switches_to_the_first(
+    cx: &mut TestAppContext,
+) {
+    let fixture = ai_on_with(models(), "beam-free");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("ai-model-notice").label(),
+            Some("Your current model (beam-free) isn't a free zero-retention model")
+        );
+        window.click("ai-model-notice-use", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("ai-model-notice").is_none());
+        assert_eq!(
+            window.find(("ai-model-switch", 0usize)).checked(),
+            Some(true)
+        );
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().ai_model, "kite-test");
+}
+
+#[gpui_kit::test]
+fn an_empty_model_list_falls_back_to_the_typed_id(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(Vec::new(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find(("ai-model", 0usize)).is_none());
+        window.click("ai-model", cx);
+        window.press("secondary-a", cx);
+        window.input("typed-model", cx);
+        window.click("save-ai", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(fixture.settings.lock().unwrap().ai_model, "typed-model");
+}
+
+#[gpui_kit::test]
+fn choosing_the_openrouter_preset_sets_the_url_and_refetches(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    assert_eq!(*fixture.ai_model_calls.lock().unwrap(), 1);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("ai-provider-openrouter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        fixture.settings.lock().unwrap().ai_base_url,
+        "https://openrouter.ai/api/v1"
+    );
+    assert_eq!(
+        *fixture.ai_model_calls.lock().unwrap(),
+        2,
+        "changing the provider refetches the model list"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("ai-provider-openrouter").selected(), Some(true));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_failed_fetch_shows_the_reason_and_retry_asks_again(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    *fixture.ai_models_error.lock().unwrap() = Some("endpoint refused".into());
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("ai-models-error").label(),
+            Some("Couldn't load models: endpoint refused")
+        );
+        *fixture.ai_models_error.lock().unwrap() = None;
+        window.click("ai-models-retry", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fixture.ai_model_calls.lock().unwrap(), 2);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(window.try_find("ai-models-error").is_none());
+        assert_eq!(window.find(("ai-model", 0usize)).label(), Some("Kite Test"));
+    })
+    .unwrap();
+}
