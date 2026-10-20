@@ -1,21 +1,17 @@
 //! The real app boots over the production engine: sidebar, empty inbox and settings.
 mod common;
+#[path = "common/temp_dir.rs"]
+mod temp_dir;
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, TestAppContext};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[gpui_kit::test]
 fn the_engine_boots_the_sidebar_the_empty_inbox_and_settings(cx: &mut TestAppContext) {
-    let dir = std::env::temp_dir().join(format!(
-        "kite-engine-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    // Declared first, so it drops last: the window owns the engine, and the engine keeps the
+    // database open inside the directory until both are gone.
+    let dir = temp_dir::TempDir::new("engine-boot");
     let engine = kite_core::engine::Engine::open_with(
         &dir,
         kite_core::engine::Secrets::Memory(Mutex::new(HashMap::new())),
@@ -50,5 +46,9 @@ fn the_engine_boots_the_sidebar_the_empty_inbox_and_settings(cx: &mut TestAppCon
         );
     })
     .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
+    // Closing the window drops the view that holds the engine, so the directory is free by the
+    // time the guard above removes it.
+    cx.update_window(window.into(), |_, window, _| window.remove_window())
+        .unwrap();
+    cx.run_until_parked();
 }

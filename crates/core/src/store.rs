@@ -2,11 +2,11 @@
 //!
 //! The same file is opened twice (a reader for the UI, a writer for sync); WAL makes that work.
 //! Every write is one short transaction so a UI action never waits behind a long sync batch.
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_iter};
 
@@ -162,6 +162,21 @@ CREATE TABLE IF NOT EXISTS thread_tags (
 CREATE INDEX IF NOT EXISTS thread_tags_tag ON thread_tags(tag_id, thread_id);
 "#;
 
+/// Schema v5 adds persistent drafts. A saved draft is a real message row in the Drafts mailbox (so
+/// the list shows it with no UI change) linked to the `drafts` row holding its editable content and
+/// its provider copy. `pending_ops.draft_id` lets a completed `SaveDraft` teach the draft its new
+/// remote id; `outbox.attempts` backs off a send that keeps failing.
+const SCHEMA_V5: &str = r#"
+CREATE TABLE IF NOT EXISTS drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+  thread_id INTEGER REFERENCES threads(id) ON DELETE SET NULL,
+  remote_id TEXT, msg_id TEXT NOT NULL, draft TEXT NOT NULL, updated INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS drafts_thread ON drafts(thread_id);
+CREATE INDEX IF NOT EXISTS drafts_msg ON drafts(account_id, msg_id);
+"#;
+
 /// Seeded on fresh and migrated stores. None of these become splits; nothing assigns them yet.
 const DEFAULT_TAGS: &str = r#"
 INSERT OR IGNORE INTO tags(id, name, color, position) VALUES
@@ -249,9 +264,189 @@ impl Store {
             tx.execute_batch("PRAGMA user_version=4")?;
             tx.commit()?;
         }
+        if version < 5 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(SCHEMA_V5)?;
+            for (table, column, ddl) in [
+                (
+                    "outbox",
+                    "attempts",
+                    "ALTER TABLE outbox ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+                ),
+                (
+                    "pending_ops",
+                    "draft_id",
+                    "ALTER TABLE pending_ops ADD COLUMN draft_id INTEGER",
+                ),
+            ] {
+                let has: bool = tx.query_row(
+                    &format!(
+                        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('{table}') WHERE name='{column}')"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )?;
+                if !has {
+                    tx.execute_batch(ddl)?;
+                }
+            }
+            tx.execute_batch("PRAGMA user_version=5")?;
+            tx.commit()?;
+        }
+        if version < 6 {
+            let tx = conn.unchecked_transaction()?;
+            // Earlier versions grouped independent provider drafts with each other and even
+            // with sent mail. Give each draft its own row before enabling conversation Trash.
+            let drafts: Vec<(Id, Id, Id, String)> = {
+                let mut statement = tx.prepare("SELECT m.id, m.thread_id, m.account_id, m.remote_id FROM messages m
+                    WHERE m.mailbox='drafts' AND (SELECT COUNT(*) FROM messages other WHERE other.thread_id=m.thread_id)>1")?;
+                statement
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+                    .collect::<rusqlite::Result<_>>()?
+            };
+            for (message, old, account, remote) in drafts {
+                let thread = new_thread(&tx, account)?;
+                tx.execute(
+                    "UPDATE messages SET thread_id=?1 WHERE id=?2",
+                    params![thread, message],
+                )?;
+                tx.execute(
+                    "UPDATE drafts SET thread_id=?1 WHERE account_id=?2 AND thread_id=?3
+                    AND (remote_id=?4 OR 'kite-draft:'||id=?4)",
+                    params![thread, account, old, remote],
+                )?;
+                tx.execute(
+                    "UPDATE undo_log SET thread_id=?1 WHERE message_id=?2",
+                    params![thread, message],
+                )?;
+                tx.execute("INSERT INTO thread_tags(thread_id, tag_id) SELECT ?1, tag_id FROM thread_tags WHERE thread_id=?2", params![thread, old])?;
+                refresh_thread(&tx, thread)?;
+                refresh_thread(&tx, old)?;
+            }
+            tx.execute_batch("PRAGMA user_version=6")?;
+            tx.commit()?;
+        }
+        if version < 7 {
+            let tx = conn.unchecked_transaction()?;
+            rethread_messages(&tx, None)?;
+            tx.execute_batch("DROP INDEX IF EXISTS messages_subject; PRAGMA user_version=7")?;
+            tx.commit()?;
+        }
+        if version < 8 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS draft_tags (
+                draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY(draft_id, tag_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS sent_tags (
+                account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                identity TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY(account_id, identity, tag_id)
+            ) WITHOUT ROWID; PRAGMA user_version=8",
+            )?;
+            tx.commit()?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name, color, position)
+             VALUES (?1, '#64748b', (SELECT COALESCE(MAX(position), -1) + 1 FROM tags))",
+            [PRIVATE_TAG],
+        )?;
         migrate_split_defaults(&conn)?;
         Ok(Store { conn })
     }
+}
+
+/// Rebuild v6's loose conversations atomically without rewriting message IDs, bodies,
+/// attachments, pending operations or outbox reply targets. Split conversations inherit
+/// their local tags and reminders; message-specific undo follows the individual message.
+fn rethread_messages(tx: &Transaction, only_thread: Option<Id>) -> Result<()> {
+    tx.execute(
+        "CREATE TEMP TABLE rethread_map AS SELECT id AS message_id, thread_id AS old_thread
+        FROM messages WHERE ?1 IS NULL OR thread_id=?1",
+        [only_thread],
+    )?;
+    tx.execute_batch(
+        "DELETE FROM thread_keys WHERE thread_id IN (SELECT old_thread FROM rethread_map)",
+    )?;
+    let rows = {
+        let mut statement = tx.prepare("SELECT id, account_id, thread_id, mailbox, message_id, in_reply_to, refs,
+            CASE WHEN (SELECT provider FROM accounts WHERE id=account_id)='microsoft' THEN thread_hint END
+            FROM messages WHERE id IN (SELECT message_id FROM rethread_map) ORDER BY id")?;
+        statement
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, Id>(0)?,
+                    r.get::<_, Id>(1)?,
+                    r.get::<_, Id>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, String>(6)?,
+                    r.get::<_, Option<String>>(7)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (message, account, old, _, _, _, _, _) in &rows {
+        let thread = new_thread(tx, *account)?;
+        tx.execute(
+            "UPDATE messages SET thread_id=?1 WHERE id=?2",
+            params![thread, message],
+        )?;
+        tx.execute("INSERT INTO thread_tags(thread_id,tag_id) SELECT ?1,tag_id FROM thread_tags WHERE thread_id=?2", params![thread, old])?;
+        tx.execute(
+            "UPDATE threads SET
+            snoozed_until=(SELECT snoozed_until FROM threads WHERE id=?2),
+            remind_after=(SELECT remind_after FROM threads WHERE id=?2) WHERE id=?1",
+            params![thread, old],
+        )?;
+    }
+    for (message, account, _, mailbox, message_id, in_reply_to, refs, hint) in rows {
+        let references: Vec<String> = serde_json::from_str(&refs)?;
+        let keys = msg_keys(message_id.as_deref(), in_reply_to.as_deref(), &references);
+        resolve_thread(
+            tx,
+            account,
+            mb_parse(&mailbox),
+            &keys,
+            hint.as_deref(),
+            Some(thread_id_of(tx, message)?),
+        )?;
+    }
+    tx.execute_batch("CREATE TEMP TABLE rethread_undo AS
+        SELECT u.token,u.account_id,m.thread_id,u.message_id,u.mailbox,u.unread,u.starred,u.folder,
+            u.snoozed_until,u.remind_after,u.op_id,u.inverse,u.tag_id
+        FROM undo_log u JOIN rethread_map r ON r.message_id=u.message_id JOIN messages m ON m.id=r.message_id
+        WHERE u.message_id IS NOT NULL
+        UNION ALL
+        SELECT DISTINCT u.token,u.account_id,m.thread_id,u.message_id,u.mailbox,u.unread,u.starred,u.folder,
+            u.snoozed_until,u.remind_after,u.op_id,u.inverse,u.tag_id
+        FROM undo_log u JOIN rethread_map r ON r.old_thread=u.thread_id JOIN messages m ON m.id=r.message_id
+        WHERE u.message_id IS NULL
+        UNION ALL SELECT u.* FROM undo_log u
+        WHERE NOT EXISTS (SELECT 1 FROM rethread_map r WHERE r.old_thread=u.thread_id);
+        DELETE FROM undo_log;
+        INSERT INTO undo_log SELECT * FROM rethread_undo;
+        UPDATE drafts SET thread_id=COALESCE((SELECT m.thread_id FROM messages m
+            WHERE m.account_id=drafts.account_id AND (m.remote_id='kite-draft:'||drafts.id OR m.remote_id=drafts.remote_id)), thread_id);
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages);
+        DROP TABLE rethread_undo;")?;
+    let threads = {
+        let mut statement = tx.prepare(
+            "SELECT DISTINCT m.thread_id FROM messages m JOIN rethread_map r ON r.message_id=m.id",
+        )?;
+        statement
+            .query_map([], |r| r.get::<_, Id>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for thread in threads {
+        refresh_thread(tx, thread)?;
+    }
+    tx.execute_batch("DROP TABLE rethread_map")?;
+    Ok(())
 }
 
 /// Databases created before the split redesign hold the two legacy seeds (`Important`/`Other`).
@@ -318,6 +513,36 @@ impl Store {
     pub fn remove_account(&self, id: Id) -> Result<()> {
         self.conn
             .execute("DELETE FROM accounts WHERE id=?1", [id])?;
+        Ok(())
+    }
+
+    /// The display name used as the From name.
+    pub fn set_account_name(&self, id: Id, name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE accounts SET name=?1 WHERE id=?2",
+            params![name.trim(), id],
+        )?;
+        Ok(())
+    }
+
+    /// When the account's provider photo was last fetched, for the once-a-day cap.
+    pub fn photo_checked(&self, id: Id) -> Result<Option<Ms>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT v FROM kv WHERE k=?1",
+                [format!("photo_checked:{id}")],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.and_then(|v| v.parse().ok()))
+    }
+
+    pub fn set_photo_checked(&self, id: Id, at: Ms) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO kv(k, v) VALUES (?1, ?2) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            params![format!("photo_checked:{id}"), at.to_string()],
+        )?;
         Ok(())
     }
 
@@ -404,6 +629,16 @@ impl Store {
         })
     }
 
+    /// Adds a folder the provider reports if the catalog does not hold it yet. A name
+    /// clash with a different id is ignored: one sidebar entry cannot show two folders.
+    pub(crate) fn ensure_folder(&self, account: Id, id: &str, name: &str) -> Result<()> {
+        if self.folder_exists(account, id)? {
+            return Ok(());
+        }
+        let _ = self.add_folder(account, id, name);
+        Ok(())
+    }
+
     pub fn folder_exists(&self, account: Id, folder: &str) -> Result<bool> {
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM folders WHERE account_id=?1 AND id=?2)",
@@ -416,7 +651,14 @@ impl Store {
 // -------------------------------------------------------------------- deltas
 
 impl Store {
-    /// Applies one sync batch in a single transaction. Batches are ≤ 200 messages (see ARCHITECTURE).
+    pub(crate) fn remote_ids(&self, account: Id) -> Result<BTreeSet<String>> {
+        let mut statement = self.conn.prepare("SELECT remote_id FROM messages WHERE account_id=?1 AND remote_id NOT LIKE 'kite-draft:%'")?;
+        Ok(statement
+            .query_map([account], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Applies one sync batch in a single transaction. Batches are Ã¢â€°Â¤ 200 messages (see ARCHITECTURE).
     pub fn apply_deltas(&self, account_id: Id, deltas: &[Delta]) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         let account_email: String = tx
@@ -431,12 +673,38 @@ impl Store {
         for d in deltas {
             let hit = match d {
                 Delta::Upsert(m) => {
-                    touched.insert(upsert_message(&tx, account_id, &account_email, m)?);
+                    // The provider's copy of a draft this client already shows is the same draft, not
+                    // a new conversation: keep the local row (and its editable content) instead.
+                    if m.mailbox == Mailbox::Drafts && is_our_draft(&tx, account_id, m)? {
+                        continue;
+                    }
+                    let thread = upsert_message(&tx, account_id, &account_email, m)?;
+                    for identity in [
+                        m.message_id
+                            .as_deref()
+                            .map(|id| format!("m:{}", bare_msg_id(id).to_ascii_lowercase())),
+                        Some(format!("r:{}", m.remote_id)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+                            SELECT ?1, tag_id FROM sent_tags WHERE account_id=?2 AND identity=?3",
+                            params![thread, account_id, identity],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM sent_tags WHERE account_id=?1 AND identity=?2",
+                            params![account_id, identity],
+                        )?;
+                    }
+                    refresh_labels(&tx, thread)?;
+                    touched.insert(thread);
                     continue;
                 }
-                Delta::Flags { remote_id, .. } | Delta::Delete { remote_id } => {
-                    find_message(&tx, account_id, remote_id)?
-                }
+                Delta::Metadata { remote_id, .. }
+                | Delta::Flags { remote_id, .. }
+                | Delta::Delete { remote_id } => find_message(&tx, account_id, remote_id)?,
             };
             let Some((mid, tid)) = hit else { continue };
             let changed = match d {
@@ -449,6 +717,17 @@ impl Store {
                        AND (unread IS NOT ?1 OR starred IS NOT ?2)
                        AND NOT EXISTS (SELECT 1 FROM pending_ops WHERE message_id=?3)",
                     params![unread, starred, mid],
+                )?,
+                Delta::Metadata {
+                    folder,
+                    mailbox,
+                    unread,
+                    starred,
+                    ..
+                } => tx.execute(
+                    "UPDATE messages SET folder=?1, mailbox=?2, unread=?3, starred=?4 WHERE id=?5
+                     AND NOT EXISTS (SELECT 1 FROM pending_ops WHERE message_id=?5)",
+                    params![folder, mb_str(*mailbox), unread, starred, mid],
                 )?,
                 Delta::Delete { .. } => tx.execute("DELETE FROM messages WHERE id=?1", [mid])?,
                 Delta::Upsert(_) => unreachable!(),
@@ -468,11 +747,39 @@ impl Store {
 fn find_message(tx: &Transaction, account_id: Id, remote_id: &str) -> Result<Option<(Id, Id)>> {
     Ok(tx
         .query_row(
-            "SELECT id, thread_id FROM messages WHERE account_id=?1 AND remote_id=?2",
+            "SELECT id, thread_id FROM messages WHERE account_id=?1 AND remote_id=?2
+             UNION ALL SELECT m.id, m.thread_id FROM drafts d JOIN messages m
+               ON m.account_id=d.account_id AND m.remote_id='kite-draft:'||d.id
+             WHERE d.account_id=?1 AND d.remote_id=?2 LIMIT 1",
             params![account_id, remote_id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?)
+}
+
+/// Whether a remote message is the provider copy of a draft saved here. Both keys are needed: the
+/// former survives a replaced copy, the latter a Message-ID the provider rewrote.
+fn is_our_draft(tx: &Transaction, account_id: Id, m: &RemoteMsg) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM drafts WHERE account_id=?1
+           AND ((?2 IS NOT NULL AND msg_id=?2) OR (?3 IS NOT NULL AND remote_id=?3)))",
+        params![
+            account_id,
+            m.message_id.as_deref().map(bare_msg_id),
+            m.remote_id
+        ],
+        |r| r.get(0),
+    )?)
+}
+
+/// A Message-ID without its angle brackets: IMAP tags carry them, Graph's `internetMessageId` and
+/// the ids Kite generates do not always, and every Message-ID we store is bare.
+fn bare_msg_id(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string()
 }
 
 fn upsert_message(
@@ -503,15 +810,15 @@ fn upsert_message(
         .optional()?
         .unwrap_or(0);
     let important = m.important.unwrap_or(from_self || sent_to > 0);
-    let existing: Option<Id> = tx
-        .query_row(
-            "SELECT id FROM messages WHERE account_id=?1 AND remote_id=?2",
-            params![account_id, m.remote_id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let existing = find_message(tx, account_id, &m.remote_id)?.map(|(id, _)| id);
     let mid = match existing {
         Some(id) => {
+            let had_fallback: bool = tx.query_row(
+                "SELECT m.thread_hint IS NOT NULL AND a.provider='microsoft'
+                FROM messages m JOIN accounts a ON a.id=m.account_id WHERE m.id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
             // While a local change is queued, keep the local placement and flags (?22 = pending).
             tx.execute(
                 "UPDATE messages SET
@@ -527,10 +834,38 @@ fn upsert_message(
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?,
                         m.list_unsubscribe],
             )?;
-            return thread_id_of(tx, id);
+            if had_fallback && m.thread_hint.is_none() {
+                // Full Graph headers arrived after a fallback: rebuild that conversation so
+                // independent roots can separate as well as genuine replies unite.
+                rethread_messages(tx, Some(thread_id_of(tx, id)?))?;
+                return thread_id_of(tx, id);
+            }
+            return resolve_thread(
+                tx,
+                account_id,
+                m.mailbox,
+                &msg_keys(
+                    m.message_id.as_deref(),
+                    m.in_reply_to.as_deref(),
+                    &m.references,
+                ),
+                m.thread_hint.as_deref(),
+                Some(thread_id_of(tx, id)?),
+            );
         }
         None => {
-            let thread_id = resolve_thread(tx, account_id, m, &ns)?;
+            let thread_id = resolve_thread(
+                tx,
+                account_id,
+                m.mailbox,
+                &msg_keys(
+                    m.message_id.as_deref(),
+                    m.in_reply_to.as_deref(),
+                    &m.references,
+                ),
+                m.thread_hint.as_deref(),
+                None,
+            )?;
             tx.execute(
                 "INSERT INTO messages(account_id, thread_id, remote_id, folder, mailbox, thread_hint,
                    message_id, in_reply_to, refs, from_name, from_email, to_json, cc_json, date, subject,
@@ -590,22 +925,44 @@ fn thread_id_of(tx: &Transaction, message_id: Id) -> Result<Id> {
     )?)
 }
 
-/// Graph's `conversationId` wins; otherwise the Message-ID/In-Reply-To/References union; otherwise
-/// normalized subject + overlapping participants within 30 days.
-fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Id> {
-    let hint = m.thread_hint.as_deref().filter(|s| !s.is_empty());
-    if let Some(h) = hint {
-        let known = key_thread(tx, account_id, &format!("h:{h}"))?;
-        if let Some(t) = known {
-            return Ok(t);
+/// Header identity and References/In-Reply-To form an account-scoped union. Provider
+/// hints are a fallback only for Graph messages whose full headers were unavailable.
+fn resolve_thread(
+    tx: &Transaction,
+    account_id: Id,
+    mailbox: Mailbox,
+    keys: &[String],
+    hint: Option<&str>,
+    existing: Option<Id>,
+) -> Result<Id> {
+    // Drafts remain individual editable messages, including replies to sent mail.
+    if mailbox == Mailbox::Drafts {
+        return match existing {
+            Some(id) => Ok(id),
+            None => new_thread(tx, account_id),
+        };
+    }
+    let mut cands: Vec<Id> = existing.into_iter().collect();
+    for key in keys {
+        if let Some(thread) = key_thread(tx, account_id, key)? {
+            cands.push(thread);
         }
     }
-    let keys = msg_keys(m);
-    let mut cands: Vec<Id> = Vec::new();
-    for k in &keys {
-        if let Some(t) = key_thread(tx, account_id, k)? {
-            cands.push(t);
-        }
+    let hint_key = if hint.is_some()
+        && tx.query_row(
+            "SELECT provider='microsoft' FROM accounts WHERE id=?1",
+            [account_id],
+            |r| r.get::<_, bool>(0),
+        )? {
+        hint.filter(|h| !h.is_empty()).map(|h| format!("h:{h}"))
+    } else {
+        None
+    };
+    if let Some(key) = &hint_key
+        && cands.len() == usize::from(existing.is_some())
+        && let Some(thread) = key_thread(tx, account_id, key)?
+    {
+        cands.push(thread);
     }
     cands.sort_unstable();
     cands.dedup();
@@ -616,63 +973,25 @@ fn resolve_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> 
             }
             canon
         }
-        None => match subject_thread(tx, account_id, m, ns)? {
-            Some(t) => t,
-            None => {
-                tx.execute(
-                    "INSERT INTO threads(account_id, subject, norm_subject, snippet, participants, date,
-                       unread, starred, important, attachments, count, mailbox)
-                     VALUES (?1,'','','','',0,0,0,0,0,0,'inbox')",
-                    [account_id],
-                )?;
-                tx.last_insert_rowid()
-            }
-        },
+        None => new_thread(tx, account_id)?,
     };
-    let mut keys = keys;
-    if let Some(h) = hint {
-        keys.push(format!("h:{h}"));
-    }
-    for k in &keys {
+    for key in keys.iter().chain(hint_key.iter()) {
         tx.execute(
             "INSERT OR IGNORE INTO thread_keys(account_id, key, thread_id) VALUES (?1,?2,?3)",
-            params![account_id, k, tid],
+            params![account_id, key, tid],
         )?;
     }
     Ok(tid)
 }
 
-fn subject_thread(tx: &Transaction, account_id: Id, m: &RemoteMsg, ns: &str) -> Result<Option<Id>> {
-    let mut emails: Vec<String> = Vec::new();
-    for a in std::iter::once(&m.from)
-        .chain(m.to.iter())
-        .chain(m.cc.iter())
-    {
-        let e = a.email.trim().to_ascii_lowercase();
-        if !e.is_empty() && !emails.contains(&e) {
-            emails.push(e);
-        }
-    }
-    if ns.is_empty() || emails.is_empty() {
-        return Ok(None);
-    }
-    let holes = vec!["?"; emails.len()].join(",");
-    let sql = format!(
-        "SELECT m.thread_id FROM messages m
-         WHERE m.account_id=?1 AND m.norm_subject=?2 AND m.date BETWEEN ?3 AND ?4
-           AND EXISTS (SELECT 1 FROM message_people p WHERE p.message_id=m.id AND p.email IN ({holes}))
-         ORDER BY m.date DESC LIMIT 1"
-    );
-    let mut ps: Vec<Value> = vec![
-        Value::Integer(account_id),
-        Value::Text(ns.to_string()),
-        Value::Integer(m.date - 30 * 86_400_000),
-        Value::Integer(m.date + 30 * 86_400_000),
-    ];
-    ps.extend(emails.into_iter().map(Value::Text));
-    Ok(tx
-        .query_row(&sql, params_from_iter(ps), |r| r.get(0))
-        .optional()?)
+fn new_thread(tx: &Transaction, account_id: Id) -> Result<Id> {
+    tx.execute(
+        "INSERT INTO threads(account_id, subject, norm_subject, snippet, participants, date,
+           unread, starred, important, attachments, count, mailbox)
+         VALUES (?1,'','','','',0,0,0,0,0,0,'inbox')",
+        [account_id],
+    )?;
+    Ok(tx.last_insert_rowid())
 }
 
 fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
@@ -696,6 +1015,17 @@ fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
             "UPDATE undo_log SET thread_id=?1 WHERE thread_id=?2",
             params![canon, other],
         )?;
+        tx.execute(
+            "UPDATE drafts SET thread_id=?1 WHERE thread_id=?2",
+            params![canon, other],
+        )?;
+        tx.execute(
+            "UPDATE threads SET
+            snoozed_until=(SELECT MAX(snoozed_until) FROM threads WHERE id IN (?1,?2)),
+            remind_after=(SELECT MAX(remind_after) FROM threads WHERE id IN (?1,?2))
+            WHERE id=?1",
+            params![canon, other],
+        )?;
         tx.execute("DELETE FROM threads WHERE id=?1", [other])?;
         refresh_labels(tx, canon)?;
     }
@@ -712,11 +1042,15 @@ fn key_thread(tx: &Transaction, account_id: Id, key: &str) -> Result<Option<Id>>
         .optional()?)
 }
 
-fn msg_keys(m: &RemoteMsg) -> Vec<String> {
+fn msg_keys(
+    message_id: Option<&str>,
+    in_reply_to: Option<&str>,
+    references: &[String],
+) -> Vec<String> {
     let mut raw: Vec<&str> = Vec::new();
-    raw.extend(m.message_id.as_deref());
-    raw.extend(m.in_reply_to.as_deref());
-    raw.extend(m.references.iter().map(String::as_str));
+    raw.extend(message_id);
+    raw.extend(in_reply_to);
+    raw.extend(references.iter().map(String::as_str));
     let mut out: Vec<String> = raw
         .into_iter()
         .filter_map(|x| {
@@ -813,7 +1147,10 @@ fn refresh_thread(tx: &Transaction, thread_id: Id) -> Result<()> {
         }
     }
     let participants = if names.len() > 4 {
-        format!("{}, {}, {}, {}…", names[0], names[1], names[2], names[3])
+        format!(
+            "{}, {}, {}, {}Ã¢â‚¬Â¦",
+            names[0], names[1], names[2], names[3]
+        )
     } else {
         names.join(", ")
     };
@@ -1304,13 +1641,16 @@ fn with_remote_id(op: Op, remote_id: &str) -> Op {
             starred,
         },
         Op::Send { mime } => Op::Send { mime },
+        other => other,
     }
 }
 
-fn current_remote_id(tx: &Transaction, message_id: Id) -> Result<Option<String>> {
+fn current_remote_id(tx: &Connection, message_id: Id) -> Result<Option<String>> {
     Ok(tx
         .query_row(
-            "SELECT remote_id FROM messages WHERE id=?1",
+            "SELECT COALESCE(d.remote_id, m.remote_id) FROM messages m
+             LEFT JOIN drafts d ON d.account_id=m.account_id AND m.remote_id='kite-draft:'||d.id
+             WHERE m.id=?1",
             [message_id],
             |r| r.get(0),
         )
@@ -1352,8 +1692,7 @@ fn plan(action: &Action, m: &MsgState) -> Plan {
             Some(move_op(rid, Mailbox::Inbox)),
             Some(move_op(rid, Mailbox::Archive)),
         ),
-        // The whole conversation goes to the bin, except drafts, which are not conversations.
-        Action::Trash if m.mailbox != "trash" && m.mailbox != "drafts" => (
+        Action::Trash if m.mailbox != "trash" => (
             Some("trash".into()),
             Some(false),
             None,
@@ -1423,7 +1762,10 @@ fn tag_id_by_name(tx: &Transaction, name: &str) -> Result<Option<Id>> {
 
 fn message_states(tx: &Transaction, thread_id: Id) -> Result<Vec<MsgState>> {
     let mut s = tx.prepare(
-        "SELECT id, remote_id, mailbox, folder, unread, starred FROM messages WHERE thread_id=?1 ORDER BY date, id",
+        "SELECT m.id, COALESCE(d.remote_id, m.remote_id), m.mailbox, m.folder, m.unread, m.starred
+         FROM messages m LEFT JOIN drafts d
+           ON d.account_id=m.account_id AND m.remote_id='kite-draft:'||d.id
+         WHERE m.thread_id=?1 ORDER BY m.date, m.id",
     )?;
     let it = s.query_map([thread_id], |r| {
         Ok(MsgState {
@@ -1456,16 +1798,66 @@ impl Store {
         Ok(out)
     }
 
-    /// A move changes a message's remote id; keep the local row pointing at the new one.
+    /// Resolve each op when it runs: an earlier draft save or move in the same batch can change
+    /// the provider id after the batch was read.
+    pub(crate) fn address_op(&self, op_id: i64, op: Op) -> Result<Op> {
+        let message: Option<Id> = self.conn.query_row(
+            "SELECT message_id FROM pending_ops WHERE id=?1",
+            [op_id],
+            |r| r.get(0),
+        )?;
+        match message
+            .map(|id| current_remote_id(&self.conn, id))
+            .transpose()?
+            .flatten()
+        {
+            Some(remote) => Ok(with_remote_id(op, &remote)),
+            None => Ok(op),
+        }
+    }
+
+    /// A move changes a message's remote id; keep the local row pointing at the new one. A draft's
+    /// save reports the provider copy's id, which the `drafts` row records instead.
     pub fn op_done(&self, op_id: i64, new_remote_id: Option<String>) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         if let Some(rid) = new_remote_id {
-            self.conn.execute(
-                "UPDATE messages SET remote_id=?1 WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2)",
+            let stale: Option<Id> = tx.query_row(
+                "SELECT p.account_id FROM pending_ops p LEFT JOIN drafts d ON d.id=p.draft_id
+                 WHERE p.id=?1 AND p.draft_id IS NOT NULL AND (d.id IS NULL OR d.account_id!=p.account_id)",
+                [op_id], |r| r.get(0),
+            ).optional()?;
+            if let Some(account) = stale {
+                // The save may already have reached the provider when From changed (or the
+                // draft was sent). Its result belongs to the old mailbox and must be removed.
+                tx.execute(
+                    "INSERT INTO pending_ops(account_id, op, at) VALUES (?1,?2,?3)",
+                    params![
+                        account,
+                        json(&Op::DeleteDraft { remote_id: rid })?,
+                        now_ms()
+                    ],
+                )?;
+                tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+                tx.commit()?;
+                return Ok(());
+            }
+            tx.execute(
+                "UPDATE drafts SET remote_id=?1 WHERE 'kite-draft:'||id=(
+                   SELECT remote_id FROM messages WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2))",
+                params![rid, op_id],
+            )?;
+            tx.execute(
+                "UPDATE messages SET remote_id=?1 WHERE id=(SELECT message_id FROM pending_ops WHERE id=?2)
+                   AND remote_id NOT LIKE 'kite-draft:%'",
+                params![rid, op_id],
+            )?;
+            tx.execute(
+                "UPDATE drafts SET remote_id=?1 WHERE id=(SELECT draft_id FROM pending_ops WHERE id=?2)",
                 params![rid, op_id],
             )?;
         }
-        self.conn
-            .execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+        tx.execute("DELETE FROM pending_ops WHERE id=?1", [op_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1489,25 +1881,483 @@ impl Store {
     }
 }
 
+// ---------------------------------------------------------------------- drafts
+
+/// The `messages` row that shows a saved draft in the Drafts mailbox. Derived from the draft id so
+/// saving again replaces the same row instead of adding one.
+fn draft_row_id(draft: Id) -> String {
+    format!("kite-draft:{draft}")
+}
+
+/// A draft that arrived from the provider as an ordinary Drafts row, before it was adopted.
+struct Adopted {
+    message: Id,
+    account: Id,
+    remote: String,
+    msg_id: Option<String>,
+    subject: String,
+    text: String,
+    to: String,
+    cc: String,
+}
+
+impl Store {
+    /// The Message-ID a saved draft keeps across edits, so the provider's own copy stays the same
+    /// conversation (`apply_deltas` skips it instead of inserting a second Drafts row).
+    pub fn draft_msg_id(&self, id: Id) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT msg_id FROM drafts WHERE id=?1", [id], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Writes a draft locally at once and returns `(draft id, provider copy it replaces)`. One short
+    /// transaction: the Drafts row is visible to the UI as soon as this returns.
+    pub fn save_draft(&self, draft: &Draft, msg_id: &str) -> Result<(Id, Option<String>)> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (name, email) = tx
+            .query_row(
+                "SELECT name, email FROM accounts WHERE id=?1",
+                [draft.account_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            .context("account was removed")?;
+        if let Some(id) = draft.id {
+            rehome_draft(&tx, id, draft.account_id)?;
+        }
+        let existing = match draft.id {
+            Some(id) => tx
+                .query_row(
+                    "SELECT thread_id, remote_id FROM drafts WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get::<_, Option<Id>>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?,
+            None => None,
+        };
+        let (id, replaced, thread) = match draft.id {
+            Some(id) => match existing {
+                Some((thread, remote)) => (id, remote, thread),
+                None => {
+                    // The UI remembers an id whose row is gone (e.g. a send that failed): keep it,
+                    // so the next save still replaces rather than piling up drafts.
+                    tx.execute(
+                        "INSERT INTO drafts(id, account_id, msg_id, draft, updated) VALUES (?1,?2,?3,?4,?5)",
+                        params![id, draft.account_id, msg_id, json(draft)?, now_ms()],
+                    )?;
+                    (id, None, None)
+                }
+            },
+            None => {
+                tx.execute(
+                    "INSERT INTO drafts(account_id, msg_id, draft, updated) VALUES (?1,?2,?3,?4)",
+                    params![draft.account_id, msg_id, json(draft)?, now_ms()],
+                )?;
+                (tx.last_insert_rowid(), None, None)
+            }
+        };
+        let mut content = draft.clone();
+        content.id = Some(id);
+        let msg_id = bare_msg_id(msg_id);
+        tx.execute(
+            "UPDATE drafts SET msg_id=?1, draft=?2, updated=?3 WHERE id=?4",
+            params![msg_id, json(&content)?, now_ms(), id],
+        )?;
+        let thread = match thread {
+            Some(thread) => {
+                update_draft_message(&tx, id, draft, &msg_id)?;
+                thread
+            }
+            None => insert_draft_message(&tx, id, draft, &name, &email, &msg_id)?,
+        };
+        tx.execute(
+            "UPDATE drafts SET thread_id=?1 WHERE id=?2",
+            params![thread, id],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+             SELECT ?1, tag_id FROM draft_tags WHERE draft_id=?2",
+            params![thread, id],
+        )?;
+        refresh_labels(&tx, thread)?;
+        tx.execute("DELETE FROM draft_tags WHERE draft_id=?1", [id])?;
+        refresh_thread(&tx, thread)?;
+        // A draft row reads better as its recipients than as its sender (which is always us).
+        tx.execute(
+            "UPDATE threads SET participants=?1 WHERE id=?2",
+            params![draft_participants(draft), thread],
+        )?;
+        tx.commit()?;
+        Ok((id, replaced))
+    }
+
+    /// The draft behind a Drafts-mailbox thread, with its id filled in. A draft written in another
+    /// client has no editable copy yet, so it is adopted on the spot and its provider copy becomes
+    /// the one a save replaces. Adoption writes, so callers use the writer connection.
+    pub fn draft(&self, thread: Id) -> Result<Option<Draft>> {
+        let known: Option<(Id, String)> = self
+            .conn
+            .query_row(
+                "SELECT id, draft FROM drafts WHERE thread_id=?1",
+                [thread],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((id, raw)) = known {
+            let mut draft: Draft = serde_json::from_str(&raw).context("saved draft")?;
+            draft.id = Some(id);
+            return Ok(Some(draft));
+        }
+
+        let row: Option<Adopted> = self
+            .conn
+            .query_row(
+                "SELECT id, account_id, remote_id, message_id, subject, text, to_json, cc_json
+                 FROM messages WHERE thread_id=?1 AND mailbox='drafts'
+                 ORDER BY date DESC, id DESC LIMIT 1",
+                [thread],
+                |r| {
+                    Ok(Adopted {
+                        message: r.get(0)?,
+                        account: r.get(1)?,
+                        remote: r.get(2)?,
+                        msg_id: r.get(3)?,
+                        subject: r.get(4)?,
+                        text: r.get(5)?,
+                        to: r.get(6)?,
+                        cc: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        let mut draft = Draft {
+            id: None,
+            account_id: row.account,
+            to: addrs_from_json(&row.to),
+            cc: addrs_from_json(&row.cc),
+            subject: row.subject,
+            body: row.text,
+            ..Draft::default()
+        };
+        tx.execute(
+            "INSERT INTO drafts(account_id, thread_id, remote_id, msg_id, draft, updated)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                row.account,
+                thread,
+                row.remote,
+                row.msg_id.as_deref().map(bare_msg_id).unwrap_or_default(),
+                json(&draft)?,
+                now_ms()
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        draft.id = Some(id);
+        // The local row becomes this draft's editable copy; the provider id it held is kept on the
+        // `drafts` row, which is what a save passes as `replaces`.
+        tx.execute(
+            "UPDATE messages SET remote_id=?1 WHERE id=?2",
+            params![draft_row_id(id), row.message],
+        )?;
+        tx.execute(
+            "UPDATE drafts SET draft=?1 WHERE id=?2",
+            params![json(&draft)?, id],
+        )?;
+        tx.execute(
+            "UPDATE threads SET participants=?1 WHERE id=?2",
+            params![draft_participants(&draft), thread],
+        )?;
+        tx.commit()?;
+        Ok(Some(draft))
+    }
+
+    /// Deletes a draft locally, returning `(account, provider copy)` when the provider still holds
+    /// one for the engine to queue a delete op.
+    pub fn discard_draft(&self, id: Id) -> Result<Option<(Id, String)>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(Id, Option<Id>, Option<String>)> = tx
+            .query_row(
+                "SELECT account_id, thread_id, remote_id FROM drafts WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((account, thread, remote)) = row else {
+            return Ok(None);
+        };
+        tx.execute(
+            "DELETE FROM messages WHERE account_id=?1 AND remote_id=?2",
+            params![account, draft_row_id(id)],
+        )?;
+        tx.execute("DELETE FROM drafts WHERE id=?1", [id])?;
+        if let Some(thread) = thread {
+            refresh_thread(&tx, thread)?;
+        }
+        tx.commit()?;
+        Ok(remote.map(|remote| (account, remote)))
+    }
+
+    /// Drops a draft row after a successful send, returning the provider copy to delete.
+    pub fn draft_sent(&self, id: Id) -> Result<Option<(Id, String)>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let row: Option<(Id, Option<Id>, Option<String>)> = tx
+            .query_row(
+                "SELECT account_id, thread_id, remote_id FROM drafts WHERE id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((account, thread, remote)) = row else {
+            return Ok(None);
+        };
+        tx.execute("DELETE FROM drafts WHERE id=?1", [id])?;
+        if let Some(thread) = thread {
+            refresh_thread(&tx, thread)?;
+        }
+        tx.commit()?;
+        Ok(remote.map(|remote| (account, remote)))
+    }
+
+    /// Persist before transmission so tags survive a successful send followed by delayed sync
+    /// or restart. Proton additionally supplies its exact provider identity after sending.
+    pub fn remember_sent_tags(&self, draft: Id, account: Id, identity: &str) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO sent_tags(account_id, identity, tag_id)
+            SELECT ?1, ?2, dt.tag_id FROM draft_tags dt JOIN drafts d ON d.id=dt.draft_id
+            WHERE d.id=?3 AND d.account_id=?1
+            UNION SELECT ?1, ?2, tt.tag_id FROM thread_tags tt JOIN drafts d ON d.thread_id=tt.thread_id
+            WHERE d.id=?3 AND d.account_id=?1", params![account, identity, draft])?;
+        Ok(())
+    }
+
+    /// Queues a provider-side draft op now. `draft` links a `SaveDraft` to the row that learns its
+    /// new remote id once the backend reports it.
+    pub fn draft_op(&self, account: Id, op: &Op, draft: Option<Id>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO pending_ops(account_id, message_id, draft_id, op, at) VALUES (?1, NULL, ?2, ?3, ?4)",
+            params![account, draft, json(op)?, now_ms()],
+        )?;
+        Ok(())
+    }
+}
+
+/// Account-scoped thread and provider ids cannot follow a draft's From account.
+fn rehome_draft(tx: &Transaction, id: Id, account: Id) -> Result<()> {
+    let old: Option<(Id, Option<String>)> = tx
+        .query_row(
+            "SELECT account_id, remote_id FROM drafts WHERE id=?1 AND account_id!=?2",
+            params![id, account],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((old_account, remote)) = old else {
+        return Ok(());
+    };
+    // A deleted message's SQLite row id can be reused by the new account's draft.
+    tx.execute(
+        "UPDATE pending_ops SET message_id=NULL, draft_id=?1 WHERE account_id=?2
+         AND message_id IN (SELECT id FROM messages WHERE account_id=?2 AND remote_id=?3)",
+        params![id, old_account, draft_row_id(id)],
+    )?;
+    hide_draft_row(tx, id)?;
+    tx.execute(
+        "UPDATE drafts SET account_id=?1, thread_id=NULL, remote_id=NULL WHERE id=?2",
+        params![account, id],
+    )?;
+    if let Some(remote_id) = remote {
+        tx.execute(
+            "INSERT INTO pending_ops(account_id, op, at) VALUES (?1,?2,?3)",
+            params![old_account, json(&Op::DeleteDraft { remote_id })?, now_ms()],
+        )?;
+    }
+    Ok(())
+}
+
+fn insert_draft_message(
+    tx: &Transaction,
+    id: Id,
+    draft: &Draft,
+    name: &str,
+    email: &str,
+    msg_id: &str,
+) -> Result<Id> {
+    tx.execute(
+        "INSERT INTO threads(account_id, subject, norm_subject, snippet, participants, date,
+           unread, starred, important, attachments, count, mailbox)
+         VALUES (?1,'','','','',0,0,0,0,0,0,'drafts')",
+        [draft.account_id],
+    )?;
+    let thread = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO messages(account_id, thread_id, remote_id, folder, mailbox, message_id,
+           from_name, from_email, to_json, cc_json, date, subject, norm_subject, text,
+           unread, starred, important, important_src, from_self)
+         VALUES (?1,?2,?3,'Drafts','drafts',?4,?5,?6,?7,?8,?9,?10,?11,?12,0,0,0,2,1)",
+        params![
+            draft.account_id,
+            thread,
+            draft_row_id(id),
+            msg_id,
+            display_name(name, email),
+            email,
+            addrs_json(&draft.to),
+            addrs_json(&draft.cc),
+            now_ms(),
+            draft.subject,
+            norm_subject(&draft.subject),
+            draft.body,
+        ],
+    )?;
+    tx.execute(
+        "INSERT OR IGNORE INTO thread_keys(account_id, key, thread_id) VALUES (?1,?2,?3)",
+        params![
+            draft.account_id,
+            format!("i:{}", msg_id.to_ascii_lowercase()),
+            thread
+        ],
+    )?;
+    Ok(thread)
+}
+
+fn update_draft_message(tx: &Transaction, id: Id, draft: &Draft, msg_id: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE messages SET message_id=?1, to_json=?2, cc_json=?3, date=?4, subject=?5,
+           norm_subject=?6, text=?7 WHERE account_id=?8 AND remote_id=?9",
+        params![
+            msg_id,
+            addrs_json(&draft.to),
+            addrs_json(&draft.cc),
+            now_ms(),
+            draft.subject,
+            norm_subject(&draft.subject),
+            draft.body,
+            draft.account_id,
+            draft_row_id(id),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Hides a queued-for-send draft from the Drafts mailbox while keeping its row (and provider id),
+/// so a cancelled send can put it back.
+fn hide_draft_row(tx: &Transaction, id: Id) -> Result<()> {
+    let thread: Option<Option<Id>> = tx
+        .query_row("SELECT thread_id FROM drafts WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(Some(thread)) = thread {
+        tx.execute(
+            "INSERT OR IGNORE INTO draft_tags(draft_id, tag_id)
+            SELECT ?1, tag_id FROM thread_tags WHERE thread_id=?2",
+            params![id, thread],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE remote_id=?1 AND account_id=(SELECT account_id FROM drafts WHERE id=?2)",
+            params![draft_row_id(id), id],
+        )?;
+        refresh_thread(tx, thread)?;
+    }
+    Ok(())
+}
+
+/// Puts a hidden draft back into the Drafts mailbox (a cancelled send).
+fn restore_draft_row(tx: &Transaction, id: Id) -> Result<()> {
+    let row: Option<(Option<Id>, String, String)> = tx
+        .query_row(
+            "SELECT thread_id, msg_id, draft FROM drafts WHERE id=?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((None, msg_id, raw)) = row else {
+        return Ok(());
+    };
+    let draft: Draft = serde_json::from_str(&raw).context("saved draft")?;
+    let (name, email) = tx.query_row(
+        "SELECT name, email FROM accounts WHERE id=?1",
+        [draft.account_id],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )?;
+    let thread = insert_draft_message(tx, id, &draft, &name, &email, &msg_id)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+        SELECT ?1, tag_id FROM draft_tags WHERE draft_id=?2",
+        params![thread, id],
+    )?;
+    tx.execute("DELETE FROM draft_tags WHERE draft_id=?1", [id])?;
+    refresh_labels(tx, thread)?;
+    tx.execute(
+        "UPDATE drafts SET thread_id=?1 WHERE id=?2",
+        params![thread, id],
+    )?;
+    refresh_thread(tx, thread)?;
+    tx.execute(
+        "UPDATE threads SET participants=?1 WHERE id=?2",
+        params![draft_participants(&draft), thread],
+    )?;
+    Ok(())
+}
+
+fn draft_participants(draft: &Draft) -> String {
+    let mut names: Vec<String> = Vec::new();
+    for a in draft.to.iter().chain(&draft.cc) {
+        let name = display_name(&a.name, &a.email);
+        if !name.is_empty() && !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.len() > 4 {
+        format!(
+            "{}, {}, {}, {}Ã¢â‚¬Â¦",
+            names[0], names[1], names[2], names[3]
+        )
+    } else {
+        names.join(", ")
+    }
+}
+
 // ---------------------------------------------------------------- outbox, ...
 
 impl Store {
     pub fn outbox_add(&self, draft: &Draft, due: Ms) -> Result<Id> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        // A saved draft leaves the Drafts mailbox the moment it is queued, so sending looks
+        // immediate. The row stays for a cancel to restore and a successful send to delete.
+        if let Some(id) = draft.id {
+            rehome_draft(&tx, id, draft.account_id)?;
+            tx.execute(
+                "UPDATE drafts SET draft=?1 WHERE id=?2",
+                params![json(draft)?, id],
+            )?;
+            hide_draft_row(&tx, id)?;
+        }
+        tx.execute(
             "INSERT INTO outbox(account_id, draft, at) VALUES (?1,?2,?3)",
             params![draft.account_id, json(draft)?, due],
         )?;
-        Ok(self.conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(id)
     }
 
     pub fn outbox_cancel(&self, id: Id) -> Result<Option<Draft>> {
-        let draft: Option<String> = self
-            .conn
+        let tx = self.conn.unchecked_transaction()?;
+        let raw: Option<String> = tx
             .query_row("SELECT draft FROM outbox WHERE id=?1", [id], |r| r.get(0))
             .optional()?;
-        let Some(draft) = draft else { return Ok(None) };
-        self.conn.execute("DELETE FROM outbox WHERE id=?1", [id])?;
-        Ok(Some(serde_json::from_str(&draft)?))
+        let Some(raw) = raw else { return Ok(None) };
+        tx.execute("DELETE FROM outbox WHERE id=?1", [id])?;
+        let draft: Draft = serde_json::from_str(&raw)?;
+        if let Some(draft_id) = draft.id {
+            restore_draft_row(&tx, draft_id)?;
+        }
+        tx.commit()?;
+        Ok(Some(draft))
     }
 
     pub fn outbox_due(&self, now: Ms) -> Result<Vec<(Id, Draft)>> {
@@ -1526,6 +2376,30 @@ impl Store {
     pub fn outbox_sent(&self, id: Id) -> Result<()> {
         self.conn.execute("DELETE FROM outbox WHERE id=?1", [id])?;
         Ok(())
+    }
+
+    /// Stop after eight attempts; return (stopped, first failure) for draft recovery and one retry toast.
+    pub fn outbox_failed(
+        &self,
+        id: Id,
+        now: Ms,
+        permanent: bool,
+        not_before: Option<Ms>,
+    ) -> Result<(bool, bool)> {
+        let attempts: i64 =
+            self.conn
+                .query_row("SELECT attempts FROM outbox WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })?;
+        if permanent || attempts >= 7 {
+            return Ok((true, attempts == 0));
+        }
+        let backoff = (5_000i64 << attempts.min(8)).min(15 * 60_000);
+        self.conn.execute(
+            "UPDATE outbox SET attempts=attempts+1, at=?1 WHERE id=?2",
+            params![(now + backoff).max(not_before.unwrap_or(0)), id],
+        )?;
+        Ok((false, attempts == 0))
     }
 
     /// Everything the engine needs to build reply MIME. `references` already includes this
@@ -1679,9 +2553,111 @@ impl Store {
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Missing sources fail closed, so stale UI state cannot authorize an AI request.
+    pub fn check_ai_thread(&self, thread: Id) -> Result<()> {
+        self.check_ai_thread_path(thread, &mut HashSet::new())
+    }
+
+    fn check_ai_thread_path(&self, thread: Id, path: &mut HashSet<Id>) -> Result<()> {
+        if !path.insert(thread) || path.len() > 100 {
+            bail!("The AI source has circular or excessive draft references");
+        }
+        let private: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_tags tt JOIN tags t ON t.id=tt.tag_id
+             WHERE tt.thread_id=threads.id AND t.name=?2 COLLATE NOCASE)
+             FROM threads WHERE id=?1",
+                params![thread, PRIVATE_TAG],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match private {
+            Some(false) => {}
+            Some(true) => bail!("This conversation is private, so AI can't read it"),
+            None => bail!("The AI source conversation is no longer available"),
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT draft FROM drafts WHERE thread_id=?1")?;
+        let drafts = statement
+            .query_map([thread], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for raw in drafts {
+            let draft: Draft = serde_json::from_str(&raw).context("AI draft source")?;
+            self.check_ai_reply(&draft, path)?;
+        }
+        path.remove(&thread);
+        Ok(())
+    }
+
+    fn check_ai_reply(&self, draft: &Draft, path: &mut HashSet<Id>) -> Result<()> {
+        if let Some(message) = draft.reply_to {
+            let thread: Id = self
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE id=?1 AND account_id=?2",
+                    params![message, draft.account_id],
+                    |r| r.get(0),
+                )
+                .context("The AI reply source is no longer available")?;
+            self.check_ai_thread_path(thread, path)?;
+        }
+        Ok(())
+    }
+
+    pub fn check_ai_draft(&self, draft: &Draft) -> Result<()> {
+        self.check_ai_reply(draft, &mut HashSet::new())?;
+        if let Some(id) = draft.id {
+            let private: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM draft_tags dt
+                JOIN tags t ON t.id=dt.tag_id WHERE dt.draft_id=?1 AND t.name=?2 COLLATE NOCASE)",
+                params![id, PRIVATE_TAG],
+                |r| r.get(0),
+            )?;
+            if private {
+                bail!("This draft is private, so AI can't read it");
+            }
+            // A draft not yet linked to a conversation has no thread to protect.
+            let thread: Option<Id> = self
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM drafts WHERE id=?1 AND account_id=?2",
+                    params![id, draft.account_id],
+                    |r| r.get(0),
+                )
+                .context("The AI draft is no longer available")?;
+            if let Some(thread) = thread {
+                self.check_ai_thread(thread)?;
+            }
+            let raw: String = self.conn.query_row(
+                "SELECT draft FROM drafts WHERE id=?1 AND account_id=?2",
+                params![id, draft.account_id],
+                |r| r.get(0),
+            )?;
+            let saved: Draft = serde_json::from_str(&raw).context("AI saved draft")?;
+            self.check_ai_reply(&saved, &mut HashSet::new())?;
+        }
+        Ok(())
+    }
+
     /// Replaces the whole list. List order is the display order; ids <= 0 create, omitted tags are
     /// deleted (cascading out of every thread). Validation happens before any write.
-    pub fn set_tags(&self, tags: Vec<Tag>) -> Result<()> {
+    pub fn set_tags(&self, mut tags: Vec<Tag>) -> Result<()> {
+        // A tag-list edit must never silently remove protection from existing conversations.
+        if let Some(private) = self
+            .tags()?
+            .into_iter()
+            .find(|t| t.name.eq_ignore_ascii_case(PRIVATE_TAG))
+        {
+            if let Some(tag) = tags.iter().find(|t| t.id == private.id) {
+                if !tag.name.eq_ignore_ascii_case(PRIVATE_TAG) {
+                    bail!("The Private tag cannot be renamed");
+                }
+            } else {
+                tags.push(private);
+            }
+        }
         let mut desired: Vec<(Option<Id>, String, String)> = Vec::with_capacity(tags.len());
         let mut seen: HashSet<String> = HashSet::new();
         for t in tags {
@@ -1707,9 +2683,7 @@ impl Store {
         let tx = self.conn.unchecked_transaction()?;
         let existing: HashMap<Id, (String, String, i64)> = {
             let mut s = tx.prepare("SELECT id, name, color, position FROM tags")?;
-            let it = s.query_map([], |r| {
-                Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
-            })?;
+            let it = s.query_map([], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?;
             it.collect::<rusqlite::Result<HashMap<_, _>>>()?
         };
         let mut seen_ids: HashSet<Id> = HashSet::new();
@@ -2056,13 +3030,15 @@ fn rewrite_label_tokens(query: &str, renames: &HashMap<String, String>) -> Strin
         let mut changed = false;
         let parts: Vec<&str> = inner
             .split(',')
-            .map(|part| match renames.get(&part.trim().to_ascii_lowercase()) {
-                Some(new) => {
-                    changed = true;
-                    new.as_str()
-                }
-                None => part,
-            })
+            .map(
+                |part| match renames.get(&part.trim().to_ascii_lowercase()) {
+                    Some(new) => {
+                        changed = true;
+                        new.as_str()
+                    }
+                    None => part,
+                },
+            )
             .collect();
         if !changed {
             out.push(token.to_string());
@@ -2130,8 +3106,12 @@ fn mailbox_cond(m: Mailbox) -> &'static str {
         Mailbox::Snoozed => "t.snoozed_until IS NOT NULL AND t.mailbox NOT IN ('trash','spam')",
         Mailbox::All => "t.mailbox NOT IN ('trash','spam')",
         Mailbox::Archive => "t.mailbox='archive'",
-        Mailbox::Drafts => "t.mailbox='drafts'",
-        Mailbox::Sent => "t.mailbox='sent'",
+        Mailbox::Drafts => {
+            "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.mailbox='drafts')"
+        }
+        Mailbox::Sent => {
+            "EXISTS (SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.mailbox='sent')"
+        }
         Mailbox::Trash => "t.mailbox='trash'",
         Mailbox::Spam => "t.mailbox='spam'",
     }

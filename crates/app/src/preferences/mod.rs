@@ -8,6 +8,7 @@ pub mod appearance;
 pub mod connections;
 pub mod general;
 pub mod privacy;
+pub mod shortcuts;
 pub mod typography;
 
 use crate::app::{Kite, Overlay};
@@ -18,10 +19,116 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::Settings;
 
+/// A settings page. [`Page::ALL`] is the only place the rail order lives: a page's index is
+/// its position there, so the rail, the shortcuts and every link cannot drift apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    General,
+    Accounts,
+    Connections,
+    Appearance,
+    Typography,
+    Shortcuts,
+    Privacy,
+    Ai,
+}
+
+impl Page {
+    /// Rail order. Reordering this list reorders the rail and moves every entry point.
+    pub const ALL: [Page; 8] = [
+        Page::General,
+        Page::Accounts,
+        Page::Connections,
+        Page::Appearance,
+        Page::Typography,
+        Page::Shortcuts,
+        Page::Privacy,
+        Page::Ai,
+    ];
+
+    /// The rail index, which is also the id the tests and shortcuts use.
+    pub const fn index(self) -> usize {
+        let mut index = 0;
+        while index < Self::ALL.len() {
+            if Self::ALL[index] as u8 == self as u8 {
+                return index;
+            }
+            index += 1;
+        }
+        unreachable!()
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        Self::ALL.get(index).copied().unwrap_or(Self::General)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Page::General => "General",
+            Page::Accounts => "Accounts",
+            Page::Connections => "Connections",
+            Page::Appearance => "Appearance",
+            Page::Typography => "Typography",
+            Page::Shortcuts => "Shortcuts",
+            Page::Privacy => "Privacy",
+            Page::Ai => "AI",
+        }
+    }
+
+    fn subtitle(self) -> &'static str {
+        match self {
+            Page::General => "Everyday defaults",
+            Page::Accounts => "Mailboxes connected to Kite",
+            Page::Connections => "Proton and Outlook",
+            Page::Appearance => "Colours and palette",
+            Page::Typography => "Type, size and colour",
+            Page::Shortcuts => "Keys for every command",
+            Page::Privacy => "Remote images and tracking",
+            Page::Ai => "Writing and summaries",
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Page::General => IconName::Settings2,
+            Page::Accounts => IconName::CircleUser,
+            Page::Connections => IconName::Network,
+            Page::Appearance => IconName::Palette,
+            Page::Typography => IconName::ALargeSmall,
+            Page::Shortcuts => IconName::Keyboard,
+            Page::Privacy => IconName::EyeOff,
+            Page::Ai => IconName::Bot,
+        }
+    }
+}
+
 /// Rail indices, shared with the shortcuts and the sidebar so they cannot drift.
-pub const OPEN_APPEARANCE: usize = 0;
-pub const OPEN_ACCOUNTS: usize = 2;
-pub const OPEN_CONNECTIONS: usize = 3;
+pub const OPEN_GENERAL: usize = Page::General.index();
+pub const OPEN_ACCOUNTS: usize = Page::Accounts.index();
+pub const OPEN_CONNECTIONS: usize = Page::Connections.index();
+pub const OPEN_SHORTCUTS: usize = Page::Shortcuts.index();
+
+const RAIL_WIDE: f32 = 200.;
+const RAIL_COMPACT: f32 = 56.;
+const INSET_WIDE: f32 = 40.;
+const INSET_COMPACT: f32 = 24.;
+/// The widest a settings form gets; galleries size themselves against it.
+pub(crate) const CONTENT_MAX: f32 = 720.;
+
+/// Whether the window uses the icon rail and the narrower page padding.
+pub(crate) fn compact(window: &Window) -> bool {
+    window.viewport_size().width < px(1000.)
+}
+
+/// Width a page's column actually gets: the window minus the rail and both insets, capped.
+pub(crate) fn content_width(window: &Window) -> f32 {
+    let (rail, inset) = if compact(window) {
+        (RAIL_COMPACT, INSET_COMPACT)
+    } else {
+        (RAIL_WIDE, INSET_WIDE)
+    };
+    (window.viewport_size().width.as_f32() - rail - inset * 2.).min(CONTENT_MAX)
+}
 
 pub struct Preferences {
     pub tab: usize,
@@ -31,6 +138,7 @@ pub struct Preferences {
     pub connections: connections::State,
     pub general: general::State,
     pub privacy: privacy::State,
+    pub shortcuts: shortcuts::State,
     pub ai: ai::State,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -40,24 +148,6 @@ pub struct Preferences {
 }
 
 pub const TEMPLATE: &str = "{\n  \"name\": \"My midnight\",\n  \"base\": \"dark\",\n  \"colors\": {\n    \"bg\": \"#101820\",\n    \"bg2\": \"#16212b\",\n    \"accent\": \"#77c5dc\"\n  }\n}";
-
-/// `(index, rail label, page subtitle, icon)`. The index is the id the tests and shortcuts use.
-fn tabs() -> [(usize, &'static str, &'static str, IconName); 7] {
-    [
-        (0, "Appearance", "Colours and palette", IconName::Palette),
-        (1, "Typography", "Type, size and colour", IconName::ALargeSmall),
-        (2, "Accounts", "Mailboxes connected to Kite", IconName::CircleUser),
-        (
-            3,
-            "Connections",
-            "Proton Bridge and Outlook",
-            IconName::Network,
-        ),
-        (4, "General", "Everyday defaults", IconName::Settings2),
-        (5, "Privacy", "Remote images and tracking", IconName::EyeOff),
-        (6, "AI", "Writing and summaries", IconName::Bot),
-    ]
-}
 
 impl Kite {
     pub(crate) fn show_preferences(
@@ -77,21 +167,17 @@ impl Kite {
                 tab,
                 appearance: appearance::State,
                 typography: typography::State::new(&settings, window, cx),
-                accounts: accounts::State::default(),
+                accounts: accounts::State::new(self, window, cx),
                 connections: connections::State::new(window, cx),
                 general: general::State,
                 privacy: privacy::State,
+                shortcuts: shortcuts::State::default(),
                 ai: ai::State::new(&settings, window, cx),
                 error: None,
                 notice: None,
                 request,
                 scroll: ScrollHandle::new(),
             });
-        }
-        // Opening Connections looks for Bridge and creates what it finds, so the user
-        // never has to press a second button.
-        if tab == OPEN_CONNECTIONS {
-            self.find_proton_bridge(cx);
         }
         self.sidebar_dirty = true;
         window.focus(&self.focus, cx);
@@ -157,13 +243,23 @@ pub(crate) fn heading(t: Theme, title: &str, description: &str) -> Div {
 
 /// A grouped card: rows separated by hairlines on a raised surface.
 pub(crate) fn card(t: Theme, rows: Vec<AnyElement>) -> Div {
+    card_with(t, rows, true)
+}
+
+/// A denser card for key tables, where a row is one line and does not need the full padding.
+pub(crate) fn card_dense(t: Theme, rows: Vec<AnyElement>) -> Div {
+    card_with(t, rows, false)
+}
+
+fn card_with(t: Theme, rows: Vec<AnyElement>, roomy: bool) -> Div {
     let count = rows.len();
     let mut body = div().flex().flex_col();
     for (ix, row) in rows.into_iter().enumerate() {
         body = body.child(
             div()
                 .w_full()
-                .py_4()
+                .when(roomy, |d| d.py_4())
+                .when(!roomy, |d| d.py_2())
                 .when(ix + 1 < count, |d| d.border_b_1().border_color(t.line))
                 .child(row),
         );
@@ -236,19 +332,20 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         return div().into_any_element();
     };
     let t = kite.theme;
-    let compact = window.viewport_size().width < px(1000.);
+    let compact = compact(window);
     let rail = if compact { px(56.) } else { px(200.) };
-    let (_, title, subtitle, _) = tabs()[page.tab.min(6)];
+    let current = Page::from_index(page.tab);
     let inset = if compact { px(24.) } else { px(40.) };
 
-    let body = match page.tab {
-        1 => typography::render(kite, window, cx),
-        2 => accounts::render(kite, window, cx),
-        3 => connections::render(kite, window, cx),
-        4 => general::render(kite, window, cx),
-        5 => privacy::render(kite, window, cx),
-        6 => ai::render(kite, window, cx),
-        _ => appearance::render(kite, window, cx),
+    let body = match current {
+        Page::General => general::render(kite, window, cx),
+        Page::Accounts => accounts::render(kite, window, cx),
+        Page::Connections => connections::render(kite, window, cx),
+        Page::Appearance => appearance::render(kite, window, cx),
+        Page::Typography => typography::render(kite, window, cx),
+        Page::Shortcuts => shortcuts::render(kite, window, cx),
+        Page::Privacy => privacy::render(kite, window, cx),
+        Page::Ai => ai::render(kite, window, cx),
     };
 
     let mut content = div()
@@ -276,23 +373,25 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             div()
                                 .text_size(t.px(22.))
                                 .font_weight(FontWeight(650.))
-                                .child(title),
+                                .child(current.label()),
                         )
                         .child(
                             div()
                                 .text_size(t.px(12.))
                                 .text_color(t.fg2)
-                                .child(subtitle),
+                                .child(current.subtitle()),
                         ),
                 )
-                .child(button("close-settings", "Back to mail", t).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.preferences = None;
-                        this.sidebar_dirty = true;
-                        window.focus(&this.focus, cx);
-                        cx.notify();
-                    },
-                ))),
+                .child(
+                    button("close-settings", "Back to mail", t).on_click(cx.listener(
+                        |this, _, window, cx| {
+                            this.preferences = None;
+                            this.sidebar_dirty = true;
+                            window.focus(&this.focus, cx);
+                            cx.notify();
+                        },
+                    )),
+                ),
         )
         .child(
             div()
@@ -378,12 +477,12 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             .child("SETTINGS"),
                     )
                 })
-                .children(tabs().into_iter().map(|(index, label, _, icon)| {
+                .children(Page::ALL.into_iter().enumerate().map(|(index, tab)| {
                     let active = page.tab == index;
                     div()
                         .id(("settings-tab", index))
                         .test_support()
-                        .aria_label(label)
+                        .aria_label(tab.label())
                         .aria_selected(active)
                         .h(px(34.))
                         .flex_shrink_0()
@@ -397,17 +496,17 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                         .when(active, |d| d.bg(t.sel))
                         .text_color(if active { t.fg } else { t.fg2 })
                         .hover(|s| s.bg(t.bg3))
-                        .child(Icon::new(icon).with_size(px(16.)).text_color(if active {
-                            t.accent
-                        } else {
-                            t.fg3
-                        }))
+                        .child(
+                            Icon::new(tab.icon())
+                                .with_size(px(16.))
+                                .text_color(if active { t.accent } else { t.fg3 }),
+                        )
                         .when(!compact, |d| {
                             d.child(
                                 div()
                                     .text_size(t.px(13.))
                                     .when(active, |d| d.font_weight(FontWeight(650.)))
-                                    .child(label),
+                                    .child(tab.label()),
                             )
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -416,9 +515,6 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                                 page.error = None;
                                 page.notice = None;
                                 page.scroll = ScrollHandle::new();
-                            }
-                            if index == OPEN_CONNECTIONS {
-                                this.find_proton_bridge(cx);
                             }
                             cx.notify();
                         }))

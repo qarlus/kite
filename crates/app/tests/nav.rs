@@ -29,7 +29,7 @@ fn j_k_move_the_selection_and_enter_opens(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn escape_leaves_the_thread_view_and_j_stays_inside_it(cx: &mut TestAppContext) {
+fn reading_moves_through_conversations_and_back_to_the_list(cx: &mut TestAppContext) {
     let fixture = Fixture::new(4);
     let (window, kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "enter");
@@ -41,18 +41,33 @@ fn escape_leaves_the_thread_view_and_j_stays_inside_it(cx: &mut TestAppContext) 
         assert_eq!(
             kite.open_id(),
             Some(2),
-            "j moves to the next thread in thread view"
+            "j moves to the next thread while reading"
         )
     });
+    // With the reading pane on, leaving the conversation keeps it in view.
     cx.simulate_keystrokes(window.into(), "u");
     update_content(window, &kite, cx, |kite, _, _| {
-        assert_eq!(kite.open_id(), None)
+        assert_eq!(kite.open_id(), Some(2), "the conversation stays on screen");
+        assert_eq!(kite.sel_index(), 1);
+    });
+    cx.simulate_keystrokes(window.into(), "j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 2, "j moves the list selection again");
+        assert_eq!(
+            kite.open_id(),
+            Some(2),
+            "and does not replace the open conversation"
+        )
     });
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
             window.try_find(("row", 0usize)).is_some(),
-            "back in the list"
+            "the list is still there"
+        );
+        assert!(
+            window.try_find("thread-subject").is_some(),
+            "and so is the conversation"
         );
     })
     .unwrap();
@@ -78,8 +93,10 @@ fn go_sequences_switch_mailbox(cx: &mut TestAppContext) {
         // The strip only belongs to the inbox, so no tab is on screen here.
         assert!(window.try_find(("tab", 0usize)).is_none());
     });
-    // Coming back through the sidebar selects the inbox lens again.
+    // Coming back through the mailbox picker selects the inbox lens again.
     cx.update_window(window.into(), |_, window, cx| {
+        window.click("mailbox-picker", cx);
+        window.render_frame(cx);
         window.click(("mailbox", Mailbox::Inbox as usize), cx);
     })
     .unwrap();
@@ -104,15 +121,15 @@ fn the_category_tabs_narrow_the_inbox_and_are_reachable_by_keyboard(cx: &mut Tes
     let (window, kite) = mount(cx, fixture.clone());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let heading = window.find("mailbox-heading").bounds();
+        let first_row = window.find(("row", 0usize)).bounds();
         let mut previous = None;
         for (ix, name) in common::SPLIT_NAMES.iter().enumerate() {
             let tab = window.find(("tab", ix));
             assert_eq!(tab.label(), Some(*name), "tab {ix} is {name}");
             let bounds = tab.bounds();
             assert!(
-                bounds.origin.y < heading.origin.y,
-                "{name} sits above the mailbox heading"
+                bounds.bottom() <= first_row.origin.y,
+                "{name} sits above the list"
             );
             if let Some(previous) = previous {
                 assert!(
@@ -146,10 +163,16 @@ fn the_category_tabs_narrow_the_inbox_and_are_reachable_by_keyboard(cx: &mut Tes
             "only the social senders remain"
         );
     });
-    let (view, _) = fixture.queries.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(
-        view.split,
-        Some(common::SPLITS[1]),
+    let asked = |split| {
+        fixture
+            .queries
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(view, _)| view.split == Some(split) && view.mailbox == Mailbox::Inbox)
+    };
+    assert!(
+        asked(common::SPLITS[1]),
         "the Social tab asks the engine for the Social split"
     );
 
@@ -162,10 +185,8 @@ fn the_category_tabs_narrow_the_inbox_and_are_reachable_by_keyboard(cx: &mut Tes
         assert_eq!(kite.view().split, Some(common::SPLITS[3]));
         assert_eq!(kite.row_ids(), vec![6], "only the GitHub sender remains");
     });
-    let (view, _) = fixture.queries.lock().unwrap().last().cloned().unwrap();
-    assert_eq!(
-        view.split,
-        Some(common::SPLITS[3]),
+    assert!(
+        asked(common::SPLITS[3]),
         "the GitHub tab asks the engine for the GitHub split"
     );
 
@@ -310,6 +331,99 @@ fn palette_navigation_keeps_the_selected_command_visible(cx: &mut TestAppContext
         let row = window.find(("palette-row", 10usize));
         assert_eq!(row.selected(), Some(true));
         assert!(row.bounds().bottom() <= window.find("palette").bounds().bottom());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_list_edges_say_so_and_do_not_stack_toasts(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, kite) = mount(cx, fixture);
+    // k at the first row.
+    cx.simulate_keystrokes(window.into(), "k");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 0, "k at the top keeps the first row")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Top of Inbox"));
+        assert!(
+            window.try_find("toast-undo-hint").is_none(),
+            "an edge notice is information, not an action to undo"
+        );
+    })
+    .unwrap();
+    // j past the last row.
+    cx.simulate_keystrokes(window.into(), "j j j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 2, "the last row stays selected")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+    // Repeating it refreshes the one toast instead of stacking another. `find` asserts the
+    // ElementId is unique, so a second toast would fail this frame.
+    cx.simulate_keystrokes(window.into(), "j j j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 3, "nothing moved")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_mailbox_other_than_the_inbox_names_itself_at_the_edge(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "s g s");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 1, "one starred thread")
+    });
+    cx.simulate_keystrokes(window.into(), "j");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Starred"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn walking_conversations_at_the_end_of_the_list_says_so(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "j enter");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), Some(2), "the last conversation is open")
+    });
+    cx.simulate_keystrokes(window.into(), "j");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.open_id(), Some(2), "there is no next conversation")
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("End of Inbox"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn an_empty_list_says_nothing_about_its_edges(cx: &mut TestAppContext) {
+    let (window, kite) = mount(cx, Fixture::new(0));
+    cx.simulate_keystrokes(window.into(), "j k");
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.row_count(), 0)
+    });
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("toast").is_none(),
+            "the empty state already says the mailbox is empty"
+        );
     })
     .unwrap();
 }

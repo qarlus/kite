@@ -13,7 +13,7 @@ use crate::model::{Addr, Mailbox, Ms};
 use serde::{Deserialize, Serialize};
 
 pub mod graph;
-pub mod imap;
+pub mod proton;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteAttachment {
@@ -25,12 +25,13 @@ pub struct RemoteAttachment {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct RemoteMsg {
-    /// Stable per account. IMAP: "{folder}/{uidvalidity}/{uid}". Graph: message id.
+    /// Stable provider message id per account.
     pub remote_id: String,
     /// Remote folder id/path the message lives in.
     pub folder: String,
     pub mailbox: Mailbox,
-    /// Provider thread id if any (Graph conversationId). The store threads by headers otherwise.
+    /// Graph conversationId fallback only when full threading headers are unavailable.
+    /// Other backends leave this empty; header links always take precedence.
     pub thread_hint: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
@@ -54,6 +55,13 @@ pub struct RemoteMsg {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub enum Delta {
     Upsert(Box<RemoteMsg>),
+    Metadata {
+        remote_id: String,
+        folder: String,
+        mailbox: Mailbox,
+        unread: bool,
+        starred: bool,
+    },
     Flags {
         remote_id: String,
         unread: bool,
@@ -83,5 +91,15 @@ pub enum Op {
     /// Raw RFC 5322 bytes (built with mail-builder). Both backends send MIME as-is.
     Send {
         mime: Vec<u8>,
+    },
+    /// Creates or replaces the provider's copy of a saved draft. `replaces` is the previous remote
+    /// id of the same draft; `apply` returns the new one so the store can delete it later.
+    SaveDraft {
+        mime: Vec<u8>,
+        replaces: Option<String>,
+    },
+    /// Removes a saved draft's provider copy (discarded, or already sent).
+    DeleteDraft {
+        remote_id: String,
     },
 }

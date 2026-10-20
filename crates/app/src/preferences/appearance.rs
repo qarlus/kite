@@ -196,13 +196,13 @@ fn inbox_preview(palette: Theme) -> Div {
 
 pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
-    let narrow = window.viewport_size().width < px(1000.);
 
     let mut themes = vec![
         ("dark", "Carbon", theme::CARBON),
         ("light", "Paper", theme::PAPER),
         ("midnight", "Midnight", theme::preset("midnight")),
         ("linen", "Linen", theme::preset("linen")),
+        ("ember", "Ember", theme::preset("ember")),
     ];
     if let Some(custom) = &kite.settings.custom_theme
         && let Ok(palette) = theme::custom(custom)
@@ -210,8 +210,21 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         themes.push(("custom", custom.name.as_str(), palette));
     }
 
+    // Tiles keep one width in every row: the grid wraps at the count that fits the content
+    // column at TILE_MIN, and a short last row stays left-aligned instead of stretching.
+    const TILE_MIN: f32 = 124.;
+    const GAP: f32 = 12.;
+    let content = super::content_width(window);
+    let columns = if super::compact(window) {
+        2
+    } else {
+        ((content + GAP) / (TILE_MIN + GAP)) as usize
+    }
+    .clamp(1, themes.len());
+    let tile_w = (content - GAP * (columns - 1) as f32) / columns as f32;
+
     let mut grid = div().flex().flex_col().gap_3();
-    for group in themes.chunks(if narrow { 2 } else { 4 }) {
+    for group in themes.chunks(columns) {
         grid = grid.child(div().flex().gap_3().children(group.iter().map(
             |(id, name, palette)| {
                 let id = *id;
@@ -228,8 +241,8 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .test_support()
                     .aria_label(format!("{name} theme"))
                     .aria_selected(selected)
-                    .flex_1()
-                    .min_w_0()
+                    .w(px(tile_w))
+                    .flex_shrink_0()
                     .p(px(1.))
                     .rounded(px(RADIUS))
                     .bg(ring)
@@ -358,5 +371,53 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                 .child(grid)
                 .child(div().pt_3().child(theme_actions)),
         )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(heading(
+                    t,
+                    "Layout",
+                    "How much of the window the conversation gets.",
+                ))
+                .child(card(
+                    t,
+                    vec![row(
+                        t,
+                        "Reading pane",
+                        "Read beside the list; off opens a conversation across the window.",
+                        switch("reading-pane", kite.settings.reading_pane, t).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                let mut settings = this.settings.clone();
+                                settings.reading_pane = !settings.reading_pane;
+                                this.save_preferences(settings, window, cx);
+                            }),
+                        ),
+                    )],
+                )),
+        )
         .into_any_element()
+}
+
+/// An on/off setting drawn as a switch: a filled track when on.
+fn switch(id: &'static str, on: bool, t: Theme) -> gpui_kit::base::ObservedElement<Stateful<Div>> {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label("Reading pane")
+        .aria_selected(on)
+        .w(px(36.))
+        .h(px(20.))
+        .flex()
+        .items_center()
+        .p(px(2.))
+        .when(on, |d| d.justify_end())
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if on {
+            t.accent.into()
+        } else {
+            Theme::alpha(t.fg3, 0.45)
+        })
+        .child(div().size(px(16.)).rounded_full().bg(t.bg))
 }

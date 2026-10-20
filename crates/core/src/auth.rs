@@ -14,25 +14,66 @@ const SCOPES: &str = "offline_access Mail.ReadWrite Mail.Send Calendars.Read Use
 const SERVICE: &str = "app.kite.mail";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Windows Credential Manager caps a secret at 2560 bytes of UTF-16; Microsoft's tokens are
+/// longer, so a secret is stored as `key`, `key#1`, `key#2`, … in UTF-16 units under the cap.
+const SECRET_CHUNK: usize = 1280;
+
+fn chunk_key(key: &str, i: usize) -> String {
+    if i == 0 {
+        key.to_string()
+    } else {
+        format!("{key}#{i}")
+    }
+}
+
 /// Stores a secret in the OS keychain (Windows Credential Manager, macOS Keychain).
 pub fn secret_set(key: &str, val: &str) -> Result<()> {
-    keyring::Entry::new(SERVICE, key)?.set_password(val)?;
-    Ok(())
+    let mut chunks = vec![String::new()];
+    for c in val.chars() {
+        if chunks
+            .last()
+            .is_some_and(|s| s.encode_utf16().count() + c.len_utf16() > SECRET_CHUNK)
+        {
+            chunks.push(String::new());
+        }
+        if let Some(last) = chunks.last_mut() {
+            last.push(c);
+        }
+    }
+    for (i, chunk) in chunks.iter().enumerate() {
+        keyring::Entry::new(SERVICE, &chunk_key(key, i))?.set_password(chunk)?;
+    }
+    // A shorter value must not pick up the tail of a longer one stored before it.
+    delete_chunks(key, chunks.len())
 }
 
 pub fn secret_get(key: &str) -> Result<Option<String>> {
-    match keyring::Entry::new(SERVICE, key)?.get_password() {
-        Ok(v) => Ok(Some(v)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(e) => Err(e.into()),
+    let mut val = String::new();
+    for i in 0.. {
+        match keyring::Entry::new(SERVICE, &chunk_key(key, i))?.get_password() {
+            Ok(v) => val.push_str(&v),
+            Err(keyring::Error::NoEntry) if i == 0 => return Ok(None),
+            Err(keyring::Error::NoEntry) => break,
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(Some(val))
 }
 
 pub fn secret_del(key: &str) -> Result<()> {
-    match keyring::Entry::new(SERVICE, key)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(e) => Err(e.into()),
+    delete_chunks(key, 0)
+}
+
+/// Deletes chunk `from` and every chunk after it.
+fn delete_chunks(key: &str, from: usize) -> Result<()> {
+    for i in from.. {
+        match keyring::Entry::new(SERVICE, &chunk_key(key, i))?.delete_credential() {
+            Ok(()) => {}
+            Err(keyring::Error::NoEntry) => break,
+            Err(e) => return Err(e.into()),
+        }
     }
+    Ok(())
 }
 
 /// Tokens for one account. Serialize them into the keychain; the engine persists refreshed ones.
@@ -160,28 +201,49 @@ async fn accept_code(listener: &tokio::net::TcpListener, state: &str) -> Result<
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.into_owned())
         };
-        if let Some(err) = get("error") {
-            let _ = reply(&mut sock, 400).await;
-            bail!("Microsoft sign-in failed: {err}");
-        }
-        let Some(code) = get("code") else {
-            let _ = reply(&mut sock, 404).await;
+        if get("error").is_none() && get("code").is_none() {
+            let _ = reply(&mut sock, 404, None).await;
             continue;
-        };
+        }
         if get("state").as_deref() != Some(state) {
-            let _ = reply(&mut sock, 400).await;
+            let _ = reply(&mut sock, 400, None).await;
             bail!("Microsoft sign-in state mismatch");
         }
-        let _ = reply(&mut sock, 200).await;
+        if let Some(err) = get("error") {
+            let detail = get("error_description").unwrap_or_default();
+            let _ = reply(&mut sock, 400, Some(detail.as_str())).await;
+            let detail = detail.trim();
+            if detail.is_empty() {
+                bail!("Microsoft sign-in failed: {err}");
+            }
+            bail!("Microsoft sign-in failed: {err} — {detail}");
+        }
+        let Some(code) = get("code") else {
+            continue;
+        };
+        let _ = reply(&mut sock, 200, None).await;
         return Ok(code);
     }
 }
 
-async fn reply(sock: &mut tokio::net::TcpStream, status: u16) -> std::io::Result<()> {
+async fn reply(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    detail: Option<&str>,
+) -> std::io::Result<()> {
     let body = if status == 200 {
         "<!doctype html><title>Kite</title><p>You can close this tab and return to Kite."
+            .to_string()
     } else {
-        "<!doctype html><title>Kite</title><p>Sign-in failed. You can close this tab."
+        let mut page =
+            "<!doctype html><title>Kite</title><p>Sign-in failed. You can close this tab."
+                .to_string();
+        if let Some(detail) = detail.filter(|d| !d.trim().is_empty()) {
+            page.push_str("<p><small>");
+            page.push_str(&escape_html(detail.trim()));
+            page.push_str("</small>");
+        }
+        page
     };
     let head = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -189,6 +251,13 @@ async fn reply(sock: &mut tokio::net::TcpStream, status: u16) -> std::io::Result
     );
     sock.write_all(head.as_bytes()).await?;
     sock.write_all(body.as_bytes()).await
+}
+
+/// `error_description` is free text destined for a browser page.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[derive(Deserialize)]
@@ -202,7 +271,7 @@ async fn read_tokens(res: reqwest::Response, prior_refresh: Option<&str>) -> Res
     let status = res.status();
     let text = res.text().await?;
     if !status.is_success() {
-        bail!("token request failed ({status}): {text}");
+        bail!("{}", oauth_error(status, &text));
     }
     let body: TokenBody = serde_json::from_str(&text).context("token response")?;
     let refresh = body
@@ -216,6 +285,56 @@ async fn read_tokens(res: reqwest::Response, prior_refresh: Option<&str>) -> Res
         refresh,
         expires_at,
     })
+}
+
+/// Turns a token-endpoint error body into a sentence a human can act on. Most failures here are
+/// registration problems (wrong audience, confidential client, missing loopback redirect), so
+/// known codes carry a hint instead of a raw JSON dump.
+fn oauth_error(status: reqwest::StatusCode, text: &str) -> String {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return format!("token request failed ({status}): {}", clip(text));
+    };
+    let code = body["error"].as_str().unwrap_or_default();
+    // AADSTS descriptions are multi-line; the first line carries the message.
+    let description = body["error_description"]
+        .as_str()
+        .and_then(|d| d.lines().next())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let hint = match code {
+        "invalid_client" => {
+            "Microsoft rejected Kite's app registration. If KITE_MS_CLIENT_ID is set, it must be \
+             the Application ID of a registration that allows public client flows."
+        }
+        "unauthorized_client" => {
+            "The app registration does not allow this sign-in. In the Entra admin center set its \
+             supported account types to include personal Microsoft accounts, add \
+             http://localhost under Mobile and desktop redirect URIs, and enable public client \
+             flows."
+        }
+        "invalid_grant" => "The consent or session is no longer valid; connect the account again.",
+        "invalid_scope" => "A requested scope is not available for this account type.",
+        "temporarily_unavailable" | "service_unavailable" => {
+            "Microsoft sign-in is temporarily unavailable; try again shortly."
+        }
+        _ => "",
+    };
+    let mut message = format!("Microsoft sign-in failed ({status})");
+    if !code.is_empty() {
+        message.push_str(&format!(": {code}"));
+    }
+    if !description.is_empty() {
+        message.push_str(&format!(" — {description}"));
+    }
+    if !hint.is_empty() {
+        message.push_str(&format!(" {hint}"));
+    }
+    message
+}
+
+fn clip(text: &str) -> String {
+    text.trim().chars().take(400).collect()
 }
 
 fn random_token(bytes: usize) -> Result<String> {

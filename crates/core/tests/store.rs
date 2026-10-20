@@ -234,7 +234,7 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     let t = &s.threads(&view(Mailbox::Inbox), 0, 50).unwrap()[0];
     assert!(t.unread && t.starred);
 
-    // A Graph thread hint wins over the header union.
+    // A provider hint cannot group unrelated Proton messages.
     let mut g1 = msg("g1", "carol@c.com", "Odd one", D0 + 10);
     g1.thread_hint = Some("conv-9".into());
     let mut g2 = msg("g2", "dave@d.com", "Totally unrelated", D0 + 20);
@@ -243,20 +243,10 @@ fn deltas_thread_together_and_refresh_the_thread_row() {
     let inbox = s.threads(&view(Mailbox::Inbox), 0, 50).unwrap();
     assert_eq!(
         inbox.len(),
-        2,
-        "hint groups the two, the rest stay separate"
+        3,
+        "a shared hint does not establish a reply chain"
     );
-    let hinted = inbox
-        .iter()
-        .find(|t| t.participants == "carol, dave")
-        .expect("hinted thread");
-    let subjects: Vec<String> = s
-        .thread(hinted.id)
-        .unwrap()
-        .into_iter()
-        .map(|m| m.subject)
-        .collect();
-    assert_eq!(subjects, vec!["Odd one", "Totally unrelated"]);
+    assert!(inbox.iter().filter(|t| t.id != tid).all(|t| t.count == 1));
 
     // Deleting messages shrinks the thread, then removes it.
     s.apply_deltas(
@@ -657,22 +647,29 @@ fn starter_tags_are_seeded_in_order() {
             "Notification",
             "Cold Email",
             "Team",
-            "Urgent"
+            "Urgent",
+            "Private"
         ]
     );
     assert_eq!(
         tags.iter().map(|t| t.position).collect::<Vec<_>>(),
-        (0..8).collect::<Vec<_>>()
+        (0..9).collect::<Vec<_>>()
     );
-    let colors: std::collections::HashSet<&str> =
-        tags.iter().map(|t| t.color.as_str()).collect();
-    assert_eq!(colors.len(), tags.len(), "each starter tag has its own colour");
+    let colors: std::collections::HashSet<&str> = tags.iter().map(|t| t.color.as_str()).collect();
+    assert_eq!(
+        colors.len(),
+        tags.len(),
+        "each starter tag has its own colour"
+    );
     assert!(tags.iter().all(|t| {
         let b = t.color.as_bytes();
         b.len() == 7 && b[0] == b'#' && b[1..].iter().all(|c| c.is_ascii_hexdigit())
     }));
     assert!(
-        s.splits().unwrap().iter().all(|sp| !sp.query.contains("label:")),
+        s.splits()
+            .unwrap()
+            .iter()
+            .all(|sp| !sp.query.contains("label:")),
         "starter tags are not tabs"
     );
 }
@@ -704,7 +701,8 @@ fn a_database_from_before_tags_migrates_and_seeds_tags() {
                 "Notification",
                 "Cold Email",
                 "Team",
-                "Urgent"
+                "Urgent",
+                "Private"
             ]
         );
         let rows = s.threads(&view(Mailbox::Inbox), 0, 50)?;
@@ -725,24 +723,40 @@ fn label_and_unlabel_update_summary_labels_in_position_order() {
     let tid = thread_id(&s, "Hi");
 
     // Apply Urgent (position 7) before Newsletter (position 0); the cache is by tag position.
-    s.act(&[tid], &Action::Label {
-        tag: "Urgent".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Urgent".into(),
+        },
+    )
     .unwrap();
-    s.act(&[tid], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Newsletter", "Urgent"]);
 
-    s.act(&[tid], &Action::Unlabel {
-        tag: "newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Unlabel {
+            tag: "newsletter".into(),
+        },
+    )
     .unwrap();
-    assert_eq!(labels_of(&s, tid), vec!["Urgent"], "names match case-insensitively");
-    s.act(&[tid], &Action::Unlabel {
-        tag: "Urgent".into(),
-    })
+    assert_eq!(
+        labels_of(&s, tid),
+        vec!["Urgent"],
+        "names match case-insensitively"
+    );
+    s.act(
+        &[tid],
+        &Action::Unlabel {
+            tag: "Urgent".into(),
+        },
+    )
     .unwrap();
     assert!(labels_of(&s, tid).is_empty());
 }
@@ -758,17 +772,23 @@ fn undo_restores_prior_tag_membership_and_ignores_no_ops() {
     let urgent = tag_id(&s, "Urgent");
 
     let label = s
-        .act(&[tid], &Action::Label {
-            tag: "Newsletter".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Label {
+                tag: "Newsletter".into(),
+            },
+        )
         .unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
 
     // Labelling an already-labelled thread is a no-op; undoing it must keep the old membership.
     let again = s
-        .act(&[tid], &Action::Label {
-            tag: "newsletter".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Label {
+                tag: "newsletter".into(),
+            },
+        )
         .unwrap();
     s.undo(again).unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
@@ -776,22 +796,31 @@ fn undo_restores_prior_tag_membership_and_ignores_no_ops() {
     assert!(labels_of(&s, tid).is_empty());
 
     let urgent_token = s
-        .act(&[tid], &Action::Label {
-            tag: "Urgent".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
         .unwrap();
     s.undo(urgent_token).unwrap();
     assert!(labels_of(&s, tid).is_empty());
 
     // Unlabel has the same no-op rule, in the other direction.
-    s.act(&[tid], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
     let noop_unlabel = s
-        .act(&[tid], &Action::Unlabel {
-            tag: "Urgent".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Unlabel {
+                tag: "Urgent".into(),
+            },
+        )
         .unwrap();
     s.undo(noop_unlabel).unwrap();
     assert_eq!(
@@ -800,9 +829,12 @@ fn undo_restores_prior_tag_membership_and_ignores_no_ops() {
         "undo must not add a tag the action never removed"
     );
     let unlabel = s
-        .act(&[tid], &Action::Unlabel {
-            tag: "Newsletter".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Unlabel {
+                tag: "Newsletter".into(),
+            },
+        )
         .unwrap();
     s.undo(unlabel).unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Newsletter"]);
@@ -828,24 +860,14 @@ fn an_unknown_tag_is_an_error_and_changes_nothing() {
     let one = thread_id(&s, "One");
     let two = thread_id(&s, "Two");
     assert!(
-        s.act(
-            &[one, two],
-            &Action::Label {
-                tag: "Nope".into()
-            }
-        )
-        .is_err()
+        s.act(&[one, two], &Action::Label { tag: "Nope".into() })
+            .is_err()
     );
     assert!(labels_of(&s, one).is_empty());
     assert!(labels_of(&s, two).is_empty());
     assert!(
-        s.act(
-            &[one],
-            &Action::Unlabel {
-                tag: "Nope".into()
-            }
-        )
-        .is_err()
+        s.act(&[one], &Action::Unlabel { tag: "Nope".into() })
+            .is_err()
     );
 }
 
@@ -871,8 +893,7 @@ fn label_search_supports_case_comma_or_negation_and_multiword_names() {
         (two, "Urgent"),
         (three, "To Reply"),
     ] {
-        s.act(&[tid], &Action::Label { tag: tag.into() })
-            .unwrap();
+        s.act(&[tid], &Action::Label { tag: tag.into() }).unwrap();
     }
 
     let subjects = |q: &str| {
@@ -885,7 +906,11 @@ fn label_search_supports_case_comma_or_negation_and_multiword_names() {
         v.sort();
         v
     };
-    assert_eq!(subjects("label:newsletter"), vec!["One"], "case-insensitive");
+    assert_eq!(
+        subjects("label:newsletter"),
+        vec!["One"],
+        "case-insensitive"
+    );
     assert_eq!(
         subjects("label:Newsletter,Urgent"),
         vec!["One", "Two"],
@@ -911,13 +936,19 @@ fn renaming_a_tag_updates_summaries_and_split_queries() {
     s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
         .unwrap();
     let tid = thread_id(&s, "Hi");
-    s.act(&[tid], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
-    s.act(&[tid], &Action::Label {
-        tag: "To Reply".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "To Reply".into(),
+        },
+    )
     .unwrap();
     s.set_splits(vec![
         Split {
@@ -949,7 +980,11 @@ fn renaming_a_tag_updates_summaries_and_split_queries() {
     }
     s.set_tags(tags).unwrap();
 
-    assert_eq!(tag_id(&s, "Bulletin"), newsletter, "identity survives a rename");
+    assert_eq!(
+        tag_id(&s, "Bulletin"),
+        newsletter,
+        "identity survives a rename"
+    );
     assert_eq!(labels_of(&s, tid), vec!["Bulletin", "Reply Later"]);
     let splits = s.splits().unwrap();
     assert_eq!(splits[0].query, "label:\"Reply Later\" from:a@a.com");
@@ -975,13 +1010,19 @@ fn reordering_tags_reorders_the_summary_labels() {
     s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
         .unwrap();
     let tid = thread_id(&s, "Hi");
-    s.act(&[tid], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
-    s.act(&[tid], &Action::Label {
-        tag: "Urgent".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Urgent".into(),
+        },
+    )
     .unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Newsletter", "Urgent"]);
 
@@ -1002,13 +1043,19 @@ fn deleting_a_tag_removes_it_from_threads() {
     s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
         .unwrap();
     let tid = thread_id(&s, "Hi");
-    s.act(&[tid], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
-    s.act(&[tid], &Action::Label {
-        tag: "Urgent".into(),
-    })
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Urgent".into(),
+        },
+    )
     .unwrap();
 
     let tags: Vec<Tag> = s
@@ -1072,13 +1119,19 @@ fn tags_survive_a_sync_update_and_a_thread_merge() {
     .unwrap();
     let alpha = thread_id(&s, "Alpha");
     let beta = thread_id(&s, "Beta");
-    s.act(&[alpha], &Action::Label {
-        tag: "Newsletter".into(),
-    })
+    s.act(
+        &[alpha],
+        &Action::Label {
+            tag: "Newsletter".into(),
+        },
+    )
     .unwrap();
-    s.act(&[beta], &Action::Label {
-        tag: "Urgent".into(),
-    })
+    s.act(
+        &[beta],
+        &Action::Label {
+            tag: "Urgent".into(),
+        },
+    )
     .unwrap();
 
     // A later sync overwrites the message and re-aggregates its thread; membership is untouched.
@@ -1112,16 +1165,22 @@ fn removing_an_account_cascades_tag_memberships_but_keeps_tags() {
         let a = s.add_account(Provider::Proton, "me@x.com", "Me")?;
         s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])?;
         let tid = thread_id(&s, "Hi");
-        s.act(&[tid], &Action::Label {
-            tag: "Newsletter".into(),
-        })?;
+        s.act(
+            &[tid],
+            &Action::Label {
+                tag: "Newsletter".into(),
+            },
+        )?;
         s.remove_account(a.id)?;
         let conn = rusqlite::Connection::open(&path)?;
         let memberships: i64 =
             conn.query_row("SELECT COUNT(*) FROM thread_tags", [], |r| r.get(0))?;
         let tags: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
         assert_eq!(memberships, 0);
-        assert_eq!(tags, 8, "tags are global, not account-owned");
+        assert_eq!(
+            tags, 9,
+            "tags, including Private, are global, not account-owned"
+        );
         Ok::<(), anyhow::Error>(())
     })();
     cleanup(&path);
@@ -1137,9 +1196,12 @@ fn deleting_a_tag_then_creating_one_never_reuses_the_id_for_undo() {
     let tid = thread_id(&s, "Hi");
     let urgent = tag_id(&s, "Urgent");
     let token = s
-        .act(&[tid], &Action::Label {
-            tag: "Urgent".into(),
-        })
+        .act(
+            &[tid],
+            &Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
         .unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Urgent"]);
 
@@ -1162,8 +1224,7 @@ fn deleting_a_tag_then_creating_one_never_reuses_the_id_for_undo() {
     s.set_tags(tags).unwrap();
     let foo = tag_id(&s, "Foo");
     assert_ne!(foo, urgent, "a deleted tag id must not be reused");
-    s.act(&[tid], &Action::Label { tag: "Foo".into() })
-        .unwrap();
+    s.act(&[tid], &Action::Label { tag: "Foo".into() }).unwrap();
     assert_eq!(labels_of(&s, tid), vec!["Foo"]);
 
     s.undo(token).unwrap();
@@ -1189,9 +1250,12 @@ fn undoing_a_label_after_a_thread_merge_removes_it_from_the_survivor() {
     let alpha = thread_id(&s, "Alpha");
     let beta = thread_id(&s, "Beta");
     let token = s
-        .act(&[beta], &Action::Label {
-            tag: "Urgent".into(),
-        })
+        .act(
+            &[beta],
+            &Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
         .unwrap();
     assert_eq!(labels_of(&s, beta), vec!["Urgent"]);
 
@@ -1218,18 +1282,29 @@ fn undoing_an_unlabel_after_the_thread_was_deleted_does_not_fail() {
     s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
         .unwrap();
     let tid = thread_id(&s, "Hi");
-    s.act(&[tid], &Action::Label { tag: "Urgent".into() })
-        .unwrap();
-    let token = s
-        .act(&[tid], &Action::Unlabel {
+    s.act(
+        &[tid],
+        &Action::Label {
             tag: "Urgent".into(),
-        })
+        },
+    )
+    .unwrap();
+    let token = s
+        .act(
+            &[tid],
+            &Action::Unlabel {
+                tag: "Urgent".into(),
+            },
+        )
         .unwrap();
 
     // The remote deletes the message, so the empty thread (and its memberships) disappear.
-    s.apply_deltas(a.id, &[Delta::Delete {
-        remote_id: "1".into(),
-    }])
+    s.apply_deltas(
+        a.id,
+        &[Delta::Delete {
+            remote_id: "1".into(),
+        }],
+    )
     .unwrap();
     assert!(s.threads(&view(Mailbox::All), 0, 50).unwrap().is_empty());
 
@@ -2080,4 +2155,627 @@ fn budget_queries_still_return_rows_in_debug() {
         .unwrap()
         .is_empty()
     );
+}
+
+// ------------------------------------------------------------------- drafts
+
+fn draft_to(account: Id, subject: &str, body: &str) -> Draft {
+    Draft {
+        account_id: account,
+        to: vec![Addr {
+            name: "Bob".into(),
+            email: "bob@example.com".into(),
+        }],
+        cc: vec![Addr {
+            name: "Carol".into(),
+            email: "carol@example.com".into(),
+        }],
+        subject: subject.into(),
+        body: body.into(),
+        ..Draft::default()
+    }
+}
+
+#[test]
+fn a_saved_draft_is_a_drafts_thread_that_replaces_itself() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+
+    let (id, replaces) = s
+        .save_draft(&draft_to(a.id, "Lunch plan", "noon?"), "d1@x")
+        .unwrap();
+    assert!(replaces.is_none(), "a new draft replaces nothing");
+
+    for view_of in [view(Mailbox::Drafts), account_drafts(a.id)] {
+        let drafts = s.threads(&view_of, 0, 50).unwrap();
+        assert_eq!(drafts.len(), 1, "one draft row: {drafts:?}");
+        let row = &drafts[0];
+        assert_eq!(row.account_id, a.id);
+        assert_eq!(row.subject, "Lunch plan");
+        assert_eq!(row.participants, "Bob, Carol", "reads as its recipients");
+        assert!(row.snippet.contains("noon?"), "{}", row.snippet);
+        assert!(!row.unread && !row.important, "a draft is not new mail");
+        assert_eq!(
+            s.draft(row.id).unwrap().expect("draft").id,
+            Some(id),
+            "the thread maps back to its draft"
+        );
+    }
+
+    // Editing again replaces the content instead of piling up threads.
+    let mut edit = draft_to(a.id, "Lunch plan v2", "one o'clock?");
+    edit.id = Some(id);
+    let (again, replaced) = s.save_draft(&edit, "d1@x").unwrap();
+    assert_eq!(again, id);
+    assert!(
+        replaced.is_none(),
+        "nothing was on the provider before the first save"
+    );
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 50).unwrap();
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].subject, "Lunch plan v2");
+    assert_eq!(drafts[0].count, 1, "content is replaced, not appended");
+    let saved = s.draft(drafts[0].id).unwrap().expect("draft");
+    assert_eq!(saved.id, Some(id));
+    assert_eq!(saved.body, "one o'clock?");
+    assert_eq!(saved.to[0].email, "bob@example.com");
+    assert_eq!(saved.cc[0].email, "carol@example.com");
+}
+
+/// The account-scoped Drafts view, next to the combined one the sidebar also offers.
+fn account_drafts(account: Id) -> View {
+    View {
+        account_id: Some(account),
+        mailbox: Mailbox::Drafts,
+        split: None,
+        query: None,
+        folder: None,
+    }
+}
+
+#[test]
+fn the_providers_own_copy_of_a_draft_is_not_a_second_thread() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let (id, _) = s
+        .save_draft(&draft_to(a.id, "Lunch plan", "noon?"), "kite1@x")
+        .unwrap();
+
+    // What Bridge's Drafts mailbox (or Graph's drafts folder) hands back after the APPEND.
+    let mut copy = in_mailbox(
+        msg("Drafts/3/7", "me@x.com", "Lunch plan", now()),
+        Mailbox::Drafts,
+    );
+    copy.folder = "Drafts".into();
+    copy.message_id = Some("<kite1@x>".into());
+    s.apply_deltas(a.id, &[up(copy)]).unwrap();
+
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 50).unwrap();
+    assert_eq!(drafts.len(), 1, "the provider copy dedupes on Message-ID");
+    assert_eq!(s.draft(drafts[0].id).unwrap().expect("draft").id, Some(id));
+
+    // A draft written in another client is a separate conversation and does show up.
+    let mut other = in_mailbox(
+        msg("Drafts/3/8", "me@x.com", "Written elsewhere", now()),
+        Mailbox::Drafts,
+    );
+    other.folder = "Drafts".into();
+    s.apply_deltas(a.id, &[up(other)]).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 50).unwrap().len(), 2);
+}
+
+#[test]
+fn a_completed_save_records_the_provider_id_and_discard_deletes_both() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let (id, _) = s
+        .save_draft(&draft_to(a.id, "Lunch plan", "noon?"), "kite1@x")
+        .unwrap();
+    let thread = s.threads(&view(Mailbox::Drafts), 0, 5).unwrap()[0].id;
+
+    let op = Op::SaveDraft {
+        mime: b"Subject: Lunch plan\r\n\r\nnoon?".to_vec(),
+        replaces: None,
+    };
+    s.draft_op(a.id, &op, Some(id)).unwrap();
+    let queued = s.pending_ops(a.id, DUE, 10).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].1, op);
+    s.op_done(queued[0].0, Some("Drafts/3/1".to_string()))
+        .unwrap();
+
+    let remote = s
+        .discard_draft(id)
+        .unwrap()
+        .expect("a remote copy to delete");
+    assert_eq!(remote, (a.id, "Drafts/3/1".to_string()));
+    assert!(
+        s.threads(&view(Mailbox::Drafts), 0, 5).unwrap().is_empty(),
+        "the Drafts row goes with it"
+    );
+    assert!(s.draft(thread).unwrap().is_none());
+    assert!(
+        s.discard_draft(id).unwrap().is_none(),
+        "discard is idempotent"
+    );
+}
+
+#[test]
+fn sending_a_saved_draft_hides_it_and_cancelling_puts_it_back() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let (id, _) = s
+        .save_draft(&draft_to(a.id, "Lunch plan", "noon?"), "kite1@x")
+        .unwrap();
+    let thread = s.threads(&view(Mailbox::Drafts), 0, 5).unwrap()[0].id;
+
+    let mut sending = draft_to(a.id, "Lunch plan", "noon?");
+    sending.id = Some(id);
+    let outbox = s.outbox_add(&sending, DUE).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Drafts), 0, 5).unwrap().is_empty(),
+        "sending takes it out of Drafts at once"
+    );
+    assert!(s.draft(thread).unwrap().is_none());
+
+    let back = s.outbox_cancel(outbox).unwrap().expect("draft comes back");
+    assert_eq!(back.id, Some(id));
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 5).unwrap();
+    assert_eq!(drafts.len(), 1, "cancel restores the Drafts row");
+    assert_eq!(
+        s.draft(drafts[0].id).unwrap().expect("draft").id,
+        Some(id),
+        "and the draft keeps its id"
+    );
+
+    // A successful send drops the row for good.
+    let outbox = s.outbox_add(&sending, DUE).unwrap();
+    s.outbox_sent(outbox).unwrap();
+    assert!(
+        s.draft_sent(id).unwrap().is_none(),
+        "nothing reached the provider"
+    );
+    assert!(s.threads(&view(Mailbox::Drafts), 0, 5).unwrap().is_empty());
+}
+
+#[test]
+fn a_failed_send_waits_in_the_outbox_before_retrying() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let outbox = s
+        .outbox_add(&draft_to(a.id, "Held", "body"), now())
+        .unwrap();
+    assert_eq!(s.outbox_due(now()).unwrap().len(), 1);
+
+    assert!(!s.outbox_failed(outbox, now(), false, None).unwrap().0);
+    assert!(
+        s.outbox_due(now()).unwrap().is_empty(),
+        "a failure backs off instead of retrying every tick"
+    );
+    assert_eq!(s.outbox_due(now() + 60_000).unwrap()[0].0, outbox);
+    assert_eq!(
+        s.outbox_cancel(outbox).unwrap().map(|d| d.subject),
+        Some("Held".to_string()),
+        "the mail is never lost"
+    );
+}
+
+#[test]
+fn removing_an_account_removes_its_drafts() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let b = s
+        .add_account(Provider::Microsoft, "other@x.com", "Other")
+        .unwrap();
+    let (id, _) = s
+        .save_draft(&draft_to(a.id, "Mine", "mine"), "d1@x")
+        .unwrap();
+    let mut theirs = draft_to(b.id, "Theirs", "theirs");
+    theirs.id = None;
+    s.save_draft(&theirs, "d2@x").unwrap();
+
+    s.remove_account(a.id).unwrap();
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 50).unwrap();
+    assert_eq!(drafts.len(), 1, "only the other account's draft is left");
+    assert_eq!(drafts[0].account_id, b.id);
+    assert!(s.draft(id).unwrap().is_none());
+}
+
+#[test]
+fn a_draft_written_in_another_client_becomes_editable_and_replaced() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let mut theirs = in_mailbox(
+        msg("Drafts/3/9", "me@x.com", "Started elsewhere", D0),
+        Mailbox::Drafts,
+    );
+    theirs.folder = "Drafts".into();
+    theirs.message_id = Some("<theirs@x>".into());
+    theirs.text = "half a thought".into();
+    s.apply_deltas(a.id, &[up(theirs)]).unwrap();
+
+    let thread = s.threads(&view(Mailbox::Drafts), 0, 5).unwrap()[0].id;
+    let adopted = s.draft(thread).unwrap().expect("an editable draft");
+    assert_eq!(adopted.subject, "Started elsewhere");
+    assert_eq!(adopted.body, "half a thought");
+    assert_eq!(adopted.account_id, a.id);
+    assert!(adopted.id.is_some());
+
+    // Editing it replaces the provider's copy instead of adding a second draft.
+    let mut edit = adopted.clone();
+    edit.body = "the whole thought".into();
+    let (id, replaces) = s.save_draft(&edit, "theirs@x").unwrap();
+    assert_eq!(replaces.as_deref(), Some("Drafts/3/9"));
+    assert_eq!(adopted.id, Some(id), "the adopted draft keeps its id");
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 5).unwrap();
+    assert_eq!(drafts.len(), 1);
+    assert_eq!(drafts[0].subject, "Started elsewhere");
+    assert_eq!(
+        s.draft(drafts[0].id).unwrap().unwrap().body,
+        "the whole thought"
+    );
+}
+
+#[test]
+fn sent_and_drafts_views_include_messages_in_a_mixed_mailbox_conversation() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let received = msg("received", "alice@x.com", "A conversation", D0);
+    let sent = in_mailbox(
+        replying_to(
+            msg("sent", "me@x.com", "Re: A conversation", D0 + 1),
+            "received",
+        ),
+        Mailbox::Sent,
+    );
+    let draft = in_mailbox(
+        replying_to(
+            msg("unfinished", "me@x.com", "Re: A conversation", D0 + 2),
+            "received",
+        ),
+        Mailbox::Drafts,
+    );
+    s.apply_deltas(account.id, &[up(received), up(sent), up(draft)])
+        .unwrap();
+    let inbox = s.threads(&view(Mailbox::Inbox), 0, 10).unwrap();
+    let sent = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 10).unwrap();
+    assert_eq!(
+        sent.len(),
+        1,
+        "a reply is visible in Sent even when another message determines the thread mailbox"
+    );
+    assert_eq!(drafts.len(), 1);
+    assert_ne!(
+        sent[0].id, drafts[0].id,
+        "a draft can be discarded without trashing its sent conversation"
+    );
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(sent[0].id, inbox[0].id);
+    let draft = s.draft(drafts[0].id).unwrap().unwrap();
+    s.discard_draft(draft.id.unwrap()).unwrap();
+    assert!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().is_empty());
+    assert_eq!(s.threads(&view(Mailbox::Sent), 0, 10).unwrap().len(), 1);
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn old_grouped_provider_drafts_are_separated_without_losing_sent_mail() {
+    let path = temp_db("grouped-drafts");
+    let s = Store::open(&path).unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let sent = in_mailbox(
+        msg("sent", "me@x.com", "Repeated subject", D0),
+        Mailbox::Sent,
+    );
+    let draft = in_mailbox(
+        msg("draft1", "me@x.com", "Repeated subject", D0 + 1),
+        Mailbox::Drafts,
+    );
+    let second = in_mailbox(
+        msg("draft2", "me@x.com", "Repeated subject", D0 + 2),
+        Mailbox::Drafts,
+    );
+    s.apply_deltas(account.id, &[up(sent), up(draft), up(second)])
+        .unwrap();
+    drop(s);
+    // Reproduce the pre-fix database: all copies shared one thread.
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("UPDATE messages SET thread_id=(SELECT thread_id FROM messages WHERE remote_id='sent');
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages); PRAGMA user_version=5;").unwrap();
+    drop(connection);
+    let s = Store::open(&path).unwrap();
+    let drafts = s.threads(&view(Mailbox::Drafts), 0, 10).unwrap();
+    assert_eq!(
+        drafts.len(),
+        2,
+        "each dead provider draft has its own deletable row"
+    );
+    let token = s.act(&[drafts[0].id], &Action::Trash).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().len(), 1);
+    assert_eq!(s.threads(&view(Mailbox::Sent), 0, 10).unwrap().len(), 1);
+    s.undo(token).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Drafts), 0, 10).unwrap().len(), 2);
+    drop(s);
+    cleanup(&path);
+}
+
+#[test]
+fn repeated_subjects_stay_separate_and_only_header_links_join_in_date_order() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let first = in_mailbox(msg("first", "me@x.com", "test", D0), Mailbox::Sent);
+    let second = in_mailbox(msg("second", "me@x.com", "test", D0 + 10), Mailbox::Sent);
+    s.apply_deltas(account.id, &[up(first), up(second)])
+        .unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        2,
+        "independent sends with identical participants and subject stay separate"
+    );
+    assert_eq!(
+        rows.iter().map(|r| (r.date, r.count)).collect::<Vec<_>>(),
+        vec![(D0 + 10, 1), (D0, 1)]
+    );
+    let original = rows[1].id;
+    let mut reply = in_mailbox(msg("reply", "me@x.com", "Re: test", D0 + 20), Mailbox::Sent);
+    reply.in_reply_to = Some("<first@x>".into());
+    s.apply_deltas(account.id, &[up(reply)]).unwrap();
+    let mut forward = in_mailbox(
+        msg("forward", "me@x.com", "Different subject", D0 + 30),
+        Mailbox::Sent,
+    );
+    forward.references = vec!["<first@x>".into()];
+    s.apply_deltas(account.id, &[up(forward)]).unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        (rows[0].id, rows[0].date, rows[0].count),
+        (original, D0 + 30, 3)
+    );
+    assert_eq!(
+        s.thread(original)
+            .unwrap()
+            .iter()
+            .map(|m| m.subject.as_str())
+            .collect::<Vec<_>>(),
+        vec!["test", "Re: test", "Different subject"]
+    );
+}
+
+#[test]
+fn late_parents_and_headers_added_on_resync_unite_their_replies() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let child = replying_to(msg("child", "a@x.com", "reply", D0 + 1), "parent");
+    let parent = msg("parent", "b@x.com", "root", D0);
+    s.apply_deltas(account.id, &[up(child), up(parent)])
+        .unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap()[0].count, 2);
+    let unlinked = msg("later", "c@x.com", "unlinked", D0 + 2);
+    s.apply_deltas(account.id, &[up(unlinked.clone())]).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Inbox), 0, 10).unwrap().len(), 2);
+    let mut linked = unlinked;
+    linked.references = vec!["<parent@x>".into()];
+    s.apply_deltas(account.id, &[up(linked)]).unwrap();
+    let rows = s.threads(&view(Mailbox::Inbox), 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].count, 3);
+}
+
+#[test]
+fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
+    let path = temp_db("header-threading");
+    let s = Store::open(&path).unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    for (i, name) in ["first", "second", "third", "fourth"].iter().enumerate() {
+        let mut message = in_mailbox(
+            body(
+                msg(name, "me@x.com", "test", D0 + i as i64),
+                "retained body",
+            ),
+            Mailbox::Sent,
+        );
+        message.thread_hint = Some("loose-proton-conversation".into());
+        s.apply_deltas(account.id, &[up(with_attachment(message, "kept.pdf"))])
+            .unwrap();
+    }
+    let reply = replying_to(
+        in_mailbox(msg("reply", "me@x.com", "Re: test", D0 + 10), Mailbox::Sent),
+        "first",
+    );
+    let mut reference = in_mailbox(
+        msg("reference", "me@x.com", "Fwd: test", D0 + 11),
+        Mailbox::Sent,
+    );
+    reference.references = vec!["<first@x>".into()];
+    s.apply_deltas(account.id, &[up(reply), up(reference)])
+        .unwrap();
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("UPDATE messages SET thread_id=(SELECT thread_id FROM messages WHERE remote_id='first');
+        DELETE FROM threads WHERE id NOT IN (SELECT thread_id FROM messages);
+        DELETE FROM thread_keys;
+        INSERT INTO thread_keys SELECT account_id,'h:loose-proton-conversation',thread_id FROM messages LIMIT 1;").unwrap();
+    drop(connection);
+    // Keep schema v7 while setting up the old merged conversation's local actions,
+    // then mark the completed fixture v6 before the migration under test.
+    let s = Store::open(&path).unwrap();
+    let thread = s.threads(&view(Mailbox::Sent), 0, 10).unwrap()[0].id;
+    let label = s
+        .act(
+            &[thread],
+            &Action::Label {
+                tag: "Urgent".into(),
+            },
+        )
+        .unwrap();
+    let star = s.act(&[thread], &Action::Star).unwrap();
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    connection.execute_batch("PRAGMA user_version=6;").unwrap();
+    let message_ids: Vec<Id> = connection
+        .prepare("SELECT id FROM messages ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    drop(connection);
+    let s = Store::open(&path).unwrap();
+    let rows = s.threads(&view(Mailbox::Sent), 0, 10).unwrap();
+    assert_eq!(
+        rows.len(),
+        4,
+        "four independent sends, with genuine replies retained"
+    );
+    assert_eq!(
+        rows.iter().map(|r| r.date).collect::<Vec<_>>(),
+        vec![D0 + 11, D0 + 3, D0 + 2, D0 + 1]
+    );
+    assert_eq!(rows[0].count, 3);
+    assert!(rows.iter().all(|r| r.starred && r.labels == vec!["Urgent"]));
+    let mut retained: Vec<Id> = rows
+        .iter()
+        .flat_map(|r| s.thread(r.id).unwrap())
+        .map(|m| m.id)
+        .collect();
+    retained.sort_unstable();
+    assert_eq!(retained, message_ids);
+    assert_eq!(
+        s.threads(&search(Mailbox::Sent, "retained"), 0, 10)
+            .unwrap()
+            .len(),
+        4
+    );
+    assert_eq!(
+        rows.iter()
+            .flat_map(|r| s.thread(r.id).unwrap())
+            .map(|m| m.attachments.len())
+            .sum::<usize>(),
+        4
+    );
+    s.undo(star).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .all(|r| !r.starred)
+    );
+    s.undo(label).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .all(|r| r.labels.is_empty())
+    );
+    let ids: Vec<_> = rows.iter().map(|r| r.id).collect();
+    drop(s);
+    let s = Store::open(&path).unwrap();
+    assert_eq!(
+        s.threads(&view(Mailbox::Sent), 0, 10)
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    drop(s);
+    let connection = rusqlite::Connection::open(&path).unwrap();
+    assert_eq!(
+        connection
+            .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        8
+    );
+    assert!(
+        !connection
+            .prepare("PRAGMA foreign_key_check")
+            .unwrap()
+            .exists([])
+            .unwrap()
+    );
+    drop(connection);
+    cleanup(&path);
+}
+
+#[test]
+fn outbox_retries_back_off_in_minutes_and_stop_after_eight_attempts() {
+    let s = Store::memory().unwrap();
+    let account = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let id = s
+        .outbox_add(&draft_to(account.id, "Recoverable", "keep this"), D0)
+        .unwrap();
+    let mut at = D0;
+    for attempt in 0..7 {
+        assert!(!s.outbox_failed(id, at, false, None).unwrap().0);
+        let delay = 5_000 * (1i64 << attempt);
+        assert!(s.outbox_due(at + delay - 1).unwrap().is_empty());
+        assert_eq!(s.outbox_due(at + delay).unwrap()[0].0, id);
+        at += delay;
+    }
+    assert!(s.outbox_failed(id, at, false, None).unwrap().0);
+    assert_eq!(s.outbox_cancel(id).unwrap().unwrap().body, "keep this");
+    assert!(s.outbox_due(i64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn the_private_tag_cannot_be_deleted_or_renamed_but_leaves_a_thread() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+
+    // Label the thread, then try to drop Private from the tag list: it stays.
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Private".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Private"]);
+    let without: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name != "Private")
+        .collect();
+    s.set_tags(without).unwrap();
+    assert!(
+        s.tags().unwrap().iter().any(|t| t.name == "Private"),
+        "Private is always present"
+    );
+    assert_eq!(
+        labels_of(&s, tid),
+        vec!["Private"],
+        "its membership survives too"
+    );
+
+    // Renaming it is refused outright.
+    let renamed: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .map(|mut t| {
+            if t.name == "Private" {
+                t.name = "Secret".into()
+            }
+            t
+        })
+        .collect();
+    assert!(s.set_tags(renamed).is_err(), "Private cannot be renamed");
+    assert!(s.tags().unwrap().iter().any(|t| t.name == "Private"));
+
+    // Removing it from the thread is fine; only the tag itself is protected.
+    s.act(
+        &[tid],
+        &Action::Unlabel {
+            tag: "Private".into(),
+        },
+    )
+    .unwrap();
+    assert!(labels_of(&s, tid).is_empty());
 }

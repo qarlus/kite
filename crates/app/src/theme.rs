@@ -20,6 +20,8 @@ pub struct Theme {
     pub danger: Rgba,
     pub ok: Rgba,
     pub dark: bool,
+    /// A painted gradient behind the rail and list. Only Ember sets it.
+    pub gradient: Option<Background>,
 }
 
 pub const CARBON: Theme = Theme {
@@ -37,6 +39,7 @@ pub const CARBON: Theme = Theme {
     danger: rgb_const(0xff6b6b),
     ok: rgb_const(0x3ddc97),
     dark: true,
+    gradient: None,
 };
 
 pub const PAPER: Theme = Theme {
@@ -54,10 +57,13 @@ pub const PAPER: Theme = Theme {
     danger: rgb_const(0xe5484d),
     ok: rgb_const(0x1f9d6b),
     dark: false,
+    gradient: None,
 };
 
 pub const ROW_H: f32 = 44.;
 pub const BAR_H: f32 = 44.;
+/// The window strip above the mail: drag region and, on Windows, the window controls.
+pub const STRIP_H: f32 = 34.;
 /// DESIGN › Tokens: the only two corner radii.
 pub const RADIUS: f32 = 10.;
 pub const RADIUS_SM: f32 = 6.;
@@ -88,7 +94,7 @@ const fn rgb_const(hex: u32) -> Rgba {
 /// Which theme `settings.theme` asks for. `system` follows the window appearance.
 pub fn wants_dark(setting: &str, appearance: WindowAppearance) -> bool {
     match setting {
-        "dark" | "midnight" => true,
+        "dark" | "midnight" | "ember" => true,
         "light" | "linen" => false,
         _ => matches!(
             appearance,
@@ -143,6 +149,29 @@ impl Theme {
     }
 }
 
+/// The window background: Ember's gradient, flat everywhere else.
+pub fn canvas(t: &Theme) -> Background {
+    t.gradient.unwrap_or_else(|| t.bg.into())
+}
+
+/// The icon rail: translucent over the gradient, otherwise the panel colour.
+pub fn rail(t: &Theme) -> Background {
+    if t.gradient.is_some() {
+        Theme::alpha(t.bg, 0.6).into()
+    } else {
+        t.bg2.into()
+    }
+}
+
+/// The list column: translucent over the gradient, otherwise the panel colour.
+pub fn panel(t: &Theme) -> Background {
+    if t.gradient.is_some() {
+        Theme::alpha(t.bg, 0.82).into()
+    } else {
+        t.bg2.into()
+    }
+}
+
 /// The Kite accent glow: the violet→sky gradient, reserved for focus and selection.
 pub fn accent_glow(t: &Theme) -> Background {
     linear_gradient(
@@ -155,6 +184,27 @@ pub fn accent_glow(t: &Theme) -> Background {
 /// The palette is owned by the view so imported themes need no leaked allocations.
 pub fn preset(name: &str) -> Theme {
     match name {
+        // Warm ember: a painted gradient under a dark mail surface.
+        "ember" => Theme {
+            bg: rgb_const(0x0b0b0b),
+            bg2: rgb_const(0x141311),
+            bg3: rgb_const(0x1f1c19),
+            sel: rgb_const(0x2b2622),
+            line: rgba_const(0xffffff14),
+            fg: rgb_const(0xf3eee8),
+            fg2: rgb_const(0xa89f97),
+            fg3: rgb_const(0x7b736c),
+            accent: rgb_const(0xff8a4c),
+            accent2: rgb_const(0xffc46b),
+            danger: rgb_const(0xff6b5a),
+            ok: rgb_const(0x5cc9a0),
+            gradient: Some(linear_gradient(
+                205.,
+                linear_color_stop(rgba_const(0x2a0704ff), 0.),
+                linear_color_stop(rgba_const(0xd2601fff), 1.),
+            )),
+            ..CARBON
+        },
         "midnight" => Theme {
             bg: rgb_const(0x101820),
             bg2: rgb_const(0x16212b),
@@ -264,7 +314,7 @@ pub fn resolve(
         anyhow::ensure!(
             matches!(
                 settings.theme.as_str(),
-                "dark" | "light" | "midnight" | "linen"
+                "dark" | "light" | "midnight" | "linen" | "ember"
             ),
             "Unknown theme."
         );

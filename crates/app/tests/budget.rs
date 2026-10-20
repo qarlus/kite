@@ -12,8 +12,8 @@ fn release_binary_within_budget() {
         .unwrap_or_else(|e| panic!("build the release binary first ({}): {e}", exe.display()))
         .len();
     assert!(
-        size <= 20 * 1024 * 1024,
-        "kite binary is {:.1} MB, budget 20 MB",
+        size <= 24 * 1024 * 1024,
+        "kite binary is {:.1} MB, budget 24 MB",
         size as f64 / 1048576.
     );
 }

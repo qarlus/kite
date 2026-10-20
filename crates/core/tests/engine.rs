@@ -1,68 +1,36 @@
-//! End-to-end tests for the engine through the `Mail` trait: real SQLite in a temp dir, in-memory
-//! secrets, and the shared fake Bridge/SMTP server. No keychain, no network.
-mod common;
+//! Production Mail tests with real SQLite, in-memory secrets and local HTTP servers.
+#[path = "common/temp_dir.rs"]
+mod temp_dir;
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use common::{FIRST, SECOND, serve};
 use kite_core::api::Mail;
 use kite_core::engine::{Engine, Options, Secrets};
 use kite_core::model::*;
+use kite_core::store::Store;
 
-// ------------------------------------------------------------------ harness
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .expect("runtime")
-}
-
-fn temp_dir() -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("kite-engine-{}-{n}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("temp dir");
-    dir
+fn temp_dir() -> temp_dir::TempDir {
+    temp_dir::TempDir::new("engine")
 }
 
 fn engine(dir: &Path) -> Arc<Engine> {
     Engine::open_with(
         dir,
         Secrets::Memory(Mutex::new(HashMap::new())),
-        Options {
-            proton_tls: false,
-            ..Default::default()
-        },
+        Options::default(),
     )
     .expect("engine")
 }
 
-fn login((imap_port, smtp_port): (u16, u16)) -> ProtonLogin {
-    ProtonLogin {
-        email: "karl@example.com".into(),
-        password: "secret".into(),
-        host: Some("127.0.0.1".into()),
-        imap_port: Some(imap_port),
-        smtp_port: Some(smtp_port),
-    }
-}
-
-fn inbox(account_id: Id) -> View {
-    View {
-        account_id: Some(account_id),
-        mailbox: Mailbox::Inbox,
-        split: None,
-        query: None,
-        folder: None,
-    }
+fn local_account(dir: &Path) -> Account {
+    Store::open(&dir.join("kite.db"))
+        .expect("store")
+        .add_account(Provider::Proton, "karl@example.com", "Karl")
+        .expect("account")
 }
 
 fn addr(name: &str, email: &str) -> Addr {
@@ -70,6 +38,20 @@ fn addr(name: &str, email: &str) -> Addr {
         name: name.into(),
         email: email.into(),
     }
+}
+
+fn drafts(account: Id) -> View {
+    View {
+        account_id: Some(account),
+        mailbox: Mailbox::Drafts,
+        split: None,
+        query: None,
+        folder: None,
+    }
+}
+
+fn now_ms() -> Ms {
+    kite_core::auth::now_ms()
 }
 
 /// A single consumer of `Event`s that buffers anything a predicate did not ask for.
@@ -113,11 +95,14 @@ impl Events {
     }
 }
 
-/// A minimal SSE server: answers one request with the given `data:` payloads.
-fn sse_server(chunks: &[&str]) -> String {
+/// A minimal SSE server: answers one request with the given `data:` payloads, and keeps the
+/// request it received so the model and the key it was sent can be checked.
+fn sse_server(chunks: &[&str]) -> (String, Arc<Mutex<Vec<u8>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind sse");
     let address = listener.local_addr().expect("addr").to_string();
     let payloads: Vec<String> = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorded = seen.clone();
     std::thread::spawn(move || {
         let Ok((mut sock, _)) = listener.accept() else {
             return;
@@ -144,6 +129,7 @@ fn sse_server(chunks: &[&str]) -> String {
                 Ok(n) => request.extend_from_slice(&buffer[..n]),
             }
         }
+        *recorded.lock().expect("request") = request.clone();
         let header =
             "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
         let _ = sock.write_all(header.as_bytes());
@@ -154,263 +140,15 @@ fn sse_server(chunks: &[&str]) -> String {
             std::thread::sleep(std::time::Duration::from_micros(300));
         }
     });
-    address
-}
-
-// -------------------------------------------------------------------- tests
-
-#[test]
-fn adding_proton_syncs_the_inbox_into_the_store() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(FIRST, &["\\Seen"]);
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(SECOND, &[]);
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    let events = Events::new(engine.events());
-    let account = engine.add_proton(login(server.ports())).expect("add");
-
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let threads = engine.threads(&inbox(account.id), 0, 50).expect("threads");
-    let mut subjects: Vec<&str> = threads.iter().map(|t| t.subject.as_str()).collect();
-    subjects.sort_unstable();
-    assert_eq!(subjects, vec!["Lunch?", "Quarterly numbers"]);
-}
-
-#[test]
-fn archiving_applies_locally_before_the_network_and_reaches_the_server() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(SECOND, &[]);
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    let events = Events::new(engine.events());
-    let account = engine.add_proton(login(server.ports())).expect("add");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let view = inbox(account.id);
-    let thread = engine.threads(&view, 0, 50).expect("threads").remove(0);
-    engine.act(&[thread.id], &Action::Archive).expect("act");
-
-    // Gone from the inbox immediately, before any network round trip.
-    assert!(engine.threads(&view, 0, 50).expect("threads").is_empty());
-
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-    let world = world.lock().expect("world");
-    let archive = world
-        .folders
-        .iter()
-        .find(|f| f.name == "Archive")
-        .expect("archive");
-    assert_eq!(archive.uids(), vec![1]);
-    assert_eq!(archive.msgs[0].raw, SECOND);
-}
-
-#[test]
-fn sending_builds_mime_and_replies_carry_reply_headers() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(FIRST, &["\\Seen"]);
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    engine
-        .set_settings(Settings {
-            undo_send_secs: 0,
-            ..Default::default()
-        })
-        .expect("settings");
-    let events = Events::new(engine.events());
-    let account = engine.add_proton(login(server.ports())).expect("add");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    engine
-        .send(Draft {
-            account_id: account.id,
-            to: vec![addr("Bob", "bob@example.org")],
-            subject: "Hi there".into(),
-            body: "hello".into(),
-            ..Default::default()
-        })
-        .expect("send");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let view = inbox(account.id);
-    let thread = engine.threads(&view, 0, 50).expect("threads").remove(0);
-    let message = engine.thread(thread.id).expect("thread").remove(0);
-    engine
-        .send(Draft {
-            account_id: account.id,
-            to: vec![addr("Ada", "ada@example.org")],
-            reply_to: Some(message.id),
-            body: "thanks".into(),
-            ..Default::default()
-        })
-        .expect("reply");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let world = world.lock().expect("world");
-    assert_eq!(world.sent.len(), 2, "both drafts reached SMTP");
-    let plain = String::from_utf8_lossy(&world.sent[0].raw).to_string();
-    assert!(plain.contains("Subject: Hi there"), "{plain}");
-    assert!(plain.contains("hello"), "{plain}");
-    assert!(world.sent[0].rcpts.contains(&"bob@example.org".to_string()));
-
-    let reply = String::from_utf8_lossy(&world.sent[1].raw).to_string();
-    assert!(reply.contains("In-Reply-To: <abc@example.org>"), "{reply}");
-    assert!(
-        reply.contains("References: <root@example.org> <parent@example.org> <abc@example.org>"),
-        "{reply}"
-    );
-    assert!(reply.contains("Subject: Re: Quarterly numbers"), "{reply}");
-    assert!(world.sent[1].rcpts.contains(&"ada@example.org".to_string()));
-}
-
-#[test]
-fn cancelling_a_queued_send_keeps_it_out_of_the_outbox() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(FIRST, &[]);
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    let events = Events::new(engine.events());
-    let account = engine.add_proton(login(server.ports())).expect("add");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    engine
-        .set_settings(Settings {
-            undo_send_secs: 30,
-            ..Default::default()
-        })
-        .expect("settings");
-    let held = engine
-        .send(Draft {
-            account_id: account.id,
-            to: vec![addr("Bob", "bob@example.org")],
-            subject: "Held".into(),
-            body: "held".into(),
-            ..Default::default()
-        })
-        .expect("send");
-    let returned = engine.cancel_send(held).expect("cancel").expect("draft");
-    assert_eq!(returned.subject, "Held");
-
-    // A second draft due at once proves the outbox ran; only it can reach SMTP.
-    engine
-        .set_settings(Settings {
-            undo_send_secs: 0,
-            ..Default::default()
-        })
-        .expect("settings");
-    engine
-        .send(Draft {
-            account_id: account.id,
-            to: vec![addr("Bob", "bob@example.org")],
-            subject: "Sent".into(),
-            body: "sent".into(),
-            ..Default::default()
-        })
-        .expect("send");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
-
-    let world = world.lock().expect("world");
-    assert_eq!(world.sent.len(), 1, "the cancelled draft never left");
-    let raw = String::from_utf8_lossy(&world.sent[0].raw).to_string();
-    assert!(raw.contains("Subject: Sent"), "{raw}");
-    assert!(!raw.contains("Held"), "{raw}");
-}
-
-#[test]
-fn a_wrong_bridge_password_leaves_no_account() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    let mut login = login(server.ports());
-    login.password = "wrong".into();
-    assert!(engine.add_proton(login).is_err());
-    assert!(engine.accounts().expect("accounts").is_empty());
-}
-
-#[test]
-fn creating_a_folder_persists_it_and_a_provider_error_persists_nothing() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    let server = rt.block_on(serve(world.clone()));
-
-    let dir = temp_dir();
-    let engine = engine(&dir);
-    let account = engine.add_proton(login(server.ports())).expect("add");
-
-    assert!(
-        engine.folders().expect("folders").is_empty(),
-        "discovery is out of scope, so nothing is cached yet"
-    );
-
-    let folder = engine
-        .create_folder(account.id, "Receipts")
-        .expect("create");
-    assert_eq!(folder.account_id, account.id);
-    assert_eq!(folder.name, "Receipts");
-    assert!(folder.id.ends_with("Receipts"), "{}", folder.id);
-
-    // The provider really accepted it, including the subscribe.
-    {
-        let world = world.lock().expect("world");
-        assert!(world.folders.iter().any(|f| f.name == folder.id));
-        assert!(world.subscribed.contains(&folder.id));
-    }
-
-    // `Mail::folders` reads the local catalog, so the folder is visible without a round trip.
-    let folders = engine.folders().expect("folders");
-    assert_eq!(folders.len(), 1);
-    assert_eq!(folders[0].id, folder.id);
-    assert_eq!(folders[0].name, "Receipts");
-
-    // A provider failure must not leave a phantom folder behind.
-    server.stop();
-    assert!(engine.create_folder(account.id, "Loud").is_err());
-    let folders = engine.folders().expect("folders");
-    assert_eq!(folders.len(), 1, "only the first folder exists");
-    assert!(folders.iter().all(|f| f.name == "Receipts"));
+    (address, seen)
 }
 
 #[test]
 fn ai_streams_sse_chunks_in_order() {
-    let address = sse_server(&[
+    let (address, request) = sse_server(&[
         r#"{"choices":[{"delta":{"content":"Hel"}}]}"#,
         r#"{"choices":[{"delta":{"content":"lo, "}}]}"#,
-        r#"{"choices":[{"delta":{"content":"wörld 🙂"}}]}"#,
+        r#"{"choices":[{"delta":{"content":"wörld ðŸ™‚"}}]}"#,
         "[DONE]",
     ]);
     let dir = temp_dir();
@@ -428,10 +166,12 @@ fn ai_streams_sse_chunks_in_order() {
     engine
         .ai(
             7,
-            vec![ChatMsg {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
+            AiRequest::Compose {
+                draft: Draft {
+                    subject: "hi".into(),
+                    ..Draft::default()
+                },
+            },
         )
         .expect("ai");
 
@@ -447,45 +187,234 @@ fn ai_streams_sse_chunks_in_order() {
             other => panic!("unexpected event {other:?}"),
         }
     }
-    assert_eq!(deltas, vec!["Hel", "lo, ", "wörld 🙂"]);
+    assert_eq!(deltas, vec!["Hel", "lo, ", "wörld ðŸ™‚"]);
+    // Settings, not constants, decide where and for which model the request goes.
+    let seen = String::from_utf8_lossy(&request.lock().expect("request").clone()).to_string();
+    assert!(
+        seen.contains("\"model\":\"test-model\""),
+        "the configured model is sent: {seen}"
+    );
+    assert!(
+        seen.contains("authorization: Bearer secret"),
+        "the keychain key is the bearer token: {seen}"
+    );
 }
 
 #[test]
-fn a_backend_error_is_reported_and_the_loop_recovers() {
-    let rt = runtime();
-    let world = Arc::new(Mutex::new(common::world()));
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(FIRST, &["\\Seen"]);
-    let server = rt.block_on(serve(world.clone()));
+fn fetch_image_downloads_http_and_refuses_everything_else() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind image");
+    let address = listener.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let Ok((mut sock, _)) = listener.accept() else {
+            return;
+        };
+        let mut buffer = [0u8; 2048];
+        let _ = sock.read(&mut buffer);
+        let body = b"\x89PNG\r\n\x1a\n";
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = sock.write_all(head.as_bytes());
+        let _ = sock.write_all(body);
+    });
+    let url = format!("http://{address}/pixel.png");
+    let dir = temp_dir();
+    assert!(
+        engine(&dir).fetch_image(&url).is_err(),
+        "mail must not make Kite fetch from the reader's own machine"
+    );
+    let dir = temp_dir();
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::new())),
+        Options {
+            local_images: true,
+            ..Default::default()
+        },
+    )
+    .expect("engine");
+    let bytes = engine.fetch_image(&url).expect("image");
+    assert_eq!(bytes, b"\x89PNG\r\n\x1a\n".to_vec());
+    assert!(
+        engine.fetch_image("file:///C:/Windows/win.ini").is_err(),
+        "only http(s) is fetched for a message"
+    );
+}
 
+#[test]
+fn a_send_without_recipients_is_rejected() {
     let dir = temp_dir();
     let engine = engine(&dir);
-    let events = Events::new(engine.events());
-    let account = engine.add_proton(login(server.ports())).expect("add");
-    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+    let account = local_account(&dir);
 
-    server.stop();
-    engine.sync_now();
-    events.wait(|e| matches!(e, Event::Error(_)));
+    assert!(
+        engine
+            .send(Draft {
+                account_id: account.id,
+                subject: "No one".into(),
+                ..Default::default()
+            })
+            .is_err(),
+        "an empty envelope must not reach the outbox"
+    );
+}
 
-    server.start();
-    world
-        .lock()
-        .expect("world")
-        .folder("INBOX")
-        .push(SECOND, &[]);
-    engine.sync_now();
-    // Each synced batch announces itself, so Changed events from the first sync may still be queued.
-    while !engine
-        .threads(&inbox(account.id), 0, 50)
-        .expect("threads")
-        .iter()
-        .any(|t| t.subject == "Lunch?")
-    {
-        events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+#[test]
+fn invalid_recipients_never_leave_drafts_or_enter_scheduled_outbox() {
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = local_account(&dir);
+    let invalid = [
+        addr("", ""),
+        addr("", "missing-at"),
+        addr("", "a..b@example.com"),
+        addr("", "a@-example.com"),
+        addr("", "a@example-.com"),
+        addr("", "a@example..com"),
+        addr("", "a@example_com.org"),
+        addr("", "a@example.com\r\nBcc: injected@example.com"),
+        addr("Injected\r\nBcc: other@example.com", "a@example.com"),
+    ];
+    for field in ["To", "Cc", "Bcc"] {
+        for recipient in &invalid {
+            for send_at in [None, Some(now_ms() + 3_600_000)] {
+                let mut draft = Draft {
+                    account_id: account.id,
+                    to: vec![addr("Valid", "valid@example.org")],
+                    subject: "Invalid envelope".into(),
+                    send_at,
+                    ..Default::default()
+                };
+                match field {
+                    "To" => draft.to.push(recipient.clone()),
+                    "Cc" => draft.cc.push(recipient.clone()),
+                    _ => draft.bcc.push(recipient.clone()),
+                }
+                let error = engine
+                    .send(draft)
+                    .expect_err("invalid address must be rejected");
+                assert!(error.to_string().starts_with(field), "{error}");
+            }
+        }
+    }
+    // Incomplete recipients remain editable drafts, including after a blocked send.
+    let id = engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![addr("", "unfinished")],
+            subject: "Keep editing".into(),
+            ..Default::default()
+        })
+        .expect("save incomplete draft");
+    let row = engine
+        .threads(&drafts(account.id), 0, 10)
+        .expect("drafts")
+        .remove(0);
+    let saved = engine.draft(row.id).expect("draft").expect("editable");
+    assert_eq!(saved.id, Some(id));
+    assert!(engine.send(saved.clone()).is_err());
+    assert_eq!(
+        engine.draft(row.id).expect("retained").expect("draft").to,
+        saved.to
+    );
+    let store = kite_core::store::Store::open(&dir.join("kite.db")).expect("local store");
+    assert!(
+        store.outbox_due(i64::MAX).expect("outbox").is_empty(),
+        "no immediate or future invalid send was queued"
+    );
+}
+
+#[test]
+fn a_legacy_bridge_account_reports_how_to_sign_in_and_can_be_removed() {
+    let dir = temp_dir();
+    let account = local_account(&dir);
+    let credentials = serde_json::json!({
+        "host": "127.0.0.1", "imap_port": 1143, "smtp_port": 1025,
+        "user": account.email, "password": "old-bridge-password", "tls": true,
+    });
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::from([(
+            format!("proton:{}", account.id),
+            credentials.to_string(),
+        )]))),
+        Options::default(),
+    )
+    .expect("engine");
+    // The synchronous account operation checks the same backend selection as sync.
+    let error = engine
+        .create_folder(account.id, "Projects")
+        .expect_err("Bridge is gone");
+    assert!(
+        error
+            .to_string()
+            .contains("This Proton account used Bridge; sign in again in Settings › Connections"),
+        "{error:#}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let errors = std::fs::read_to_string(dir.join("errors.log")).unwrap_or_default();
+        if errors
+            .contains("This Proton account used Bridge; sign in again in Settings › Connections")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "startup must report the account error: {errors}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
     }
     assert_eq!(engine.accounts().expect("accounts").len(), 1);
+    engine
+        .remove_account(account.id)
+        .expect("remove old account");
+    assert!(engine.accounts().expect("accounts").is_empty());
+}
+
+#[test]
+fn scheduled_and_undo_send_can_be_cancelled_back_to_editable_drafts() {
+    let dir = temp_dir();
+    let account = local_account(&dir);
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 30,
+            ..Settings::default()
+        })
+        .unwrap();
+    for send_at in [None, Some(now_ms() + 3_600_000)] {
+        let id = engine
+            .save_draft(Draft {
+                account_id: account.id,
+                to: vec![addr("Bob", "bob@example.org")],
+                subject: "Keep editing".into(),
+                send_at,
+                ..Draft::default()
+            })
+            .unwrap();
+        let row = engine
+            .threads(&drafts(account.id), 0, 10)
+            .unwrap()
+            .remove(0);
+        let draft = engine.draft(row.id).unwrap().unwrap();
+        let queued = engine.send(draft).unwrap();
+        assert!(
+            engine
+                .threads(&drafts(account.id), 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let returned = engine.cancel_send(queued).unwrap().unwrap();
+        assert_eq!(returned.id, Some(id));
+        assert_eq!(returned.subject, "Keep editing");
+        assert_eq!(returned.send_at, send_at);
+        let row = engine
+            .threads(&drafts(account.id), 0, 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(engine.draft(row.id).unwrap().unwrap().id, Some(id));
+        engine.discard_draft(id).unwrap();
+    }
 }

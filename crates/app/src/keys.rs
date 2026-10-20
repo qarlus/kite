@@ -1,6 +1,9 @@
-//! The command table. One list drives `cx.bind_keys`, the command palette and the cheat sheet.
+//! The command table. One list drives `cx.bind_keys`, the command palette, the cheat sheet
+//! and the shortcut editor.
+use crate::app::Kite;
 use gpui_kit::*;
-use kite_core::model::Mailbox;
+use kite_core::model::{Mailbox, Settings};
+use std::rc::Rc;
 
 /// Command ids carried by [`Act`], so one handler serves every command.
 pub mod cmd {
@@ -29,6 +32,7 @@ pub mod cmd {
     pub const SETTINGS: u8 = 31;
     pub const ACCOUNT_SWITCHER: u8 = 32;
     pub const MANAGE_ACCOUNTS: u8 = 33;
+    pub const REFRESH: u8 = 34;
     pub const ACCOUNT: u8 = 40;
     pub const COMPOSE: u8 = 50;
     pub const REPLY: u8 = 51;
@@ -37,96 +41,496 @@ pub mod cmd {
     pub const SEND: u8 = 54;
     pub const COMPOSE_CLOSE: u8 = 55;
     pub const SHOW_CC: u8 = 56;
+    pub const SEND_LATER: u8 = 57;
+    pub const DISCARD: u8 = 58;
+    pub const AI_WRITE: u8 = 59;
+    pub const AI_SUMMARY: u8 = 60;
+    pub const TAGS: u8 = 61;
+}
+
+/// The section a command is listed under in the palette, the cheat sheet and Settings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Group {
+    Navigation,
+    Triage,
+    Compose,
+    GoTo,
+    Accounts,
+    App,
+}
+
+impl Group {
+    pub const ALL: [Self; 6] = [
+        Self::Navigation,
+        Self::Triage,
+        Self::Compose,
+        Self::GoTo,
+        Self::Accounts,
+        Self::App,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Navigation => "Navigation",
+            Self::Triage => "Triage",
+            Self::Compose => "Compose",
+            Self::GoTo => "Go to",
+            Self::Accounts => "Accounts",
+            Self::App => "App",
+        }
+    }
 }
 
 pub struct Cmd {
+    /// Stable identifier stored in `Settings::shortcuts`.
+    pub slug: &'static str,
     pub title: &'static str,
-    /// Keystroke strings, as bound. The first is the one shown in hints.
+    /// Default keystroke strings, as bound. The first is the one shown in hints.
     pub keys: &'static [&'static str],
     /// Key context the binding lives in.
     pub ctx: &'static str,
+    pub group: Group,
     pub id: u8,
 }
 
-const fn c(title: &'static str, keys: &'static [&'static str], ctx: &'static str, id: u8) -> Cmd {
+const fn c(
+    slug: &'static str,
+    title: &'static str,
+    keys: &'static [&'static str],
+    ctx: &'static str,
+    group: Group,
+    id: u8,
+) -> Cmd {
     Cmd {
+        slug,
         title,
         keys,
         ctx,
+        group,
         id,
     }
 }
 
 pub static COMMANDS: &[Cmd] = &[
     c(
+        "refresh",
+        "Refresh mail",
+        &["secondary-r"],
+        "Kite",
+        Group::App,
+        cmd::REFRESH,
+    ),
+    c(
+        "manage_accounts",
         "Manage accounts",
         &["secondary-shift-,"],
         "Kite",
+        Group::Accounts,
         cmd::MANAGE_ACCOUNTS,
     ),
-    c("Settings", &["secondary-,"], "Kite", cmd::SETTINGS),
     c(
+        "settings",
+        "Settings",
+        &["secondary-,"],
+        "Kite",
+        Group::App,
+        cmd::SETTINGS,
+    ),
+    c(
+        "switch_account",
         "Switch account",
         &["secondary-shift-a"],
         "Kite",
+        Group::Accounts,
         cmd::ACCOUNT_SWITCHER,
     ),
-    c("Next thread", &["j"], "Kite", cmd::NEXT),
-    c("Previous thread", &["k"], "Kite", cmd::PREV),
-    c("Open thread", &["enter", "o"], "KiteList", cmd::OPEN),
-    c("Back", &["escape"], "Kite", cmd::BACK),
-    c("Back to list", &["u"], "KiteThread", cmd::BACK),
-    c("Mark done", &["e"], "KiteList", cmd::DONE),
-    c("Move back to inbox", &["shift-e"], "KiteList", cmd::INBOX),
-    c("Trash", &["#", "shift-3"], "KiteList", cmd::TRASH),
-    c("Snooze / remind", &["h"], "KiteList", cmd::SNOOZE),
-    c("Star", &["s"], "KiteList", cmd::STAR),
-    c("Toggle read", &["shift-u"], "KiteList", cmd::TOGGLE_READ),
-    c("Move to folder", &["l"], "KiteList", cmd::MOVE),
     c(
+        "next_thread",
+        "Next thread",
+        &["j"],
+        "Kite",
+        Group::Navigation,
+        cmd::NEXT,
+    ),
+    c(
+        "previous_thread",
+        "Previous thread",
+        &["k"],
+        "Kite",
+        Group::Navigation,
+        cmd::PREV,
+    ),
+    c(
+        "open_thread",
+        "Open thread",
+        &["enter", "o"],
+        "KiteList",
+        Group::Navigation,
+        cmd::OPEN,
+    ),
+    c(
+        "back",
+        "Back",
+        &["escape"],
+        "Kite",
+        Group::Navigation,
+        cmd::BACK,
+    ),
+    c(
+        "back_to_list",
+        "Back to list",
+        &["u"],
+        "KiteThread",
+        Group::Navigation,
+        cmd::BACK,
+    ),
+    c(
+        "mark_done",
+        "Mark done",
+        &["e"],
+        "KiteList",
+        Group::Triage,
+        cmd::DONE,
+    ),
+    c(
+        "move_to_inbox",
+        "Move back to inbox",
+        &["shift-e"],
+        "KiteList",
+        Group::Triage,
+        cmd::INBOX,
+    ),
+    c(
+        "trash",
+        "Trash",
+        &["#", "shift-3", "delete"],
+        "KiteList",
+        Group::Triage,
+        cmd::TRASH,
+    ),
+    c(
+        "snooze",
+        "Snooze / remind",
+        &["h"],
+        "KiteList",
+        Group::Triage,
+        cmd::SNOOZE,
+    ),
+    c("star", "Star", &["s"], "KiteList", Group::Triage, cmd::STAR),
+    c(
+        "toggle_read",
+        "Toggle read",
+        &["shift-u"],
+        "KiteList",
+        Group::Triage,
+        cmd::TOGGLE_READ,
+    ),
+    c(
+        "move_to_folder",
+        "Move to folder",
+        &["l"],
+        "KiteList",
+        Group::Triage,
+        cmd::MOVE,
+    ),
+    c(
+        "tags",
+        "Tag conversation",
+        &["shift-l"],
+        "KiteList",
+        Group::Triage,
+        cmd::TAGS,
+    ),
+    c(
+        "new_folder",
         "New folder",
         &["secondary-shift-n"],
         "Kite",
+        Group::App,
         cmd::CREATE_FOLDER,
     ),
-    c("Select", &["x"], "KiteList", cmd::SELECT),
-    c("Search", &["/"], "KiteList", cmd::SEARCH),
-    c("Command palette", &["secondary-k"], "Kite", cmd::PALETTE),
-    c("Compose", &["c"], "Kite", cmd::COMPOSE),
-    c("Reply", &["r"], "Kite", cmd::REPLY),
-    c("Reply all", &["a"], "Kite", cmd::REPLY_ALL),
-    c("Forward", &["f"], "Kite", cmd::FORWARD),
-    c("Send", &["secondary-enter"], "KiteCompose", cmd::SEND),
     c(
+        "select",
+        "Select",
+        &["x"],
+        "KiteList",
+        Group::Triage,
+        cmd::SELECT,
+    ),
+    c(
+        "search",
+        "Search",
+        &["/"],
+        "KiteList",
+        Group::App,
+        cmd::SEARCH,
+    ),
+    c(
+        "palette",
+        "Command palette",
+        &["secondary-k"],
+        "Kite",
+        Group::App,
+        cmd::PALETTE,
+    ),
+    c(
+        "compose",
+        "Compose",
+        &["c"],
+        "Kite",
+        Group::Compose,
+        cmd::COMPOSE,
+    ),
+    c("reply", "Reply", &["r"], "Kite", Group::Compose, cmd::REPLY),
+    c(
+        "reply_all",
+        "Reply all",
+        &["a"],
+        "Kite",
+        Group::Compose,
+        cmd::REPLY_ALL,
+    ),
+    c(
+        "forward",
+        "Forward",
+        &["f"],
+        "Kite",
+        Group::Compose,
+        cmd::FORWARD,
+    ),
+    c(
+        "send",
+        "Send",
+        &["secondary-enter"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::SEND,
+    ),
+    c(
+        "close_compose",
         "Close compose",
         &["escape"],
         "KiteCompose",
+        Group::Compose,
         cmd::COMPOSE_CLOSE,
     ),
-    c("Show Cc", &["secondary-shift-c"], "KiteCompose", cmd::SHOW_CC),
-    c("Next split", &["tab"], "Kite", cmd::NEXT_SPLIT),
-    c("Previous split", &["shift-tab"], "Kite", cmd::PREV_SPLIT),
-    c("Undo", &["z"], "Kite", cmd::UNDO),
-    c("Go to inbox", &["g i"], "Kite", cmd::GO),
-    c("Go to starred", &["g s"], "Kite", cmd::GO + 1),
-    c("Go to drafts", &["g d"], "Kite", cmd::GO + 2),
-    c("Go to sent", &["g t"], "Kite", cmd::GO + 3),
-    c("Go to snoozed", &["g h"], "Kite", cmd::GO + 4),
-    c("Go to all mail", &["g a"], "Kite", cmd::GO + 5),
-    c("Go to archive", &["g e"], "Kite", cmd::GO + 6),
-    c("Go to spam", &["g p"], "Kite", cmd::GO + 7),
-    c("Go to trash", &["g b"], "Kite", cmd::GO + 8),
-    c("All inboxes", &["secondary-0"], "Kite", cmd::UNIFIED),
-    c("Shortcut help", &["shift-/"], "Kite", cmd::HELP),
-    c("Account 1", &["secondary-1"], "Kite", cmd::ACCOUNT),
-    c("Account 2", &["secondary-2"], "Kite", cmd::ACCOUNT + 1),
-    c("Account 3", &["secondary-3"], "Kite", cmd::ACCOUNT + 2),
-    c("Account 4", &["secondary-4"], "Kite", cmd::ACCOUNT + 3),
-    c("Account 5", &["secondary-5"], "Kite", cmd::ACCOUNT + 4),
-    c("Account 6", &["secondary-6"], "Kite", cmd::ACCOUNT + 5),
-    c("Account 7", &["secondary-7"], "Kite", cmd::ACCOUNT + 6),
-    c("Account 8", &["secondary-8"], "Kite", cmd::ACCOUNT + 7),
-    c("Account 9", &["secondary-9"], "Kite", cmd::ACCOUNT + 8),
+    c(
+        "show_cc",
+        "Show Cc",
+        &["secondary-shift-c"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::SHOW_CC,
+    ),
+    c(
+        "next_split",
+        "Next split",
+        &["tab"],
+        "Kite",
+        Group::Navigation,
+        cmd::NEXT_SPLIT,
+    ),
+    c(
+        "previous_split",
+        "Previous split",
+        &["shift-tab"],
+        "Kite",
+        Group::Navigation,
+        cmd::PREV_SPLIT,
+    ),
+    c("undo", "Undo", &["z"], "Kite", Group::Triage, cmd::UNDO),
+    c(
+        "go_inbox",
+        "Go to inbox",
+        &["g i"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO,
+    ),
+    c(
+        "go_starred",
+        "Go to starred",
+        &["g s"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 1,
+    ),
+    c(
+        "go_drafts",
+        "Go to drafts",
+        &["g d"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 2,
+    ),
+    c(
+        "go_sent",
+        "Go to sent",
+        &["g t"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 3,
+    ),
+    c(
+        "go_snoozed",
+        "Go to snoozed",
+        &["g h"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 4,
+    ),
+    c(
+        "go_all_mail",
+        "Go to all mail",
+        &["g a"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 5,
+    ),
+    c(
+        "go_archive",
+        "Go to archive",
+        &["g e"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 6,
+    ),
+    c(
+        "go_spam",
+        "Go to spam",
+        &["g p"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 7,
+    ),
+    c(
+        "go_trash",
+        "Go to trash",
+        &["g b"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO + 8,
+    ),
+    c(
+        "all_inboxes",
+        "All inboxes",
+        &["secondary-0"],
+        "Kite",
+        Group::Accounts,
+        cmd::UNIFIED,
+    ),
+    c(
+        "shortcut_help",
+        "Shortcut help",
+        &["shift-/"],
+        "Kite",
+        Group::App,
+        cmd::HELP,
+    ),
+    c(
+        "account_1",
+        "Account 1",
+        &["secondary-1"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT,
+    ),
+    c(
+        "account_2",
+        "Account 2",
+        &["secondary-2"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 1,
+    ),
+    c(
+        "account_3",
+        "Account 3",
+        &["secondary-3"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 2,
+    ),
+    c(
+        "account_4",
+        "Account 4",
+        &["secondary-4"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 3,
+    ),
+    c(
+        "account_5",
+        "Account 5",
+        &["secondary-5"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 4,
+    ),
+    c(
+        "account_6",
+        "Account 6",
+        &["secondary-6"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 5,
+    ),
+    c(
+        "account_7",
+        "Account 7",
+        &["secondary-7"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 6,
+    ),
+    c(
+        "account_8",
+        "Account 8",
+        &["secondary-8"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 7,
+    ),
+    c(
+        "account_9",
+        "Account 9",
+        &["secondary-9"],
+        "Kite",
+        Group::Accounts,
+        cmd::ACCOUNT + 8,
+    ),
+    c(
+        "send_later",
+        "Send later",
+        &["secondary-shift-enter"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::SEND_LATER,
+    ),
+    c(
+        "discard_draft",
+        "Discard draft",
+        &["secondary-shift-d"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::DISCARD,
+    ),
+    c(
+        "ai_write",
+        "Write with AI",
+        &["secondary-j"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::AI_WRITE,
+    ),
+    c(
+        "ai_summary",
+        "Summarize thread",
+        &["shift-s"],
+        "KiteThread",
+        Group::Compose,
+        cmd::AI_SUMMARY,
+    ),
 ];
 
 /// The mailboxes reachable through the `g` sequences, in the same order as the table above.
@@ -142,39 +546,147 @@ pub const GO_MAILBOXES: [(Mailbox, &str); 9] = [
     (Mailbox::Trash, "Trash"),
 ];
 
-#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
-#[action(namespace = kite, no_json)]
-pub struct Act {
-    pub cmd: u8,
+/// Whether a command only exists while Settings › AI is on.
+pub fn needs_ai(id: u8) -> bool {
+    matches!(id, cmd::AI_WRITE | cmd::AI_SUMMARY)
 }
 
-pub fn bind(cx: &mut App) {
-    let mut bindings = Vec::new();
+/// Whether a command is offered at all. The AI helpers only exist once the reader turned AI on,
+/// so the palette and the cheat sheet never advertise a command that cannot run.
+pub fn available(settings: &Settings, command: &Cmd) -> bool {
+    settings.ai_enabled || !needs_ai(command.id)
+}
+
+/// The command carrying `id`.
+pub fn command(id: u8) -> Option<&'static Cmd> {
+    COMMANDS.iter().find(|command| command.id == id)
+}
+
+/// Classic (click-first) mode unbinds single-key shortcuts so typing never runs a command.
+/// Modifier chords, Escape, Enter, Delete and the navigation keys stay.
+fn mode_keeps(key: &str) -> bool {
+    let Ok(stroke) = Keystroke::parse(key) else {
+        return true;
+    };
+    stroke.modifiers.control
+        || stroke.modifiers.platform
+        || stroke.modifiers.alt
+        || matches!(
+            stroke.key.as_str(),
+            "escape"
+                | "enter"
+                | "delete"
+                | "up"
+                | "down"
+                | "left"
+                | "right"
+                | "home"
+                | "end"
+                | "pageup"
+                | "pagedown"
+        )
+}
+
+/// The keystrokes currently bound to `command`: user overrides first, then the defaults,
+/// filtered by the input mode. An override is always bound as written — the user asked for it.
+pub fn bound(settings: &Settings, command: &Cmd) -> Vec<String> {
+    let Some(keys) = settings.shortcuts.get(command.slug) else {
+        return command
+            .keys
+            .iter()
+            .filter(|key| settings.input_mode != "classic" || mode_keeps(key))
+            .map(|key| (*key).to_string())
+            .collect();
+    };
+    keys.clone()
+}
+
+/// The first current keystroke, for a button's key hint. Empty when the command is unbound.
+pub fn hint(settings: &Settings, command: &Cmd) -> String {
+    bound(settings, command)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+}
+
+/// The current key hint for a command id.
+pub fn hint_for(settings: &Settings, id: u8) -> String {
+    command(id)
+        .map(|command| hint(settings, command))
+        .unwrap_or_default()
+}
+
+/// A recorded keystroke as a binding string that survives Settings and a restart.
+pub fn source(stroke: &Keystroke) -> String {
+    let mut source = String::new();
+    // `secondary` is Ctrl on Windows and Cmd on macOS, so a recorded chord follows the platform.
+    if stroke.modifiers.control || stroke.modifiers.platform {
+        source.push_str("secondary-");
+    }
+    if stroke.modifiers.alt {
+        source.push_str("alt-");
+    }
+    if stroke.modifiers.function {
+        source.push_str("fn-");
+    }
+    if stroke.modifiers.shift {
+        source.push_str("shift-");
+    }
+    source.push_str(&stroke.key);
+    source
+}
+
+/// The title of another command that already uses `stroke` in the same scope, so an edit can
+/// explain the clash instead of silently shadowing it.
+pub fn conflict(settings: &Settings, slug: &str, stroke: &str) -> Option<&'static str> {
+    let compose = |ctx: &str| ctx.starts_with("KiteCompose");
+    let target = COMMANDS.iter().find(|command| command.slug == slug)?;
+    COMMANDS
+        .iter()
+        .filter(|command| command.slug != slug && compose(command.ctx) == compose(target.ctx))
+        .find(|command| bound(settings, command).iter().any(|key| key == stroke))
+        .map(|command| command.title)
+}
+
+/// The bindings gpui-kit's components install at startup (text fields, menus, lists).
+/// Captured once, before Kite binds anything, so a rebind can replace our own keys without
+/// leaving text inputs without theirs.
+struct ComponentKeys(Rc<[KeyBinding]>);
+
+impl Global for ComponentKeys {}
+
+/// Applies the keymap for `settings`. The single place that turns defaults, user overrides and
+/// the input mode into bindings, so a change takes effect on the next keystroke.
+pub fn bind(cx: &mut App, settings: &Settings) {
+    let base = match cx.try_global::<ComponentKeys>() {
+        Some(base) => base.0.clone(),
+        None => {
+            let captured: Rc<[KeyBinding]> = {
+                let keymap = cx.key_bindings();
+                let keymap = keymap.borrow();
+                keymap.bindings().cloned().collect()
+            };
+            cx.set_global(ComponentKeys(captured.clone()));
+            captured
+        }
+    };
+    cx.clear_key_bindings();
+    cx.bind_keys(base.iter().cloned().chain(bindings(settings)));
+}
+
+fn bindings(settings: &Settings) -> Vec<KeyBinding> {
+    let mut bindings = Vec::with_capacity(COMMANDS.len() * 2 + 3);
     for command in COMMANDS {
-        for key in command.keys {
-            bindings.push(KeyBinding::new(
-                key,
-                Act { cmd: command.id },
-                Some(
-                    if command.ctx == "Kite"
-                        && !matches!(
-                            command.id,
-                            cmd::BACK | cmd::SETTINGS | cmd::PALETTE | cmd::ACCOUNT_SWITCHER
-                        )
-                    {
-                        "Kite && !Input"
-                    } else {
-                        command.ctx
-                    },
-                ),
-            ));
+        for key in bound(settings, command) {
+            let act = Act { cmd: command.id };
+            bindings.push(KeyBinding::new(&key, act.clone(), Some(context(command))));
             // Compose fields focus an Input, which binds Enter, Escape and
             // friends at a deeper context. Re-bind at that depth so the field
             // keys win; later bindings win a tie.
             if command.ctx == "KiteCompose" {
                 bindings.push(KeyBinding::new(
-                    key,
-                    Act { cmd: command.id },
+                    &key,
+                    act.clone(),
                     Some("KiteCompose > Input"),
                 ));
             }
@@ -188,14 +700,43 @@ pub fn bind(cx: &mut App) {
                     | cmd::STAR
                     | cmd::TOGGLE_READ
                     | cmd::MOVE
+                    | cmd::TAGS
             ) {
-                bindings.push(KeyBinding::new(
-                    key,
-                    Act { cmd: command.id },
-                    Some("KiteThread"),
-                ));
+                bindings.push(KeyBinding::new(&key, act, Some("KiteThread")));
             }
         }
     }
-    cx.bind_keys(bindings);
+    // The arrows move the selection the way a click-first client expects, in every input mode.
+    // They stay list keys, so reading a long thread still scrolls with the same keys.
+    for (key, id) in [("up", cmd::PREV), ("down", cmd::NEXT)] {
+        bindings.push(KeyBinding::new(key, Act { cmd: id }, Some("KiteList")));
+    }
+    bindings
+}
+
+fn context(command: &Cmd) -> &'static str {
+    if command.ctx == "Kite"
+        && !matches!(
+            command.id,
+            cmd::BACK | cmd::SETTINGS | cmd::PALETTE | cmd::ACCOUNT_SWITCHER
+        )
+    {
+        "Kite && !Input"
+    } else {
+        command.ctx
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
+#[action(namespace = kite, no_json)]
+pub struct Act {
+    pub cmd: u8,
+}
+
+impl Kite {
+    /// Re-applies the keymap after a settings change, so a mode switch or an edited shortcut
+    /// works without a restart.
+    pub(crate) fn rebind(&mut self, cx: &mut App) {
+        bind(cx, &self.settings);
+    }
 }

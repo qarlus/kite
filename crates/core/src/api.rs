@@ -3,24 +3,40 @@
 //! Slow work (account setup, OAuth) is called by the UI from a background executor.
 use crate::model::*;
 use anyhow::Result;
+use std::path::PathBuf;
 
 pub trait Mail: Send + Sync + 'static {
     fn accounts(&self) -> Result<Vec<Account>>;
-    fn add_proton(&self, login: ProtonLogin) -> Result<Account>;
     fn add_microsoft(&self) -> Result<Account>;
     fn remove_account(&self, id: Id) -> Result<()>;
 
-    /// Proton Bridge accounts found on this machine, ready to pass to [`Mail::add_proton`].
-    /// Reads only local files and the OS keychain, so callers must run it off the UI thread.
-    fn discover_proton(&self) -> Result<Vec<ProtonLogin>> {
-        crate::bridge::discover()
+    /// The avatar image file for an account: the user's choice first, then the
+    /// provider's photo. `None` shows initials. Local files only; never blocks.
+    fn avatar(&self, _account: Id) -> Option<PathBuf> {
+        None
+    }
+    /// Replaces the account's chosen avatar with an already-encoded PNG.
+    fn save_avatar(&self, _account: Id, _png: &[u8]) -> Result<()> {
+        anyhow::bail!("Avatars are not available")
+    }
+    /// Removes the chosen avatar; a provider photo, when one exists, takes over.
+    fn remove_avatar(&self, _account: Id) -> Result<()> {
+        anyhow::bail!("Avatars are not available")
+    }
+    /// Changes the display name used as the From name.
+    fn set_account_name(&self, _id: Id, _name: &str) -> Result<()> {
+        anyhow::bail!("Renaming is not available")
     }
 
-    /// Starts Proton Bridge when it is installed, returning whether an install was launched.
-    /// Blocking; callers must run it off the UI thread. Bridge keeps the Proton sign-in itself,
-    /// so a locked Bridge still needs the user in its own window.
-    fn start_proton_bridge(&self) -> Result<bool> {
-        crate::bridge::launch()
+    /// Starts a native Proton sign-in with the account password. Blocking; run off the UI thread.
+    /// The password is used for SRP and key unlock and is never stored.
+    fn proton_sign_in(&self, _email: &str, _password: &str) -> Result<ProtonAuth> {
+        anyhow::bail!("Proton sign-in is not available")
+    }
+    /// Answers the step the previous call returned (2FA code, mailbox password or verification
+    /// token). Blocking; run off the UI thread.
+    fn proton_sign_in_step(&self, _answer: &str) -> Result<ProtonAuth> {
+        anyhow::bail!("No Proton sign-in in progress")
     }
 
     /// Locally known custom folders, with provider identities scoped to their accounts.
@@ -41,8 +57,26 @@ pub trait Mail: Send + Sync + 'static {
     /// Queues to the outbox (due after the undo window or at `send_at`). Returns the outbox id.
     fn send(&self, draft: Draft) -> Result<Id>;
     fn cancel_send(&self, id: Id) -> Result<Option<Draft>>;
+    /// Saves a draft locally at once (it shows in the Drafts mailbox) and queues the provider copy.
+    /// `draft.id: None` creates; `Some` replaces that draft. Returns the draft id.
+    fn save_draft(&self, _draft: Draft) -> Result<Id> {
+        anyhow::bail!("Drafts are not available")
+    }
+    /// The saved draft behind a Drafts-mailbox thread, so compose can reopen it.
+    fn draft(&self, _thread: Id) -> Result<Option<Draft>> {
+        Ok(None)
+    }
+    /// Deletes a saved draft locally and on the provider.
+    fn discard_draft(&self, _id: Id) -> Result<()> {
+        anyhow::bail!("Drafts are not available")
+    }
     fn contacts(&self, query: &str) -> Result<Vec<Addr>>;
     fn open_attachment(&self, id: Id) -> Result<()>;
+    /// One remote image for HTML mail, fetched only when the reader allowed remote images for
+    /// that message. Blocking; call it on the background executor.
+    fn fetch_image(&self, _url: &str) -> Result<Vec<u8>> {
+        anyhow::bail!("Remote images are not available")
+    }
 
     fn splits(&self) -> Result<Vec<Split>>;
     fn set_splits(&self, splits: Vec<Split>) -> Result<()>;
@@ -60,8 +94,14 @@ pub trait Mail: Send + Sync + 'static {
     fn set_ai_key(&self, key: &str) -> Result<()>;
 
     fn calendar_today(&self, account: Id) -> Result<Vec<CalEvent>>;
-    /// Streams `Event::Ai { req, .. }` chunks.
-    fn ai(&self, req: u32, messages: Vec<ChatMsg>) -> Result<()>;
+    /// Streams `Event::Ai { req, .. }` chunks. The engine checks source privacy and builds the
+    /// prompt; callers cannot submit an unscoped prompt containing protected mail.
+    fn ai(&self, req: u32, request: AiRequest) -> Result<()>;
+    /// The free, zero-data-retention models the configured AI endpoint offers. Blocks on the
+    /// network: call it from a background task.
+    fn ai_models(&self) -> Result<Vec<AiModel>> {
+        Ok(Vec::new())
+    }
     fn sync_now(&self);
     /// Engine -> UI notifications. Each call returns a new receiver.
     fn events(&self) -> async_channel::Receiver<Event>;

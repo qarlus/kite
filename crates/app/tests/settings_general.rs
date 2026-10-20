@@ -33,7 +33,7 @@ fn scroll_to_bottom(window: &mut gpui_kit::Window, cx: &mut gpui_kit::App) {
 fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 5);
+    open_section(window, cx, 6);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("remote-images").checked(), Some(false));
@@ -49,7 +49,7 @@ fn remote_images_toggle_persists_and_is_off_by_default(cx: &mut TestAppContext) 
 fn ai_settings_persist_and_the_key_goes_to_the_keychain(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 6);
+    open_section(window, cx, 7);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(
@@ -60,6 +60,9 @@ fn ai_settings_persist_and_the_key_goes_to_the_keychain(cx: &mut TestAppContext)
         window.click("ai-enabled", cx);
         window.render_frame(cx);
         assert_eq!(window.find("ai-enabled").checked(), Some(true));
+        scroll_to_bottom(window, cx);
+        window.click("ai-provider-custom", cx);
+        window.render_frame(cx);
         scroll_to_bottom(window, cx);
         window.click("ai-base-url", cx);
         window.press("secondary-a", cx);
@@ -97,7 +100,7 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 4usize), cx);
+        window.click(("settings-tab", 0usize), cx);
         window.render_frame(cx);
         let page = window.find("settings-page").bounds();
         for seconds in [0, 5, 10, 20, 30] {
@@ -115,11 +118,14 @@ fn the_undo_send_chips_fit_the_minimum_window(cx: &mut TestAppContext) {
 fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture.clone());
-    open_section(window, cx, 6);
+    open_section(window, cx, 7);
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         scroll_to_bottom(window, cx);
         window.click("ai-enabled", cx);
+        window.render_frame(cx);
+        scroll_to_bottom(window, cx);
+        window.click("ai-provider-custom", cx);
         window.render_frame(cx);
         scroll_to_bottom(window, cx);
         window.click("ai-base-url", cx);
@@ -134,5 +140,87 @@ fn typing_in_ai_inputs_never_runs_mail_shortcuts(cx: &mut TestAppContext) {
     assert!(
         fixture.actions().is_empty(),
         "typing in General must never run mail shortcuts"
+    );
+}
+
+#[gpui_kit::test]
+fn the_input_mode_choice_is_shown_and_saved(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    let (window, _) = mount(cx, fixture.clone());
+    open_section(window, cx, 0);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("input-mode-keyboard").selected(),
+            Some(true),
+            "keyboard-first is the default"
+        );
+        window.click("input-mode-classic", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("input-mode-classic").selected(), Some(true));
+        assert_eq!(window.find("input-mode-keyboard").selected(), Some(false));
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().input_mode, "classic");
+}
+
+#[gpui_kit::test]
+fn the_undo_send_window_from_settings_decides_whether_z_still_cancels(cx: &mut TestAppContext) {
+    // Off means send at once: by the time the writer can reach z, the mail is gone.
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    open_section(window, cx, 0);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("undo-send-0", cx);
+        window.render_frame(cx);
+        window.click("close-settings", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(fixture.settings.lock().unwrap().undo_send_secs, 0);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Sent for good", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    assert_eq!(fixture.drafts().len(), 1);
+    cx.background_executor
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(window.into(), "z");
+    assert!(
+        fixture.cancelled().is_empty(),
+        "a zero-second window means the message has already left"
+    );
+}
+
+#[gpui_kit::test]
+fn a_typed_undo_send_window_keeps_the_send_cancellable(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    fixture.settings.lock().unwrap().undo_send_secs = 30;
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("alice@example.com", cx);
+        window.click("compose-body", cx);
+        window.input("Still mine", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    cx.simulate_keystrokes(window.into(), "z");
+    assert_eq!(
+        fixture.cancelled(),
+        vec![9001],
+        "z takes the message back inside the configured window"
     );
 }

@@ -2,6 +2,15 @@
 use serde::{Deserialize, Serialize};
 
 pub type Id = i64;
+/// Reserved local tag: excludes a conversation from Kite's AI helpers.
+pub const PRIVATE_TAG: &str = "Private";
+
+/// The engine builds AI prompts from identified sources, enforcing privacy before reading them.
+#[derive(Clone, Debug)]
+pub enum AiRequest {
+    Summary { thread: Id },
+    Compose { draft: Draft },
+}
 /// Unix epoch milliseconds.
 pub type Ms = i64;
 
@@ -112,15 +121,27 @@ pub enum Action {
     Unstar,
     Read,
     Unread,
-    Snooze { until: Ms },
-    Move { folder: String },
+    Snooze {
+        until: Ms,
+    },
+    Move {
+        folder: String,
+    },
     /// Local-only for now: no remote op is queued. Unknown tag names are an error.
-    Label { tag: String },
-    Unlabel { tag: String },
+    Label {
+        tag: String,
+    },
+    Unlabel {
+        tag: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct Draft {
+    /// The saved draft this edits (from [`crate::api::Mail::save_draft`]). Sending or discarding it
+    /// removes the saved copy locally and on the provider.
+    #[serde(default)]
+    pub id: Option<Id>,
     pub account_id: Id,
     pub to: Vec<Addr>,
     pub cc: Vec<Addr>,
@@ -162,6 +183,15 @@ pub struct CalEvent {
     pub all_day: bool,
 }
 
+/// Per-account extras that are not already on `Account`. Avatar image bytes never
+/// live in settings or SQLite: they are files under `data_dir()/avatars/`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct AccountProfile {
+    /// Plain-text signature for new drafts; empty adds nothing.
+    pub signature: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CustomTheme {
@@ -183,6 +213,17 @@ pub struct Settings {
     pub ai_enabled: bool,
     pub ai_base_url: String,
     pub ai_model: String,
+    /// `"keyboard"`: single-key shortcuts (Superhuman style). `"classic"`: click-first, where only
+    /// modifier shortcuts (Ctrl/Cmd+…) stay bound and actions are shown as buttons.
+    pub input_mode: String,
+    /// User shortcut overrides: command slug -> keystrokes (GPUI syntax). Absent = default keys;
+    /// an empty list unbinds the command.
+    pub shortcuts: std::collections::BTreeMap<String, Vec<String>>,
+    /// `true`: list and reading pane side by side. `false`: an opened conversation takes the
+    /// full width (Superhuman style).
+    pub reading_pane: bool,
+    /// Per-account profile (signature), keyed by account id. Display name is `Account.name`.
+    pub profiles: std::collections::BTreeMap<Id, AccountProfile>,
 }
 
 impl Default for Settings {
@@ -197,18 +238,39 @@ impl Default for Settings {
             load_remote_images: false,
             ai_enabled: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
-            ai_model: "deepseek-v4.1-flash".into(),
+            ai_model: "minimax-m3.1-flash-free".into(),
+            input_mode: "keyboard".into(),
+            shortcuts: Default::default(),
+            reading_pane: true,
+            profiles: Default::default(),
         }
     }
 }
 
+/// The next step of a native Proton sign-in (Proton's API directly, no Bridge; works on free plans).
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct ProtonLogin {
-    pub email: String,
-    pub password: String,
-    pub host: Option<String>,
-    pub imap_port: Option<u16>,
-    pub smtp_port: Option<u16>,
+pub enum ProtonAuth {
+    Done(Account),
+    /// A six-digit code from the user's authenticator app.
+    TwoFactor,
+    /// Two-password mode: the separate mailbox password unlocks the keys.
+    MailboxPassword,
+    /// Proton wants a human-verification challenge solved at `url` (opened in the browser);
+    /// the answer is the verification token.
+    HumanVerification {
+        url: String,
+    },
+}
+
+/// A model the configured AI endpoint offers. Kite only offers free models whose provider keeps
+/// no data (zero data retention), so mail never trains or lingers on a third-party server.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AiModel {
+    /// Sent as the request's `model`.
+    pub id: String,
+    pub name: String,
+    pub free: bool,
+    pub zdr: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

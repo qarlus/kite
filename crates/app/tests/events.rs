@@ -54,3 +54,38 @@ async fn an_error_event_shows_a_toast(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn refresh_button_and_classic_shortcut_request_mail_and_show_feedback(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.settings.lock().unwrap().input_mode = "classic".into();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("refresh-mail", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Refresh requested"));
+    })
+    .unwrap();
+    assert_eq!(
+        fixture.refreshes.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    cx.simulate_keystrokes(window.into(), "ctrl-r");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Refresh requested"));
+        assert!(
+            window
+                .find("refresh-mail")
+                .label()
+                .unwrap()
+                .contains("Refresh mail")
+        );
+    })
+    .unwrap();
+    assert_eq!(
+        fixture.refreshes.load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+}

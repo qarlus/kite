@@ -4,24 +4,70 @@ use crate::app::Kite;
 use crate::theme::{self, RADIUS, RADIUS_SM, Theme};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{Icon, Sizable};
+use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::{ActiveTheme, Icon, IndexPath, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::Settings;
 use std::time::Duration;
 
+/// The faces offered first, in preference order. Only the ones installed are listed.
+const RECOMMENDED: [&str; 21] = [
+    "Segoe UI Variable",
+    "Segoe UI",
+    "Inter",
+    "Aptos",
+    "Calibri",
+    "Arial",
+    "Helvetica Neue",
+    "SF Pro Text",
+    "Roboto",
+    "Open Sans",
+    "Source Sans 3",
+    "IBM Plex Sans",
+    "Georgia",
+    "Cambria",
+    "Charter",
+    "Iowan Old Style",
+    "Source Serif 4",
+    "Cascadia Code",
+    "Consolas",
+    "JetBrains Mono",
+    "SF Mono",
+];
+
 pub struct State {
-    pub font: Entity<InputState>,
+    pub font: Entity<SelectState<FontList>>,
     pub color: Entity<InputState>,
 }
 
 impl State {
     pub fn new(settings: &Settings, window: &mut Window, cx: &mut Context<Kite>) -> Self {
+        let family = settings.font_family.clone();
+        // The installed fonts are read once here: a frame must never touch the platform.
         let font = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("System font")
-                .default_value(settings.font_family.clone())
+            let list = FontList::new(settings, cx);
+            let selected = list.position(&family);
+            SelectState::new(list, selected, window, cx).searchable(true)
         });
+        // Picking a face applies it at once, the way the size stepper does.
+        cx.subscribe_in(
+            &font,
+            window,
+            |kite, _, event: &SelectEvent<FontList>, window, cx| {
+                let SelectEvent::Confirm(Some(family)) = event else {
+                    return;
+                };
+                if *family == kite.settings.font_family {
+                    return;
+                }
+                let mut settings = kite.settings.clone();
+                settings.font_family = family.clone();
+                kite.save_preferences(settings, window, cx);
+            },
+        )
+        .detach();
         let color = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Theme default")
@@ -30,6 +76,215 @@ impl State {
         // The swatch mirrors what is typed, so the page repaints while the field changes.
         cx.observe(&color, |_, _, cx| cx.notify()).detach();
         Self { font, color }
+    }
+}
+
+/// One row of the picker. An empty family is the platform's own UI font.
+#[derive(Clone)]
+pub struct FontChoice {
+    family: String,
+    title: SharedString,
+}
+
+impl FontChoice {
+    fn new(family: &str) -> Self {
+        Self {
+            family: family.to_string(),
+            title: if family.is_empty() {
+                "System default".into()
+            } else {
+                family.into()
+            },
+        }
+    }
+
+    /// The face the row draws itself in, so the list previews every choice.
+    fn face(&self) -> SharedString {
+        if self.family.is_empty() {
+            theme::FONT.into()
+        } else {
+            SharedString::from(self.family.clone())
+        }
+    }
+}
+
+impl SearchableListItem for FontChoice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.title.clone()
+    }
+
+    fn value(&self) -> &String {
+        &self.family
+    }
+
+    fn display_title(&self) -> Option<AnyElement> {
+        Some(
+            div()
+                .font_family(self.face())
+                .child(self.title.clone())
+                .into_any_element(),
+        )
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .id((ElementId::from("font-choice"), self.family.clone()))
+            .test_support()
+            .aria_label(self.title.clone())
+            .font_family(self.face())
+            .child(self.title.clone())
+    }
+}
+
+/// The picker's rows, cached at startup: System default, the saved family when it is
+/// not installed, the installed recommended faces, then every other installed family.
+/// `matched` mirrors the query so a keystroke only re-filters indices instead of
+/// re-reading the system fonts.
+pub struct FontList {
+    groups: Vec<(SharedString, Vec<FontChoice>)>,
+    /// `(group, rows)` of every section the current query keeps, in display order.
+    matched: Vec<(usize, Vec<usize>)>,
+}
+
+impl FontList {
+    fn new(settings: &Settings, cx: &App) -> Self {
+        let installed: Vec<String> = cx
+            .text_system()
+            .all_font_names()
+            .into_iter()
+            // Hidden and vertical ("@face") aliases are not choosable families.
+            .filter(|name| !name.is_empty() && !name.starts_with(['@', '.']))
+            .collect();
+        let has = |wanted: &str| {
+            installed
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(wanted))
+        };
+
+        let recommended: Vec<FontChoice> = RECOMMENDED
+            .into_iter()
+            .filter(|name| has(name))
+            .map(FontChoice::new)
+            .collect();
+        let others: Vec<FontChoice> = installed
+            .iter()
+            .filter(|name| {
+                !RECOMMENDED
+                    .iter()
+                    .any(|face| face.eq_ignore_ascii_case(name))
+            })
+            .map(|name| FontChoice::new(name))
+            .collect();
+
+        // Every group carries a title: the list measures section 0's header once and
+        // reuses that height for every section, so no group may start headerless.
+        let mut groups: Vec<(SharedString, Vec<FontChoice>)> =
+            vec![("Default".into(), vec![FontChoice::new("")])];
+        // A saved family that is no longer installed keeps its own row, never a crash.
+        let saved = settings.font_family.trim();
+        if !saved.is_empty() && !has(saved) {
+            groups.push(("Current".into(), vec![FontChoice::new(saved)]));
+        }
+        groups.push(("Recommended".into(), recommended));
+        groups.push(("All fonts".into(), others));
+
+        let matched = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, items))| !items.is_empty())
+            .map(|(group, (_, items))| (group, (0..items.len()).collect()))
+            .collect();
+        Self { groups, matched }
+    }
+}
+
+impl SearchableListDelegate for FontList {
+    type Item = FontChoice;
+
+    fn sections_count(&self, _: &App) -> usize {
+        self.matched.len()
+    }
+
+    fn items_count(&self, section: usize) -> usize {
+        self.matched.get(section).map_or(0, |(_, rows)| rows.len())
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        let (group, rows) = self.matched.get(ix.section)?;
+        self.groups.get(*group)?.1.get(*rows.get(ix.row)?)
+    }
+
+    fn position<V>(&self, family: &V) -> Option<IndexPath>
+    where
+        Self::Item: SearchableListItem<Value = V>,
+        V: PartialEq,
+    {
+        self.matched
+            .iter()
+            .enumerate()
+            .find_map(|(section, (group, rows))| {
+                let row = rows
+                    .iter()
+                    .position(|row| self.groups[*group].1[*row].value() == family)?;
+                Some(IndexPath::default().section(section).row(row))
+            })
+    }
+
+    fn perform_search(&mut self, query: &str, _: &mut Window, _: &mut App) -> Task<()> {
+        let query = query.trim().to_lowercase();
+        self.matched = self
+            .groups
+            .iter()
+            .enumerate()
+            .filter_map(|(group, (title, items))| {
+                let rows: Vec<usize> = if query.is_empty() || title.to_lowercase().contains(&query)
+                {
+                    (0..items.len()).collect()
+                } else {
+                    items
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, item)| item.matches(&query))
+                        .map(|(row, _)| row)
+                        .collect()
+                };
+                (!rows.is_empty()).then_some((group, rows))
+            })
+            .collect();
+        Task::ready(())
+    }
+
+    fn render_section_header(
+        &self,
+        section: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        let (group, _) = self.matched.get(section)?;
+        let title = self.groups.get(*group)?.0.clone();
+        // The list measures section 0's header once and gives every section's header row
+        // that height. A missing or auto-sized header would therefore be a zero-height
+        // row, painting the next group's label on top of its first item, so this is a
+        // fixed-height block for every group, filtered or not.
+        Some(
+            div()
+                .id(("font-group", section))
+                .test_support()
+                .aria_label(title.to_string())
+                .w_full()
+                .h(px(24.))
+                .flex()
+                .items_center()
+                .px_1()
+                .pt_1()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(cx.theme().muted_foreground.opacity(0.8))
+                .child(SharedString::from(title.to_uppercase()))
+                .into_any_element(),
+        )
     }
 }
 
@@ -227,10 +482,14 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
             )),
         );
 
-    let font_control = div().w(px(220.)).child(
-        Input::new(&page.typography.font)
+    let font_control = div().w(px(220.)).h(px(32.)).child(
+        Select::new(&page.typography.font)
             .id("font-family")
-            .aria_label("Font family"),
+            .accessibility_label("Font family")
+            .placeholder("System default")
+            .search_placeholder("Search fonts")
+            .menu_width(px(260.))
+            .menu_max_h(px(320.)),
     );
 
     let typed = page.typography.color.read(cx).value().trim().to_string();
@@ -275,9 +534,9 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 settings.font_size = 14;
                 this.save_preferences(settings, window, cx);
                 if let Some(page) = &this.preferences {
-                    page.typography
-                        .font
-                        .update(cx, |input, cx| input.set_value("", window, cx));
+                    page.typography.font.update(cx, |select, cx| {
+                        select.set_selected_value(&String::new(), window, cx)
+                    });
                     page.typography
                         .color
                         .update(cx, |input, cx| input.set_value("", window, cx));
@@ -294,7 +553,13 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                         return;
                     };
                     let mut settings = this.settings.clone();
-                    settings.font_family = page.typography.font.read(cx).value().trim().into();
+                    settings.font_family = page
+                        .typography
+                        .font
+                        .read(cx)
+                        .selected_value()
+                        .cloned()
+                        .unwrap_or_default();
                     let color = page.typography.color.read(cx).value().trim().to_string();
                     settings.font_color = (!color.is_empty()).then_some(color);
                     this.save_preferences(settings, window, cx);
@@ -329,7 +594,7 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                         row(
                             t,
                             "Font family",
-                            "Any font installed on this computer. Empty uses the system font.",
+                            "A font installed on this computer, or the system default.",
                             font_control,
                         ),
                         row(

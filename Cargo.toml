@@ -27,9 +27,6 @@ image = { version = "0.25", default-features = false }
 # kite-core network stack. TLS is always the OS stack (native-tls), never rustls.
 tokio = { version = "1", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "native-tls", "stream"] }
-native-tls = "0.2"
-tokio-native-tls = "0.3"
-async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 mail-parser = { version = "0.11", default-features = false }
 mail-builder = { version = "1", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
@@ -38,11 +35,11 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }
-# Proton Bridge vault: AES-256-GCM over msgpack.
-aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-rmp-serde = "1"
-# Win32 credential enumeration for the Bridge vault key (Keyring cannot enumerate).
-windows = "0.62"
+# Native Proton API: SRP (bcrypt + the big-int crate rpgp already links) and OpenPGP bodies.
+bcrypt = { version = "0.19", default-features = false, features = ["std"] }
+num-bigint-dig = { version = "0.8", default-features = false, features = ["std"] }
+pgp = { version = "0.21", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
 
 [profile.dev]
 debug = "line-tables-only"
