@@ -102,12 +102,18 @@ Kite ships with its own Microsoft registration, so this is only for developers w
 
 ### Releasing
 
-Releases are built, signed and published by CI when a version tag is pushed. Bump `version` in the root `Cargo.toml`, commit, then:
+Releases are built, signed and published by CI (`.github/workflows/release.yml`) when a version tag is pushed. The tag must match the version in `Cargo.toml`, and the tag message becomes the release notes.
 
 ```sh
-git tag v0.2.0
-git push origin v0.2.0
+# 1. Bump [workspace.package].version in Cargo.toml, then refresh Cargo.lock:
+cargo check --workspace
+git add Cargo.toml Cargo.lock && git commit -m "Release 0.2.0"
+# 2. Tag and push:
+git tag -a v0.2.0 -m "What's new in 0.2.0"
+git push && git push --tags
 ```
+
+CI publishes `kite-windows-x86_64.exe`, its minisign signature, and `latest.json`, which installed copies of Kite check for updates.
 
 ### Project docs
 
