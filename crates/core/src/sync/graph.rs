@@ -56,15 +56,27 @@ impl Graph {
             self.base_url
         );
         let v = self.get_json(&url, "").await?;
-        let name = v["displayName"].as_str().unwrap_or_default().to_string();
+        // Personal accounts report no `mail` and often no `displayName`: the MSA address
+        // arrives as `userPrincipalName`.
         let email = v["mail"]
             .as_str()
-            .or_else(|| v["userPrincipalName"].as_str())
+            .filter(|s| s.contains('@'))
+            .or_else(|| v["userPrincipalName"].as_str().filter(|s| s.contains('@')))
             .unwrap_or_default()
             .to_string();
         if email.is_empty() {
             bail!("Graph /me returned no address");
         }
+        let name = v["displayName"]
+            .as_str()
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                email.split('@')
+                    .next()
+                    .unwrap_or(email.as_str())
+                    .to_string()
+            });
         Ok((email, name))
     }
 

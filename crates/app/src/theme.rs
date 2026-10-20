@@ -1,8 +1,7 @@
 //! Design tokens from docs/DESIGN.md. The only place colours and sizes are defined.
 use gpui_kit::component::{ActiveTheme as _, Theme as UiTheme, ThemeMode};
 use gpui_kit::{
-    App, Background, Hsla, Rgba, WindowAppearance, checkerboard, linear_color_stop,
-    linear_gradient, px,
+    App, Background, Hsla, Rgba, WindowAppearance, linear_color_stop, linear_gradient, px,
 };
 
 #[derive(Clone, Copy, PartialEq)]
@@ -171,11 +170,6 @@ pub fn panel(t: &Theme) -> Background {
     } else {
         t.bg2.into()
     }
-}
-
-/// A quiet dot texture for the empty reading pane.
-pub fn dots(t: &Theme) -> Background {
-    checkerboard(Theme::alpha(t.fg, 0.05), 3.)
 }
 
 /// The Kite accent glow: the violet→sky gradient, reserved for focus and selection.

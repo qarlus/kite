@@ -1,5 +1,5 @@
 //! Shortcuts: every command with the keys bound right now, and a way to change them.
-use super::{button, card, heading};
+use super::{button, card_dense, heading};
 use crate::app::Kite;
 use crate::keys::{self, Cmd, Group};
 use crate::list::keys_pills;
@@ -74,7 +74,7 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
             .collect();
         if !rows.is_empty() {
             blocks.push(heading(t, group.label(), "").into_any_element());
-            blocks.push(card(t, rows).into_any_element());
+            blocks.push(card_dense(t, rows).into_any_element());
         }
     }
     div()
@@ -89,6 +89,9 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
 }
 
 /// One command: its current keys, a Change action and a Reset action.
+///
+/// In keyboard mode the `<kbd>` pills are the hint, so the row stays one line; the note under
+/// the title only appears while recording or when the command has no key to show.
 fn row(t: Theme, kite: &Kite, command: &'static Cmd, cx: &mut Context<Kite>) -> AnyElement {
     let keys = keys::bound(&kite.settings, command);
     let text = keys.join(" ");
@@ -96,14 +99,19 @@ fn row(t: Theme, kite: &Kite, command: &'static Cmd, cx: &mut Context<Kite>) -> 
         .preferences
         .as_ref()
         .is_some_and(|page| page.shortcuts.recording == Some(command.slug));
-    let shown = if recording {
-        "Press a key".to_string()
-    } else if !text.is_empty() {
-        text.clone()
-    } else if kite.settings.shortcuts.contains_key(command.slug) {
-        "Off".to_string()
+    let overridden = kite.settings.shortcuts.contains_key(command.slug);
+    let note: Option<(&str, bool)> = if recording {
+        Some(("Press a key", true))
+    } else if text.is_empty() && overridden {
+        Some(("Off", false))
+    } else if text.is_empty() {
+        Some(("Not bound in this mode", false))
     } else {
-        "Not bound in this mode".to_string()
+        None
+    };
+    let shown = match note {
+        Some((note, _)) => note.to_string(),
+        None => text.clone(),
     };
     div()
         .id(format!("shortcut-row-{}", command.slug))
@@ -121,12 +129,14 @@ fn row(t: Theme, kite: &Kite, command: &'static Cmd, cx: &mut Context<Kite>) -> 
                 .flex_col()
                 .gap_1()
                 .child(div().text_size(t.px(13.)).child(command.title))
-                .child(
-                    div()
-                        .text_size(t.px(11.))
-                        .text_color(if recording { t.accent } else { t.fg2 })
-                        .child(shown),
-                ),
+                .when_some(note, |d, (note, recording)| {
+                    d.child(
+                        div()
+                            .text_size(t.px(11.))
+                            .text_color(if recording { t.accent } else { t.fg2 })
+                            .child(note),
+                    )
+                }),
         )
         .child(
             div()

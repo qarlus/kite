@@ -5,7 +5,53 @@ use anyhow::{Context, Result, bail};
 use futures_util::StreamExt;
 
 use crate::engine::Inner;
-use crate::model::{ChatMsg, Event, Settings};
+use crate::model::{AiRequest, ChatMsg, Event, Settings};
+use crate::store::Store;
+
+pub(crate) fn prepare(store: &Store, request: &AiRequest) -> Result<Vec<ChatMsg>> {
+    let (system, content) = match request {
+        AiRequest::Summary { thread } => {
+            store.check_ai_thread(*thread)?;
+            let messages = store.thread(*thread)?;
+            let mut text = String::new();
+            for message in messages {
+                text.push_str(&format!(
+                    "Subject: {}\nFrom: {}\n{}\n\n",
+                    message.subject, message.from.email, message.text
+                ));
+            }
+            (
+                "Summarize an email thread in at most four short lines: what the sender wants and what is still open.",
+                text,
+            )
+        }
+        AiRequest::Compose { draft } => {
+            store.check_ai_draft(draft)?;
+            let text = if draft.body.trim().is_empty() {
+                format!("Write a reply to an email about \"{}\".", draft.subject)
+            } else {
+                format!(
+                    "Write a reply to the email below.\n\nSubject: {}\n\n{}",
+                    draft.subject, draft.body
+                )
+            };
+            (
+                "You draft one email reply. Answer with the reply body only: no subject line, no commentary.",
+                text,
+            )
+        }
+    };
+    Ok(vec![
+        ChatMsg {
+            role: "system".into(),
+            content: system.into(),
+        },
+        ChatMsg {
+            role: "user".into(),
+            content,
+        },
+    ])
+}
 
 pub(crate) fn stream(
     settings: &Settings,

@@ -324,7 +324,7 @@ fn reply_quotes_a_display_name_with_a_comma(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn invalid_address_is_rejected_with_an_error_toast(cx: &mut TestAppContext) {
+fn invalid_address_is_rejected_with_field_feedback(cx: &mut TestAppContext) {
     let fixture = Fixture::new(1);
     let (window, _kite) = mount(cx, fixture.clone());
     cx.simulate_keystrokes(window.into(), "c");
@@ -340,8 +340,8 @@ fn invalid_address_is_rejected_with_an_error_toast(cx: &mut TestAppContext) {
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(
-            window.find("toast").label(),
-            Some("Invalid address: not-an-email")
+            window.find("compose-to-error").label(),
+            Some("To: correct the address; use name@example.com or Name <name@example.com>.")
         );
     })
     .unwrap();
@@ -735,7 +735,10 @@ fn sending_with_no_recipients_keeps_the_panel(cx: &mut TestAppContext) {
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("compose").is_some(), "the panel stays open");
-        assert_eq!(window.find("toast").label(), Some("Add a recipient"));
+        assert_eq!(
+            window.find("compose-to-error").label(),
+            Some("Add a recipient in To, Cc or Bcc.")
+        );
     })
     .unwrap();
 }
@@ -886,4 +889,176 @@ fn opening_sent_reads_the_conversation_even_when_it_also_has_a_draft(cx: &mut Te
     update_content(window, &kite, cx, |kite, _, _| {
         assert_eq!(kite.open_id(), Some(thread))
     });
+}
+
+#[gpui_kit::test]
+fn each_invalid_recipient_field_blocks_send_and_send_later_until_corrected(
+    cx: &mut TestAppContext,
+) {
+    for (field, show, error) in [
+        ("compose-to", None, "compose-to-error"),
+        ("compose-cc", Some("compose-show-cc"), "compose-cc-error"),
+        ("compose-bcc", Some("compose-show-bcc"), "compose-bcc-error"),
+    ] {
+        let fixture = Fixture::new(1);
+        let (window, _) = mount(cx, fixture.clone());
+        cx.simulate_keystrokes(window.into(), "c");
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            if field != "compose-to" {
+                window.click("compose-to", cx);
+                window.input("valid@example.com", cx);
+            }
+            if let Some(show) = show {
+                window.click(show, cx);
+            }
+            window.click(field, cx);
+            window.input("Jane <jane@example.com> ignored", cx);
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window.into(), "secondary-enter");
+        cx.simulate_keystrokes(window.into(), "secondary-shift-enter");
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            assert!(
+                window
+                    .find(error)
+                    .label()
+                    .unwrap()
+                    .contains("correct the address")
+            );
+            assert!(
+                window.try_find("snooze").is_none(),
+                "invalid recipients cannot schedule"
+            );
+            assert!(window.try_find("compose").is_some());
+            window.click("compose-send", cx);
+            window.click("compose-send-later", cx);
+        })
+        .unwrap();
+        assert!(
+            fixture.drafts().is_empty(),
+            "every send path is blocked for {field}"
+        );
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click(field, cx);
+            window.press("secondary-a", cx);
+            window.input("\"Doe, Jane\" <jane+tag@example.com>", cx);
+        })
+        .unwrap();
+        cx.simulate_keystrokes(window.into(), "secondary-shift-enter");
+        cx.simulate_keystrokes(window.into(), "enter");
+        let sent = fixture.drafts();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].send_at.is_some());
+        let recipients = match field {
+            "compose-to" => &sent[0].to,
+            "compose-cc" => &sent[0].cc,
+            _ => &sent[0].bcc,
+        };
+        assert_eq!(recipients, &vec![addr("Doe, Jane", "jane+tag@example.com")]);
+    }
+}
+
+#[gpui_kit::test]
+fn compose_docks_expands_and_keeps_actions_inside_a_small_reading_pane(cx: &mut TestAppContext) {
+    cx.update(gpui_kit::init);
+    let fixture = Fixture::new(1);
+    let (window, _) = common::open_window(
+        cx,
+        Some(gpui_kit::size(gpui_kit::px(720.), gpui_kit::px(480.))),
+        |window, cx| cx.new(|cx| kite::app::Kite::new(fixture, window, cx)),
+    );
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-show-cc", cx);
+        window.click("compose-show-bcc", cx);
+        let dock = window.find("compose").bounds();
+        assert!(dock.origin.x >= gpui_kit::px(384.));
+        assert!(dock.bottom_right().x <= gpui_kit::px(720.));
+        assert!(dock.bottom_right().y <= gpui_kit::px(480.));
+        for id in [
+            "compose-send",
+            "compose-send-later",
+            "compose-discard",
+            "compose-expand",
+            "compose-close",
+        ] {
+            let bounds = window.find(id).bounds();
+            assert!(
+                dock.contains(&bounds.origin) && dock.contains(&bounds.bottom_right()),
+                "{id} is inside compose"
+            );
+        }
+        window.click("compose-expand", cx);
+        let expanded = window.find("compose").bounds();
+        assert_eq!(expanded.origin.x, gpui_kit::px(384.));
+        assert_eq!(expanded.bottom_right().x, gpui_kit::px(720.));
+        assert!(expanded.size.height > dock.size.height);
+        assert_eq!(
+            window.find("compose-expand").label(),
+            Some("Collapse compose")
+        );
+        window.click("compose-expand", cx);
+        assert_eq!(window.find("compose").bounds(), dock);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn escaped_display_names_and_quoted_local_parts_send_without_losing_recipients(
+    cx: &mut TestAppContext,
+) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input(
+            r#""Doe \"Jane\", Team" <jane+tag@example.com>; "quoted local"@example.org"#,
+            cx,
+        );
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-enter");
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(
+        sent[0].to,
+        vec![
+            addr("Doe \"Jane\", Team", "jane+tag@example.com"),
+            addr("", r#""quoted local"@example.org"#)
+        ]
+    );
+}
+
+#[gpui_kit::test]
+fn closing_an_incomplete_draft_preserves_recipient_fields(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("unfinished", cx);
+        window.click("compose-show-cc", cx);
+        window.click("compose-cc", cx);
+        window.input("cc@", cx);
+        window.click("compose-show-bcc", cx);
+        window.click("compose-bcc", cx);
+        window.input("bcc@", cx);
+    })
+    .unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click("compose-close", cx);
+    })
+    .unwrap();
+    assert!(fixture.drafts().is_empty());
+    let saved = fixture.saved_drafts();
+    assert_eq!(saved.len(), 1);
+    assert_eq!(saved[0].to, vec![addr("", "unfinished")]);
+    assert_eq!(saved[0].cc, vec![addr("", "cc@")]);
+    assert_eq!(saved[0].bcc, vec![addr("", "bcc@")]);
 }

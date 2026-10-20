@@ -89,8 +89,9 @@ pub trait Mail: Send + Sync + 'static {
     fn set_ai_key(&self, key: &str) -> Result<()>;
 
     fn calendar_today(&self, account: Id) -> Result<Vec<CalEvent>>;
-    /// Streams `Event::Ai { req, .. }` chunks.
-    fn ai(&self, req: u32, messages: Vec<ChatMsg>) -> Result<()>;
+    /// Streams `Event::Ai { req, .. }` chunks. The engine checks source privacy and builds the
+    /// prompt; callers cannot submit an unscoped prompt containing protected mail.
+    fn ai(&self, req: u32, request: AiRequest) -> Result<()>;
     fn sync_now(&self);
     /// Engine -> UI notifications. Each call returns a new receiver.
     fn events(&self) -> async_channel::Receiver<Event>;

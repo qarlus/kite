@@ -45,6 +45,7 @@ pub mod cmd {
     pub const DISCARD: u8 = 58;
     pub const AI_WRITE: u8 = 59;
     pub const AI_SUMMARY: u8 = 60;
+    pub const TAGS: u8 = 61;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -231,6 +232,14 @@ pub static COMMANDS: &[Cmd] = &[
         "KiteList",
         Group::Triage,
         cmd::MOVE,
+    ),
+    c(
+        "tags",
+        "Tag conversation",
+        &["shift-l"],
+        "KiteList",
+        Group::Triage,
+        cmd::TAGS,
     ),
     c(
         "new_folder",
@@ -691,6 +700,7 @@ fn bindings(settings: &Settings) -> Vec<KeyBinding> {
                     | cmd::STAR
                     | cmd::TOGGLE_READ
                     | cmd::MOVE
+                    | cmd::TAGS
             ) {
                 bindings.push(KeyBinding::new(&key, act, Some("KiteThread")));
             }

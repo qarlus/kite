@@ -9,6 +9,7 @@ use crate::list::when;
 use crate::theme::{MAX_COL, RADIUS_SM, Theme};
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::menu::ContextMenuExt as _;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -209,6 +210,7 @@ impl Kite {
             .flex_col()
             .min_h_0()
             .overflow_hidden()
+            .context_menu(crate::tags::popup(cx.entity().downgrade(), vec![open_id]))
             .child(self.thread_toolbar(cx))
             .child(
                 div()

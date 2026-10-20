@@ -139,6 +139,17 @@ fn quiet(
         .child(label.to_string())
 }
 
+/// The Outlook app ID is the registration's Application (client) ID — a GUID. A typo here
+/// only fails inside the browser, so it is checked before sign-in opens.
+fn is_guid(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('-').collect();
+    parts.len() == 5
+        && [8usize, 4, 4, 4, 12]
+            .into_iter()
+            .zip(&parts)
+            .all(|(len, part)| part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn spinner(t: Theme) -> Spinner {
     Spinner::new().with_size(px(15.)).color(t.accent.into())
 }
@@ -412,6 +423,18 @@ impl Kite {
                     .to_string(),
                 None => return,
             };
+            if !id.is_empty() && !is_guid(&id) {
+                if let Some(page) = &mut self.preferences {
+                    page.error = Some(
+                        "The Outlook app ID is the Application (client) ID from the Entra \
+                         app registration — a GUID like 11111111-2222-3333-4444-555555555555, \
+                         not the object ID or a secret."
+                            .into(),
+                    );
+                }
+                cx.notify();
+                return;
+            }
             if id != self.settings.ms_client_id {
                 let mut settings = self.settings.clone();
                 settings.ms_client_id = id;
@@ -779,22 +802,38 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
     connect.push(row(
         t,
         "Microsoft Outlook",
-        "Sign in through your browser. Kite never sees your password.",
+        "Sign in through your browser — Microsoft 365 and personal Outlook.com accounts both work. Kite never sees your password.",
         button("add-microsoft", "Connect Outlook", t)
             .on_click(cx.listener(|this, _, window, cx| this.connect_account(false, window, cx))),
     ));
 
+    let instruction = |text: &'static str| {
+        div()
+            .text_size(t.px(12.))
+            .text_color(t.fg2)
+            .child(text)
+    };
     connect.push(
         div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(
-                div()
-                    .text_size(t.px(12.))
-                    .text_color(t.fg2)
-                    .child("Outlook app ID: the Microsoft Entra app registration Kite signs in as. Leave empty to use the one built into Kite."),
-            )
+            .child(instruction(
+                "Outlook sign-in needs a Microsoft Entra app registration. To create one: \
+                 entra.microsoft.com → App registrations → New registration, then under \
+                 Authentication add a Mobile and desktop redirect URI for http://localhost \
+                 and enable public client flows.",
+            ))
+            .child(instruction(
+                "For a personal Outlook.com mailbox, the registration's supported account \
+                 types must include personal Microsoft accounts — pick \"any organizational \
+                 directory and personal Microsoft accounts\", or \"personal Microsoft accounts \
+                 only\".",
+            ))
+            .child(instruction(
+                "Copy the Application (client) ID here. No client secret is needed. If Kite \
+                 was built with an app ID, this field can stay empty.",
+            ))
             .child(
                 Input::new(&page.connections.ms_client_id)
                     .id("ms-client-id")

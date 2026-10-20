@@ -167,13 +167,23 @@ pub(crate) fn heading(t: Theme, title: &str, description: &str) -> Div {
 
 /// A grouped card: rows separated by hairlines on a raised surface.
 pub(crate) fn card(t: Theme, rows: Vec<AnyElement>) -> Div {
+    card_with(t, rows, true)
+}
+
+/// A denser card for key tables, where a row is one line and does not need the full padding.
+pub(crate) fn card_dense(t: Theme, rows: Vec<AnyElement>) -> Div {
+    card_with(t, rows, false)
+}
+
+fn card_with(t: Theme, rows: Vec<AnyElement>, roomy: bool) -> Div {
     let count = rows.len();
     let mut body = div().flex().flex_col();
     for (ix, row) in rows.into_iter().enumerate() {
         body = body.child(
             div()
                 .w_full()
-                .py_4()
+                .when(roomy, |d| d.py_4())
+                .when(!roomy, |d| d.py_2())
                 .when(ix + 1 < count, |d| d.border_b_1().border_color(t.line))
                 .child(row),
         );

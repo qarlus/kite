@@ -7,8 +7,8 @@ use gpui_kit::{
 };
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action, Addr, Attachment, CalEvent, ChatMsg, Draft, Event, Folder, Id, Mailbox,
-    Message, Ms, ProtonAuth, ProtonLogin, Settings, Split, ThreadSummary, View,
+    Account, Action, Addr, AiRequest, Attachment, CalEvent, Draft, Event, Folder, Id, Mailbox,
+    Message, Ms, ProtonAuth, ProtonLogin, Settings, Split, Tag, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -64,7 +64,9 @@ pub struct Fixture {
     /// The bytes `fetch_image` answers with; a 1x1 PNG unless a test replaces it.
     pub image_bytes: Mutex<Vec<u8>>,
     /// Every `ai` request the UI made, with the prompt it sent.
-    pub ai_requests: Mutex<Vec<(u32, Vec<ChatMsg>)>>,
+    pub ai_requests: Mutex<Vec<(u32, AiRequest)>>,
+    /// The tag list `tags`/`set_tags` keep, mirroring the store's seeded set.
+    pub tags: Mutex<Vec<Tag>>,
     pub settings: Mutex<Settings>,
     /// The AI key the UI handed to `set_ai_key`; never part of `Settings`.
     pub ai_key: Mutex<Option<String>>,
@@ -163,6 +165,18 @@ impl Fixture {
             image_bytes: Mutex::new(PNG.to_vec()),
             refreshes: AtomicI64::new(0),
             ai_requests: Mutex::new(Vec::new()),
+            tags: Mutex::new(
+                ["Newsletter", "To Reply", "Private"]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| Tag {
+                        id: i as Id + 1,
+                        name: name.into(),
+                        color: "#8b7cff".into(),
+                        position: i as i64,
+                    })
+                    .collect(),
+            ),
             settings: Mutex::new(Settings {
                 theme: "dark".into(),
                 ..Settings::default()
@@ -1040,8 +1054,35 @@ impl Mail for Fixture {
         Ok(Vec::new())
     }
 
-    fn ai(&self, req: u32, messages: Vec<ChatMsg>) -> anyhow::Result<()> {
-        self.ai_requests.lock().unwrap().push((req, messages));
+    fn tags(&self) -> anyhow::Result<Vec<Tag>> {
+        Ok(self.tags.lock().unwrap().clone())
+    }
+
+    /// The fixture enforces the store's rule too: Private cannot be left out.
+    fn set_tags(&self, tags: Vec<Tag>) -> anyhow::Result<()> {
+        let mut kept = self.tags.lock().unwrap();
+        anyhow::ensure!(
+            tags.iter().any(|t| t.name.eq_ignore_ascii_case("Private")),
+            "the Private tag cannot be deleted"
+        );
+        let mut next = kept.iter().map(|t| t.id).max().unwrap_or(0) + 1;
+        *kept = tags
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut tag)| {
+                if tag.id <= 0 {
+                    tag.id = next;
+                    next += 1;
+                }
+                tag.position = i as i64;
+                tag
+            })
+            .collect();
+        Ok(())
+    }
+
+    fn ai(&self, req: u32, request: AiRequest) -> anyhow::Result<()> {
+        self.ai_requests.lock().unwrap().push((req, request));
         Ok(())
     }
 

@@ -1140,3 +1140,161 @@ async fn a_permanent_http_send_rejection_is_returned_to_drafts_without_retrying(
     assert_eq!(fake.path("/me/sendMail").len(), 1);
     drop(engine);
 }
+
+// -------------------------------------------------------- personal accounts
+
+/// A personal Microsoft account answers `/me` with no `mail` and often no `displayName`;
+/// the MSA address arrives as `userPrincipalName`.
+#[tokio::test]
+async fn me_reads_a_personal_account_shape() {
+    let fake = Fake::start(|c, _| match c.path.as_str() {
+        "/me" => Reply::json(
+            200,
+            json!({
+                "displayName": "",
+                "mail": null,
+                "userPrincipalName": "karl@outlook.com"
+            }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let mut g = graph(&fake);
+    assert_eq!(
+        g.me().await.unwrap(),
+        ("karl@outlook.com".to_string(), "karl".to_string())
+    );
+    assert!(
+        fake.path("/me")[0]
+            .query_pairs()["$select"]
+            .contains("userPrincipalName")
+    );
+}
+
+/// An empty or malformed `mail` must not suppress the `userPrincipalName` fallback.
+#[tokio::test]
+async fn me_falls_back_when_mail_is_empty_or_malformed() {
+    for body in [
+        json!({ "displayName": "Karl", "mail": "", "userPrincipalName": "karl@live.com" }),
+        json!({ "displayName": "Karl", "mail": "not-an-address", "userPrincipalName": "karl@live.com" }),
+    ] {
+        let fake = Fake::start(move |c, _| match c.path.as_str() {
+            "/me" => Reply::json(200, body.clone()),
+            _ => Reply::empty(404),
+        })
+        .await;
+        let mut g = graph(&fake);
+        assert_eq!(
+            g.me().await.unwrap(),
+            ("karl@live.com".to_string(), "Karl".to_string())
+        );
+    }
+}
+
+/// Token-endpoint failures carry the OAuth code and a hint about the registration fix,
+/// instead of a raw JSON dump.
+#[tokio::test]
+async fn token_errors_name_the_oauth_code_and_hint() {
+    let fake = Fake::start(|c, _| match c.path.as_str() {
+        "/oauth2/v2.0/token" => Reply::json(
+            400,
+            json!({
+                "error": "unauthorized_client",
+                "error_description": "AADSTS700016: Application 'x' was not found.\r\nTrace ID: abc"
+            }),
+        ),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let err = auth::ms_refresh_at(&fake.base, "client-1", "r1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("unauthorized_client"), "{err}");
+    assert!(err.contains("personal Microsoft accounts"), "{err}");
+    assert!(!err.contains("Trace ID"), "{err}");
+}
+
+/// A consent declined (or any error redirect) reports the OAuth error and its description,
+/// both on the loopback page and in the returned error.
+#[tokio::test]
+async fn a_declined_login_reports_the_error_description() {
+    let fake = Fake::start(|_, _| Reply::empty(404)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let authority = fake.base.clone();
+    let task = tokio::spawn(async move {
+        auth::ms_login_at(&authority, "client-1", move |url| {
+            let _ = tx.send(url.to_string());
+        })
+        .await
+    });
+    let authorize = rx.await.unwrap();
+    let url = reqwest::Url::parse(&authorize).unwrap();
+    let query: HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let bounce = format!(
+        "{}/?error=access_denied&error_description={}&state={}",
+        dial(&query["redirect_uri"]),
+        "The%20user%20declined%20consent",
+        query["state"]
+    );
+    let res = reqwest::get(bounce).await.unwrap();
+    assert_eq!(res.status().as_u16(), 400);
+    let page = res.text().await.unwrap();
+    assert!(page.contains("declined consent"), "{page}");
+    let err = task.await.unwrap().unwrap_err().to_string();
+    assert!(err.contains("access_denied"), "{err}");
+    assert!(err.contains("declined consent"), "{err}");
+}
+
+/// Error redirects are state-bound too: a mismatched state wins over the provider error.
+#[tokio::test]
+async fn an_error_redirect_still_requires_the_state() {
+    let fake = Fake::start(|_, _| Reply::empty(404)).await;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let authority = fake.base.clone();
+    let task = tokio::spawn(async move {
+        auth::ms_login_at(&authority, "client-1", move |url| {
+            let _ = tx.send(url.to_string());
+        })
+        .await
+    });
+    let authorize = rx.await.unwrap();
+    let url = reqwest::Url::parse(&authorize).unwrap();
+    let query: HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    let bounce = format!(
+        "{}/?error=access_denied&state=forged",
+        dial(&query["redirect_uri"])
+    );
+    let res = reqwest::get(bounce).await.unwrap();
+    assert_eq!(res.status().as_u16(), 400);
+    let err = task.await.unwrap().unwrap_err().to_string();
+    assert!(err.contains("state mismatch"), "{err}");
+    assert!(!err.contains("access_denied"), "{err}");
+}
+
+/// A non-JSON error body with multi-byte characters is clipped on character
+/// boundaries, never mid-UTF-8-sequence.
+#[tokio::test]
+async fn token_error_bodies_are_clipped_on_character_boundaries() {
+    let long = "é".repeat(300);
+    let fake = Fake::start(move |c, _| match c.path.as_str() {
+        "/oauth2/v2.0/token" => Reply::raw(500, "text/plain", long.clone().into_bytes()),
+        _ => Reply::empty(404),
+    })
+    .await;
+
+    let err = auth::ms_refresh_at(&fake.base, "client-1", "r1")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("é"), "{err}");
+    assert!(err.chars().count() <= 450, "{err}");
+}

@@ -31,7 +31,7 @@ impl Drop for TempFile {
 }
 
 #[gpui_kit::test]
-fn a_short_window_keeps_the_rail_actions_and_switches_accounts_by_keyboard(
+fn a_short_window_keeps_the_settings_cog_and_switches_accounts_by_keyboard(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_kit::init);
@@ -52,10 +52,17 @@ fn a_short_window_keeps_the_rail_actions_and_switches_accounts_by_keyboard(
     );
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        // The window actions stay anchored at the bottom of the rail.
-        let settings = window.find("open-settings").bounds();
-        assert!(settings.bottom() <= px(480.));
-        assert!(settings.origin.y > px(350.));
+        // The cog moved to the top strip, where it is always reachable.
+        let cog = window.find("open-settings").bounds();
+        assert!(
+            cog.bottom() <= px(34.),
+            "the cog sits in the window strip, not the rail"
+        );
+        assert!(
+            window.find("add-account").bounds().bottom() <= px(480.),
+            "the remaining rail actions stay inside a short window"
+        );
+        assert!(window.find("add-account").bounds().origin.y > px(350.));
         // The account menu is a key away in any window size.
         assert!(window.try_find("account-menu").is_none());
     })
@@ -430,7 +437,7 @@ fn theme_tiles_preview_the_native_inbox_four_across_or_two_across(cx: &mut TestA
 }
 
 #[gpui_kit::test]
-fn compact_settings_fit_beside_the_sidebar(cx: &mut TestAppContext) {
+fn compact_settings_use_the_whole_window(cx: &mut TestAppContext) {
     cx.update(gpui_kit::init);
     let (window, _) = open_window(
         cx,
@@ -440,15 +447,19 @@ fn compact_settings_fit_beside_the_sidebar(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        let rail = window.find("sidebar").bounds();
+        assert!(
+            window.try_find("sidebar").is_none(),
+            "settings hides the mail rail and fills the window"
+        );
         let page = window.find("settings-page").bounds();
-        assert!(page.origin.x >= rail.right());
+        assert_eq!(page.origin.x, px(0.));
         assert!(page.right() <= px(720.));
         assert!(window.find("theme-light").bounds().right() <= px(720.));
-        assert!(window.find("open-settings").bounds().bottom() <= px(480.));
+        assert!(window.find("open-settings").bounds().bottom() <= px(34.));
         window.click("close-settings", cx);
         window.render_frame(cx);
         assert!(window.try_find("settings-page").is_none());
+        assert!(window.try_find("sidebar").is_some());
         assert!(window.try_find(("row", 0usize)).is_some());
     })
     .unwrap();
@@ -502,6 +513,14 @@ async fn bridge_errors_clear_the_password_and_require_reentry(cx: &mut TestAppCo
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         window.click(("settings-tab", 3usize), cx);
+        window.render_frame(cx);
+        // The Connections page grew with the Outlook setup copy, so the Bridge button needs
+        // a scroll before it can be clicked.
+        window.scroll(
+            "settings-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(-500.))),
+            cx,
+        );
         window.render_frame(cx);
         window.click("add-proton", cx);
         window.render_frame(cx);

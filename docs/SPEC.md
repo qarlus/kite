@@ -20,6 +20,8 @@ The mailbox picker in the list header offers Inbox, Drafts, Sent, Starred, Snooz
 - **Command palette** (`Cmd/Ctrl+K`): fuzzy search over every command, showing its shortcut.
 - **Instant search** (`/`): local FTS5 with operators `from: to: subject: has:attachment is:unread is:read is:starred is:important is:snoozed is:newsletter before: after:`, plus `-` to negate any term. A comma inside `from:`/`to:` means OR within that term (`from:a.com,b.com`), while two separate terms are ANDed. Results update on each keystroke.
 - **Compose** (`c`), reply (`r`), reply all (`a`), forward (`f`). Plain text with minimal formatting (bold, italic, link, list). `Cmd/Ctrl+Enter` sends. Replying to your own message addresses its original recipients; `Re:`/`Fwd:` prefixes never stack; forwards carry the original header block; sending needs at least one recipient in To, Cc or Bcc.
+
+Compose docks within the reading area and can expand to fill that area. To, Cc and Bcc are editable; field errors block normal and scheduled sends for malformed addresses while incomplete drafts remain saveable. Validation checks supported address syntax, not whether the destination mailbox exists.
 - **Drafts**: compose autosaves 1.5 s after typing stops and on close, showing Saving…/Saved. Drafts sync to the provider's Drafts folder (IMAP `APPEND`, Graph `POST /me/messages`, Proton draft API), reopen from Drafts into compose, and are deleted on the provider once sent. `Cmd/Ctrl+Shift+D` discards.
 - **Undo send**: a 5 s delay window (configurable 0–30 s). `z` or the toast button cancels. This, and send later, are the only way to take a message back: **recall is not possible** (Graph v1.0, IMAP/SMTP and Proton expose no recall), so it is deliberately not offered.
 - **Undo** (`z`) for the last archive/trash/snooze/label action.
@@ -28,6 +30,9 @@ The mailbox picker in the list header offers Inbox, Drafts, Sent, Starred, Snooz
 - **Read status**: not implemented (no tracking pixels, by design).
 - **Calendar sidebar** (Graph accounts only): today's agenda in the right pane, toggled with `Cmd/Ctrl+Shift+C`.
 - **AI (optional, off by default)**: "Write with AI" in compose (`Cmd/Ctrl+J`) and "Summarize thread" (`Shift+S`). This works with any OpenAI-compatible Chat Completions endpoint. The default preset is **OpenCode Go** with `deepseek-v4.1-flash`. Base URL, model and API key are configured in Settings, and the key is stored in the keychain. Responses stream.
+- **Tags**: `Shift+L` (or the palette, or right-click on a row or the open conversation) opens the tag menu: every tag as a checkable item over the conversation or the multi-selection, "New tag…" for a one-off label, and the usual triage actions. Tags paint as a chip on the list row; Private's chip carries a lock.
+
+Conversations tagged **Private** are excluded from Kite's AI helpers: the engine rejects summaries and AI writing from protected saved drafts, replies and forwards before contacting the endpoint ("This conversation is private, so AI can't read it"; subjects count as content). The reserved tag is always present and cannot be renamed or deleted through tag-catalog edits; users can explicitly remove it from a conversation or undo tagging. It is local to Kite and does not control other applications, coding agents with filesystem access, or content manually copied into a new message. Applying it cannot retract a request already sent to an AI service.
 
 Mail sync starts when Kite opens. Native Proton events poll every 25-40 seconds with independent random jitter; Refresh requests sync immediately, at most once every 10 seconds, and never bypasses a provider retry deadline. A send that is permanently rejected or exhausts eight attempts returns to Drafts with an error toast.
 
@@ -50,7 +55,8 @@ Settings › Shortcuts lists every command by group with its current keys. Each 
 | `h` | snooze / remind |
 | `s` | star / flag |
 | `Shift+U` | toggle read / unread |
-| `l` | label / move to folder |
+| `l` | move to folder |
+| `Shift+L` | tag conversation (tag menu) |
 | `x` | select (multi-select, then actions apply to the selection) |
 | `c` | compose |
 | `r` / `a` / `f` | reply / reply all / forward |

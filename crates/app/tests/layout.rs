@@ -191,7 +191,9 @@ fn without_the_reading_pane_a_conversation_takes_the_whole_window(cx: &mut TestA
 }
 
 #[gpui_kit::test]
-fn the_settings_cog_replaces_the_mail_and_escape_restores_it(cx: &mut TestAppContext) {
+fn the_settings_cog_opens_settings_over_the_whole_window_and_escape_restores_mail(
+    cx: &mut TestAppContext,
+) {
     let (window, _) = mount(cx, Fixture::showcase());
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
@@ -199,8 +201,13 @@ fn the_settings_cog_replaces_the_mail_and_escape_restores_it(cx: &mut TestAppCon
         window.render_frame(cx);
         assert!(window.try_find("settings-page").is_some());
         assert!(
-            window.try_find("sidebar").is_some(),
-            "the rail stays, with the cog selected"
+            window.try_find("sidebar").is_none(),
+            "settings takes the whole window, with no mail rail"
+        );
+        assert_eq!(
+            window.find("settings-page").bounds().origin.x,
+            px(0.),
+            "settings starts at the window's left edge"
         );
         assert_eq!(window.find("open-settings").selected(), Some(true));
         assert!(
@@ -215,6 +222,7 @@ fn the_settings_cog_replaces_the_mail_and_escape_restores_it(cx: &mut TestAppCon
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert!(window.try_find("settings-page").is_none());
+        assert!(window.try_find("sidebar").is_some());
         assert!(window.try_find("mailbox-picker").is_some());
         assert!(window.try_find(("row", 0usize)).is_some());
         assert_eq!(window.find("open-settings").selected(), Some(false));

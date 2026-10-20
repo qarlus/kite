@@ -8,6 +8,7 @@ pub mod palette;
 pub mod preferences;
 pub mod sidebar;
 pub mod snooze;
+pub mod tags;
 pub mod theme;
 pub mod thread;
 
@@ -33,7 +34,10 @@ gpui_kit::assets::icon_assets!(
         MailOpen,
         X,
         SquarePen,
-        RefreshCw
+        RefreshCw,
+        Lock,
+        Plus,
+        Tag
     ]
 );
 

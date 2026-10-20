@@ -647,12 +647,13 @@ fn starter_tags_are_seeded_in_order() {
             "Notification",
             "Cold Email",
             "Team",
-            "Urgent"
+            "Urgent",
+            "Private"
         ]
     );
     assert_eq!(
         tags.iter().map(|t| t.position).collect::<Vec<_>>(),
-        (0..8).collect::<Vec<_>>()
+        (0..9).collect::<Vec<_>>()
     );
     let colors: std::collections::HashSet<&str> = tags.iter().map(|t| t.color.as_str()).collect();
     assert_eq!(
@@ -700,7 +701,8 @@ fn a_database_from_before_tags_migrates_and_seeds_tags() {
                 "Notification",
                 "Cold Email",
                 "Team",
-                "Urgent"
+                "Urgent",
+                "Private"
             ]
         );
         let rows = s.threads(&view(Mailbox::Inbox), 0, 50)?;
@@ -1175,7 +1177,10 @@ fn removing_an_account_cascades_tag_memberships_but_keeps_tags() {
             conn.query_row("SELECT COUNT(*) FROM thread_tags", [], |r| r.get(0))?;
         let tags: i64 = conn.query_row("SELECT COUNT(*) FROM tags", [], |r| r.get(0))?;
         assert_eq!(memberships, 0);
-        assert_eq!(tags, 8, "tags are global, not account-owned");
+        assert_eq!(
+            tags, 9,
+            "tags, including Private, are global, not account-owned"
+        );
         Ok::<(), anyhow::Error>(())
     })();
     cleanup(&path);
@@ -2682,7 +2687,7 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        7
+        8
     );
     assert!(
         !connection
@@ -2713,4 +2718,64 @@ fn outbox_retries_back_off_in_minutes_and_stop_after_eight_attempts() {
     assert!(s.outbox_failed(id, at, false, None).unwrap().0);
     assert_eq!(s.outbox_cancel(id).unwrap().unwrap().body, "keep this");
     assert!(s.outbox_due(i64::MAX).unwrap().is_empty());
+}
+
+#[test]
+fn the_private_tag_cannot_be_deleted_or_renamed_but_leaves_a_thread() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.apply_deltas(a.id, &[up(msg("1", "a@a.com", "Hi", D0))])
+        .unwrap();
+    let tid = thread_id(&s, "Hi");
+
+    // Label the thread, then try to drop Private from the tag list: it stays.
+    s.act(
+        &[tid],
+        &Action::Label {
+            tag: "Private".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(labels_of(&s, tid), vec!["Private"]);
+    let without: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .filter(|t| t.name != "Private")
+        .collect();
+    s.set_tags(without).unwrap();
+    assert!(
+        s.tags().unwrap().iter().any(|t| t.name == "Private"),
+        "Private is always present"
+    );
+    assert_eq!(
+        labels_of(&s, tid),
+        vec!["Private"],
+        "its membership survives too"
+    );
+
+    // Renaming it is refused outright.
+    let renamed: Vec<Tag> = s
+        .tags()
+        .unwrap()
+        .into_iter()
+        .map(|mut t| {
+            if t.name == "Private" {
+                t.name = "Secret".into()
+            }
+            t
+        })
+        .collect();
+    assert!(s.set_tags(renamed).is_err(), "Private cannot be renamed");
+    assert!(s.tags().unwrap().iter().any(|t| t.name == "Private"));
+
+    // Removing it from the thread is fine; only the tag itself is protected.
+    s.act(
+        &[tid],
+        &Action::Unlabel {
+            tag: "Private".into(),
+        },
+    )
+    .unwrap();
+    assert!(labels_of(&s, tid).is_empty());
 }

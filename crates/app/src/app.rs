@@ -4,7 +4,7 @@
 //! so every keystroke paints from local state on the same frame.
 use crate::keys::{self, Act, GO_MAILBOXES, cmd};
 use crate::theme::{self, MAX_COL, RADIUS_SM, STRIP_H, Theme};
-use crate::{compose, folders, palette, snooze, thread};
+use crate::{compose, folders, palette, snooze, tags, thread};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -14,7 +14,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action as MailAction, ChatMsg, Event, Folder, Id, Mailbox, Message, Settings,
+    Account, Action as MailAction, AiRequest, Event, Folder, Id, Mailbox, Message, Settings,
     ThreadSummary, View,
 };
 use std::cell::RefCell;
@@ -108,6 +108,10 @@ pub enum Overlay {
     Accounts(usize),
     /// The mailbox picker behind the list header's title, by row.
     Mailboxes(usize),
+    /// The tag/action menu the keyboard opens (`Shift+L`); right-click uses a popup instead.
+    Tags(tags::TagMenu),
+    /// The "New tag…" name field, with the conversations it will apply to.
+    NewTag(tags::NewTag),
 }
 
 /// Which pane the keyboard is working in: the list, or the open conversation beside it.
@@ -806,6 +810,7 @@ impl Kite {
                 cx.notify();
             }
             cmd::MOVE => self.show_move(window, cx),
+            cmd::TAGS => self.show_tag_menu(window, cx),
             cmd::AI_WRITE => self.ai_write(cx),
             cmd::AI_SUMMARY => self.ai_summary(cx),
             cmd::CREATE_FOLDER => self.show_create_folder(window, cx),
@@ -876,8 +881,9 @@ impl Kite {
     // ---- AI --------------------------------------------------------------------
 
     /// One AI answer, shared by "Write with AI" and "Summarize thread". The engine owns the
-    /// endpoint and model from Settings and streams the answer back as `Event::Ai`.
-    fn ai_request(&mut self, id: u8, target: AiFor, prompt: Vec<ChatMsg>, cx: &mut Context<Self>) {
+    /// prompt, the endpoint and the model, so it — not the UI — decides what may leave the
+    /// machine. It refuses Private conversations and streams the answer back as `Event::Ai`.
+    fn ai_request(&mut self, id: u8, target: AiFor, request: AiRequest, cx: &mut Context<Self>) {
         if !self.settings.ai_enabled {
             self.toast("AI is off. Turn it on in Settings › AI.", cx);
             return;
@@ -888,7 +894,7 @@ impl Kite {
         }
         self.seq += 1;
         let req = self.seq as u32;
-        match self.mail.ai(req, prompt) {
+        match self.mail.ai(req, request) {
             Ok(()) => {
                 self.ai = Some(Ai {
                     req,
@@ -903,57 +909,28 @@ impl Kite {
         cx.notify();
     }
 
-    /// Cmd/Ctrl+J in compose: draft the reply from the subject and what is written so far.
+    /// Cmd/Ctrl+J in compose: the engine writes from the draft, refusing when the draft
+    /// answers a Private conversation.
     fn ai_write(&mut self, cx: &mut Context<Self>) {
         let Some(compose) = &self.compose else {
             self.toast("Open compose first", cx);
             return;
         };
-        let subject = compose.subject.read(cx).value().to_string();
-        let body = compose.body.read(cx).value().to_string();
-        let ask = if body.trim().is_empty() {
-            format!("Write a reply to an email about \"{subject}\".")
-        } else {
-            format!("Write a reply to the email below.\n\nSubject: {subject}\n\n{body}")
+        let request = AiRequest::Compose {
+            draft: compose.draft(cx),
         };
-        let prompt = vec![
-            ChatMsg {
-                role: "system".into(),
-                content: "You draft one email reply. Answer with the reply body only: no subject line, no commentary.".into(),
-            },
-            ChatMsg {
-                role: "user".into(),
-                content: ask,
-            },
-        ];
-        self.ai_request(cmd::AI_WRITE, AiFor::Compose, prompt, cx);
+        self.ai_request(cmd::AI_WRITE, AiFor::Compose, request, cx);
     }
 
-    /// Shift+S in the reading pane: summarize the open conversation.
+    /// Shift+S in the reading pane: summarize the open conversation — unless it is Private.
     fn ai_summary(&mut self, cx: &mut Context<Self>) {
         let Some(open) = &self.open else {
             self.toast("Open a conversation first", cx);
             return;
         };
         let id = open.id;
-        let mut thread = format!("Subject: {}\n\n", open.subject);
-        for message in &open.messages {
-            thread.push_str(&format!(
-                "From: {}\n{}\n\n",
-                message.from.email, message.text
-            ));
-        }
-        let prompt = vec![
-            ChatMsg {
-                role: "system".into(),
-                content: "Summarize an email thread in at most four short lines: what the sender wants and what is still open.".into(),
-            },
-            ChatMsg {
-                role: "user".into(),
-                content: thread,
-            },
-        ];
-        self.ai_request(cmd::AI_SUMMARY, AiFor::Summary(id), prompt, cx);
+        let request = AiRequest::Summary { thread: id };
+        self.ai_request(cmd::AI_SUMMARY, AiFor::Summary(id), request, cx);
     }
 
     fn action(&mut self, action: &Act, window: &mut Window, cx: &mut Context<Self>) {
@@ -1053,6 +1030,33 @@ impl Kite {
                 cx.notify();
                 cx.stop_propagation();
             }
+            Overlay::Tags(menu) => {
+                let last = menu.items.len().saturating_sub(1);
+                match key {
+                    "escape" => self.overlay = Overlay::None,
+                    "up" => menu.selected = menu.selected.saturating_sub(1),
+                    "down" => menu.selected = (menu.selected + 1).min(last),
+                    "enter" => {
+                        let index = menu.selected;
+                        self.activate_tag_item(index, window, cx);
+                    }
+                    _ => {}
+                }
+                cx.notify();
+                cx.stop_propagation();
+            }
+            Overlay::NewTag(_) => match key {
+                "escape" => {
+                    self.close_overlay(cx);
+                    window.focus(&self.focus, cx);
+                    cx.stop_propagation();
+                }
+                "enter" => {
+                    self.create_tag(cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
             Overlay::CreateFolder(dialog) => match key {
                 "up" | "down" if !dialog.busy && !self.accounts.is_empty() => {
                     let current = self
@@ -1246,9 +1250,10 @@ impl Kite {
     }
 
     /// The window's top strip: the drag region, then the window controls where the OS draws none.
-    fn window_strip(&self, window: &Window) -> AnyElement {
+    fn window_strip(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let pane = self.settings.reading_pane && self.preferences.is_none();
+        let settings_open = self.preferences.is_some();
         let panel = theme::panel(&t);
         let wide = if pane {
             crate::sidebar::list_width(window)
@@ -1282,6 +1287,30 @@ impl Kite {
                         })
                     })
                     .on_double_click(|_, window, _| window.titlebar_double_click()),
+            )
+            .child(
+                div()
+                    .id("open-settings")
+                    .test_support()
+                    .aria_label("Settings")
+                    .aria_selected(settings_open)
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size(px(STRIP_H - 8.))
+                    .mr_1()
+                    .rounded(px(RADIUS_SM))
+                    .cursor_pointer()
+                    .text_color(if settings_open { t.fg } else { t.fg2 })
+                    .when(settings_open, |d| d.bg(Theme::alpha(t.fg, 0.1)))
+                    .when(!settings_open, |d| {
+                        d.hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
+                    })
+                    .child(Icon::new(IconName::Settings).with_size(px(15.)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_settings(window, cx)
+                    })),
             )
             .child(self.window_controls(window))
             .into_any_element()
@@ -1442,7 +1471,7 @@ impl Kite {
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(theme::dots(&t))
+            .bg(t.bg)
             .child(
                 Icon::new(IconName::Inbox)
                     .with_size(px(22.))
@@ -1880,7 +1909,7 @@ impl Render for Kite {
                 .flex()
                 .flex_col()
                 .bg(self.theme.bg)
-                .child(self.window_strip(window))
+                .child(self.window_strip(window, cx))
                 .child(
                     div()
                         .id("body")
@@ -1902,7 +1931,7 @@ impl Render for Kite {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(self.window_strip(window))
+                .child(self.window_strip(window, cx))
                 .child(
                     div()
                         .id("body")
@@ -1923,7 +1952,7 @@ impl Render for Kite {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(self.window_strip(window))
+                .child(self.window_strip(window, cx))
                 .child(
                     div()
                         .id("body")
@@ -1945,7 +1974,7 @@ impl Render for Kite {
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .child(self.window_strip(window))
+                .child(self.window_strip(window, cx))
                 .child(
                     div()
                         .id("body")
@@ -1971,14 +2000,17 @@ impl Render for Kite {
             .key_context("Kite")
             .on_key_down(cx.listener(Self::key_down))
             .on_action(cx.listener(Self::action))
-            .children(self.sidebar.as_ref().map(|sidebar| {
-                sidebar.clone().cached(
-                    StyleRefinement::default()
-                        .w(px(crate::sidebar::RAIL_W))
-                        .h_full()
-                        .flex_shrink_0(),
-                )
-            }))
+            // Settings takes the whole window, so the mail rail steps aside there.
+            .when(!preferences_open, |d| {
+                d.children(self.sidebar.as_ref().map(|sidebar| {
+                    sidebar.clone().cached(
+                        StyleRefinement::default()
+                            .w(px(crate::sidebar::RAIL_W))
+                            .h_full()
+                            .flex_shrink_0(),
+                    )
+                }))
+            })
             .child(content)
             .children(self.render_compose(window, cx))
             .children(self.render_overlay(window, cx))
@@ -2000,6 +2032,7 @@ impl Kite {
             Overlay::Palette(_) => Some(palette::render(self, window, cx)),
             Overlay::Snooze(_) => Some(snooze::render(self, window, cx)),
             Overlay::Move(_) | Overlay::CreateFolder(_) => Some(folders::render(self, window, cx)),
+            Overlay::Tags(_) | Overlay::NewTag(_) => Some(tags::render(self, window, cx)),
         }
     }
 }

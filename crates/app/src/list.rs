@@ -5,6 +5,7 @@ use crate::theme::{RADIUS, RADIUS_SM, ROW_H, Theme};
 use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::menu::ContextMenuExt;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -498,16 +499,31 @@ fn row_element(
                                         .child(row.subject.clone()),
                                 )
                                 .children(row.labels.iter().take(1).map(|label| {
+                                    let private =
+                                        label.eq_ignore_ascii_case(kite_core::model::PRIVATE_TAG);
                                     div()
+                                        .id(("row-tag", ix))
+                                        .test_support()
+                                        .aria_label(format!("Tag: {label}"))
                                         .max_w(px(120.))
                                         .min_w_0()
                                         .flex_shrink_0()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
                                         .truncate()
                                         .px_2()
                                         .rounded(px(RADIUS_SM))
                                         .bg(t.bg3)
                                         .text_size(t.px(11.))
                                         .text_color(t.fg2)
+                                        .when(private, |d| {
+                                            d.child(
+                                                Icon::new(IconName::Lock)
+                                                    .with_size(px(10.))
+                                                    .text_color(t.fg2),
+                                            )
+                                        })
                                         .child(label.clone())
                                 }))
                                 .when(row.attachments, |d| {
@@ -565,6 +581,33 @@ fn row_element(
             window.focus(&this.focus, cx);
             this.open_thread(cx);
         }))
+        // A right-click picks the row unless it is part of the multi-selection, which the
+        // menu then acts on — the way desktop clients treat a secondary click.
+        .on_mouse_down(MouseButton::Right, cx.listener(move |this, _, window, cx| {
+            if !this.multi.contains(&row_id) {
+                this.multi.clear();
+                this.sel = ix;
+            }
+            window.focus(&this.focus, cx);
+            cx.notify();
+        }))
+        .context_menu({
+            let entity = cx.entity().downgrade();
+            move |menu, window, cx| {
+                let ids = entity
+                    .upgrade()
+                    .map(|kite| {
+                        let state = kite.read(cx);
+                        if state.multi.contains(&row_id) {
+                            state.multi.clone()
+                        } else {
+                            vec![row_id]
+                        }
+                    })
+                    .unwrap_or_else(|| vec![row_id]);
+                crate::tags::popup_with(entity.clone(), ids, menu, window, cx)
+            }
+        })
         .into_any_element()
 }
 

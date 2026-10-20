@@ -164,6 +164,54 @@ fn the_cheat_sheet_shows_the_keys_that_are_actually_bound(cx: &mut TestAppContex
 }
 
 #[gpui_kit::test]
+fn keyboard_mode_keeps_each_shortcut_row_to_a_single_line(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    let (window, _) = mount_tall(cx, fixture);
+    open_shortcuts(window, cx);
+    cx.update_window(window.into(), |_, window, _| {
+        let row = window.find("shortcut-row-mark_done");
+        assert_eq!(row.label(), Some("Mark done: e"));
+        // The key is shown once, as a pill beside the actions. A repeated key line would stack
+        // title (19.5px) + note (16.5px) and outgrow the shared 35.5px Change/Reset button.
+        let height = row.bounds().size.height;
+        assert!(
+            height <= px(36.),
+            "the row is button-high, not two lines: {height}"
+        );
+        // The dense card trims the shared 16px row padding to 8px, so consecutive rows sit
+        // closer than the roomy 67.5px they would at full padding.
+        let next = window.find("shortcut-row-move_to_inbox");
+        let pitch = next.bounds().origin.y - row.bounds().origin.y;
+        assert!(
+            pitch < px(60.),
+            "shortcut rows keep the dense card spacing: {pitch}"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn classic_mode_explains_rows_that_have_no_key_instead_of_a_dead_pill(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    fixture.settings.lock().unwrap().input_mode = "classic".into();
+    let (window, _) = mount_tall(cx, fixture);
+    open_shortcuts(window, cx);
+    cx.update_window(window.into(), |_, window, _| {
+        assert_eq!(
+            window.find("shortcut-row-mark_done").label(),
+            Some("Mark done: Not bound in this mode"),
+            "a single-key command names why it has no key"
+        );
+        assert_eq!(
+            window.find("shortcut-row-palette").label(),
+            Some("Command palette: secondary-k"),
+            "a modifier chord keeps its key"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
 fn text_fields_still_edit_after_the_keymap_is_rebuilt(cx: &mut TestAppContext) {
     let fixture = Fixture::new(3);
     let (window, _) = mount_tall(cx, fixture);

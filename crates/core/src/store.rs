@@ -332,6 +332,28 @@ impl Store {
             tx.execute_batch("DROP INDEX IF EXISTS messages_subject; PRAGMA user_version=7")?;
             tx.commit()?;
         }
+        if version < 8 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(
+                "CREATE TABLE IF NOT EXISTS draft_tags (
+                draft_id INTEGER NOT NULL REFERENCES drafts(id) ON DELETE CASCADE,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY(draft_id, tag_id)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS sent_tags (
+                account_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                identity TEXT NOT NULL,
+                tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                PRIMARY KEY(account_id, identity, tag_id)
+            ) WITHOUT ROWID; PRAGMA user_version=8",
+            )?;
+            tx.commit()?;
+        }
+        conn.execute(
+            "INSERT OR IGNORE INTO tags(name, color, position)
+             VALUES (?1, '#64748b', (SELECT COALESCE(MAX(position), -1) + 1 FROM tags))",
+            [PRIVATE_TAG],
+        )?;
         migrate_split_defaults(&conn)?;
         Ok(Store { conn })
     }
@@ -626,7 +648,28 @@ impl Store {
                     if m.mailbox == Mailbox::Drafts && is_our_draft(&tx, account_id, m)? {
                         continue;
                     }
-                    touched.insert(upsert_message(&tx, account_id, &account_email, m)?);
+                    let thread = upsert_message(&tx, account_id, &account_email, m)?;
+                    for identity in [
+                        m.message_id
+                            .as_deref()
+                            .map(|id| format!("m:{}", bare_msg_id(id).to_ascii_lowercase())),
+                        Some(format!("r:{}", m.remote_id)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        tx.execute(
+                            "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+                            SELECT ?1, tag_id FROM sent_tags WHERE account_id=?2 AND identity=?3",
+                            params![thread, account_id, identity],
+                        )?;
+                        tx.execute(
+                            "DELETE FROM sent_tags WHERE account_id=?1 AND identity=?2",
+                            params![account_id, identity],
+                        )?;
+                    }
+                    refresh_labels(&tx, thread)?;
+                    touched.insert(thread);
                     continue;
                 }
                 Delta::Metadata { remote_id, .. }
@@ -2019,6 +2062,17 @@ impl Store {
         Ok(remote.map(|remote| (account, remote)))
     }
 
+    /// Persist before transmission so tags survive a successful send followed by delayed sync
+    /// or restart. Proton additionally supplies its exact provider identity after sending.
+    pub fn remember_sent_tags(&self, draft: Id, account: Id, identity: &str) -> Result<()> {
+        self.conn.execute("INSERT OR IGNORE INTO sent_tags(account_id, identity, tag_id)
+            SELECT ?1, ?2, dt.tag_id FROM draft_tags dt JOIN drafts d ON d.id=dt.draft_id
+            WHERE d.id=?3 AND d.account_id=?1
+            UNION SELECT ?1, ?2, tt.tag_id FROM thread_tags tt JOIN drafts d ON d.thread_id=tt.thread_id
+            WHERE d.id=?3 AND d.account_id=?1", params![account, identity, draft])?;
+        Ok(())
+    }
+
     /// Queues a provider-side draft op now. `draft` links a `SaveDraft` to the row that learns its
     /// new remote id once the backend reports it.
     pub fn draft_op(&self, account: Id, op: &Op, draft: Option<Id>) -> Result<()> {
@@ -2105,6 +2159,11 @@ fn hide_draft_row(tx: &Transaction, id: Id) -> Result<()> {
         .optional()?;
     if let Some(Some(thread)) = thread {
         tx.execute(
+            "INSERT OR IGNORE INTO draft_tags(draft_id, tag_id)
+            SELECT ?1, tag_id FROM thread_tags WHERE thread_id=?2",
+            params![id, thread],
+        )?;
+        tx.execute(
             "DELETE FROM messages WHERE remote_id=?1 AND account_id=(SELECT account_id FROM drafts WHERE id=?2)",
             params![draft_row_id(id), id],
         )?;
@@ -2132,6 +2191,13 @@ fn restore_draft_row(tx: &Transaction, id: Id) -> Result<()> {
         |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
     )?;
     let thread = insert_draft_message(tx, id, &draft, &name, &email, &msg_id)?;
+    tx.execute(
+        "INSERT OR IGNORE INTO thread_tags(thread_id, tag_id)
+        SELECT ?1, tag_id FROM draft_tags WHERE draft_id=?2",
+        params![thread, id],
+    )?;
+    tx.execute("DELETE FROM draft_tags WHERE draft_id=?1", [id])?;
+    refresh_labels(tx, thread)?;
     tx.execute(
         "UPDATE drafts SET thread_id=?1 WHERE id=?2",
         params![thread, id],
@@ -2389,9 +2455,111 @@ impl Store {
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Missing sources fail closed, so stale UI state cannot authorize an AI request.
+    pub fn check_ai_thread(&self, thread: Id) -> Result<()> {
+        self.check_ai_thread_path(thread, &mut HashSet::new())
+    }
+
+    fn check_ai_thread_path(&self, thread: Id, path: &mut HashSet<Id>) -> Result<()> {
+        if !path.insert(thread) || path.len() > 100 {
+            bail!("The AI source has circular or excessive draft references");
+        }
+        let private: Option<bool> = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM thread_tags tt JOIN tags t ON t.id=tt.tag_id
+             WHERE tt.thread_id=threads.id AND t.name=?2 COLLATE NOCASE)
+             FROM threads WHERE id=?1",
+                params![thread, PRIVATE_TAG],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match private {
+            Some(false) => {}
+            Some(true) => bail!("This conversation is private, so AI can't read it"),
+            None => bail!("The AI source conversation is no longer available"),
+        }
+        let mut statement = self
+            .conn
+            .prepare("SELECT draft FROM drafts WHERE thread_id=?1")?;
+        let drafts = statement
+            .query_map([thread], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for raw in drafts {
+            let draft: Draft = serde_json::from_str(&raw).context("AI draft source")?;
+            self.check_ai_reply(&draft, path)?;
+        }
+        path.remove(&thread);
+        Ok(())
+    }
+
+    fn check_ai_reply(&self, draft: &Draft, path: &mut HashSet<Id>) -> Result<()> {
+        if let Some(message) = draft.reply_to {
+            let thread: Id = self
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM messages WHERE id=?1 AND account_id=?2",
+                    params![message, draft.account_id],
+                    |r| r.get(0),
+                )
+                .context("The AI reply source is no longer available")?;
+            self.check_ai_thread_path(thread, path)?;
+        }
+        Ok(())
+    }
+
+    pub fn check_ai_draft(&self, draft: &Draft) -> Result<()> {
+        self.check_ai_reply(draft, &mut HashSet::new())?;
+        if let Some(id) = draft.id {
+            let private: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM draft_tags dt
+                JOIN tags t ON t.id=dt.tag_id WHERE dt.draft_id=?1 AND t.name=?2 COLLATE NOCASE)",
+                params![id, PRIVATE_TAG],
+                |r| r.get(0),
+            )?;
+            if private {
+                bail!("This draft is private, so AI can't read it");
+            }
+            // A draft not yet linked to a conversation has no thread to protect.
+            let thread: Option<Id> = self
+                .conn
+                .query_row(
+                    "SELECT thread_id FROM drafts WHERE id=?1 AND account_id=?2",
+                    params![id, draft.account_id],
+                    |r| r.get(0),
+                )
+                .context("The AI draft is no longer available")?;
+            if let Some(thread) = thread {
+                self.check_ai_thread(thread)?;
+            }
+            let raw: String = self.conn.query_row(
+                "SELECT draft FROM drafts WHERE id=?1 AND account_id=?2",
+                params![id, draft.account_id],
+                |r| r.get(0),
+            )?;
+            let saved: Draft = serde_json::from_str(&raw).context("AI saved draft")?;
+            self.check_ai_reply(&saved, &mut HashSet::new())?;
+        }
+        Ok(())
+    }
+
     /// Replaces the whole list. List order is the display order; ids <= 0 create, omitted tags are
     /// deleted (cascading out of every thread). Validation happens before any write.
-    pub fn set_tags(&self, tags: Vec<Tag>) -> Result<()> {
+    pub fn set_tags(&self, mut tags: Vec<Tag>) -> Result<()> {
+        // A tag-list edit must never silently remove protection from existing conversations.
+        if let Some(private) = self
+            .tags()?
+            .into_iter()
+            .find(|t| t.name.eq_ignore_ascii_case(PRIVATE_TAG))
+        {
+            if let Some(tag) = tags.iter().find(|t| t.id == private.id) {
+                if !tag.name.eq_ignore_ascii_case(PRIVATE_TAG) {
+                    bail!("The Private tag cannot be renamed");
+                }
+            } else {
+                tags.push(private);
+            }
+        }
         let mut desired: Vec<(Option<Id>, String, String)> = Vec::with_capacity(tags.len());
         let mut seen: HashSet<String> = HashSet::new();
         for t in tags {

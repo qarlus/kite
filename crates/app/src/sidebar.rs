@@ -133,7 +133,6 @@ pub(crate) struct Sidebar {
     view: View,
     theme: Theme,
     parent: WeakEntity<Kite>,
-    settings_open: bool,
 }
 
 impl Sidebar {
@@ -150,7 +149,6 @@ impl Sidebar {
             view: kite.view.clone(),
             theme: kite.theme,
             parent,
-            settings_open: kite.preferences.is_some(),
         }
     }
 
@@ -305,20 +303,6 @@ impl Render for Sidebar {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.parent
                                 .update(cx, |kite, cx| kite.run(crate::keys::cmd::HELP, window, cx))
-                                .ok();
-                        })),
-                    )
-                    .child(
-                        rail_button(
-                            &t,
-                            "open-settings",
-                            IconName::Settings,
-                            "Settings",
-                            self.settings_open,
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.parent
-                                .update(cx, |kite, cx| kite.toggle_settings(window, cx))
                                 .ok();
                         })),
                     )

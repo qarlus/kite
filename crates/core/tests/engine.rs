@@ -434,10 +434,12 @@ fn ai_streams_sse_chunks_in_order() {
     engine
         .ai(
             7,
-            vec![ChatMsg {
-                role: "user".into(),
-                content: "hi".into(),
-            }],
+            AiRequest::Compose {
+                draft: Draft {
+                    subject: "hi".into(),
+                    ..Draft::default()
+                },
+            },
         )
         .expect("ai");
 
@@ -463,6 +465,237 @@ fn ai_streams_sse_chunks_in_order() {
     assert!(
         seen.contains("authorization: Bearer secret"),
         "the keychain key is the bearer token: {seen}"
+    );
+}
+
+#[test]
+fn a_private_saved_draft_stays_private_after_send_and_delayed_sent_sync() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+    let ai_endpoint = std::net::TcpListener::bind("127.0.0.1:0").expect("local AI endpoint");
+    ai_endpoint
+        .set_nonblocking(true)
+        .expect("nonblocking endpoint");
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine.set_ai_key("test-only").expect("in-memory AI key");
+    engine
+        .set_settings(Settings {
+            ai_enabled: true,
+            ai_base_url: format!(
+                "http://{}",
+                ai_endpoint.local_addr().expect("endpoint address")
+            ),
+            undo_send_secs: 0,
+            ..Default::default()
+        })
+        .expect("settings");
+    let account = engine
+        .add_proton(login(server.ports()))
+        .expect("add account");
+    let id = engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![addr("Recipient", "recipient@example.org")],
+            subject: "Private fresh compose".into(),
+            body: "Synthetic private draft body".into(),
+            ..Default::default()
+        })
+        .expect("save fresh draft");
+    wait_for("the provider draft", || {
+        !draft_folder(&world.lock().expect("world")).is_empty()
+    });
+    let row = engine
+        .threads(&drafts(account.id), 0, 10)
+        .expect("drafts")
+        .remove(0);
+    for tag in [PRIVATE_TAG, "Urgent"] {
+        engine
+            .act(&[row.id], &Action::Label { tag: tag.into() })
+            .expect("tag draft");
+    }
+    let saved = engine
+        .draft(row.id)
+        .expect("draft")
+        .expect("editable draft");
+    assert_eq!(saved.id, Some(id));
+    assert_eq!(
+        saved.reply_to, None,
+        "privacy belongs to this fresh draft, not a reply source"
+    );
+    engine.send(saved).expect("send through local SMTP");
+    wait_for("SMTP delivery and provider draft deletion", || {
+        let world = world.lock().expect("world");
+        world.sent.len() == 1 && draft_folder(&world).is_empty()
+    });
+
+    // Delay the Sent copy until both local and provider drafts are gone. The fake does not
+    // automatically file sent mail, so successful SMTP alone cannot satisfy this regression.
+    let db = rusqlite::Connection::open(dir.join("kite.db")).expect("local database");
+    let remaining: i64 = db
+        .query_row("SELECT count(*) FROM drafts WHERE id=?1", [id], |r| {
+            r.get(0)
+        })
+        .expect("draft deletion");
+    assert_eq!(remaining, 0, "the sent draft row was actually deleted");
+    assert!(
+        engine
+            .threads(&sent(account.id), 0, 10)
+            .expect("Sent before sync")
+            .is_empty()
+    );
+    let raw = {
+        let world = world.lock().expect("world");
+        assert!(
+            world
+                .folders
+                .iter()
+                .find(|f| f.name == "Sent")
+                .expect("Sent folder")
+                .msgs
+                .is_empty()
+        );
+        assert_eq!(world.sent[0].rcpts, vec!["recipient@example.org"]);
+        world.sent[0].raw.clone()
+    };
+    let outgoing = mail_parser::MessageParser::default()
+        .parse(&raw)
+        .expect("outgoing MIME");
+    let outgoing_id = outgoing
+        .message_id()
+        .expect("outgoing Message-ID")
+        .to_string();
+    world
+        .lock()
+        .expect("world")
+        .folder("Sent")
+        .push(&raw, &["\\Seen"]);
+    engine.sync_now();
+    let mut synced = Vec::new();
+    wait_for("the delayed Sent copy to sync", || {
+        synced = engine.threads(&sent(account.id), 0, 10).expect("Sent");
+        !synced.is_empty()
+    });
+    assert_eq!(synced.len(), 1);
+    let sent_row = &synced[0];
+    assert_eq!(sent_row.subject, row.subject);
+    for tag in [PRIVATE_TAG, "Urgent"] {
+        assert!(
+            sent_row.labels.iter().any(|label| label == tag),
+            "{tag} survived draft deletion and delayed Sent sync"
+        );
+    }
+    let synced_id: String = db
+        .query_row(
+            "SELECT message_id FROM messages WHERE thread_id=?1 AND mailbox='sent'",
+            [sent_row.id],
+            |r| r.get(0),
+        )
+        .expect("synced Message-ID");
+    assert_eq!(
+        synced_id,
+        outgoing_id.trim_matches(['<', '>']),
+        "the exact SMTP Message-ID links the delayed copy to its tags"
+    );
+    let error = engine
+        .ai(
+            91,
+            AiRequest::Summary {
+                thread: sent_row.id,
+            },
+        )
+        .expect_err("the synced Private Sent conversation cannot be summarized");
+    assert!(
+        error.to_string().to_ascii_lowercase().contains("private"),
+        "privacy refusal: {error}"
+    );
+    assert_eq!(
+        ai_endpoint
+            .accept()
+            .expect_err("AI endpoint must receive no connection")
+            .kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn a_private_conversation_never_reaches_the_ai_endpoint() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(FIRST, &["\\Seen"]);
+    world
+        .lock()
+        .expect("world")
+        .folder("INBOX")
+        .push(SECOND, &[]);
+    let server = rt.block_on(serve(world.clone()));
+    let (address, request) = sse_server(&["[DONE]"]);
+
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    engine.set_ai_key("secret").expect("key");
+    engine
+        .set_settings(Settings {
+            ai_enabled: true,
+            ai_base_url: format!("http://{address}"),
+            ai_model: "test-model".into(),
+            ..Default::default()
+        })
+        .expect("settings");
+    let events = Events::new(engine.events());
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    events.wait(|e| matches!(e, Event::Changed(ids) if ids.contains(&account.id)));
+    let threads = engine.threads(&inbox(account.id), 0, 50).expect("threads");
+    let private = threads
+        .iter()
+        .find(|t| t.subject == "Quarterly numbers")
+        .expect("private")
+        .id;
+    let open = threads
+        .iter()
+        .find(|t| t.subject == "Lunch?")
+        .expect("open")
+        .id;
+    engine
+        .act(&[private], &Action::Label { tag: "Private".into() })
+        .expect("label");
+
+    let error = engine
+        .ai(3, AiRequest::Summary { thread: private })
+        .expect_err("a Private thread is refused before any request");
+    assert!(
+        error.to_string().contains("private"),
+        "the refusal explains itself: {error}"
+    );
+    // Write-with-AI replying to that thread is refused too.
+    let reply_to = engine.thread(private).expect("thread").last().unwrap().id;
+    let draft = Draft {
+        account_id: account.id,
+        reply_to: Some(reply_to),
+        subject: "Re: Quarterly numbers".into(),
+        ..Draft::default()
+    };
+    assert!(engine.ai(4, AiRequest::Compose { draft }).is_err());
+    assert!(
+        request.lock().expect("request").is_empty(),
+        "nothing reached the endpoint"
+    );
+
+    // A normal conversation still summarizes, and the request carries its content.
+    engine
+        .ai(5, AiRequest::Summary { thread: open })
+        .expect("ai");
+    events.wait(|e| matches!(e, Event::Ai { req: 5, done: true, .. }));
+    let seen = String::from_utf8_lossy(&request.lock().expect("request").clone()).to_string();
+    assert!(seen.contains("Lunch"), "the request has the open thread: {seen}");
+    assert!(
+        !seen.contains("Quarterly"),
+        "no Private subject ever crosses: {seen}"
     );
 }
 
@@ -1151,4 +1384,70 @@ fn a_provider_draft_can_be_trashed_and_undone_over_imap() {
             .expect("drafts")
             .is_empty()
     );
+}
+
+#[test]
+fn invalid_recipients_never_leave_drafts_or_enter_scheduled_outbox() {
+    let rt = runtime();
+    let world = Arc::new(Mutex::new(common::world()));
+    let server = rt.block_on(serve(world.clone()));
+    let dir = temp_dir();
+    let engine = engine(&dir);
+    let account = engine.add_proton(login(server.ports())).expect("add");
+    let invalid = [
+        addr("", ""),
+        addr("", "missing-at"),
+        addr("", "a..b@example.com"),
+        addr("", "a@-example.com"),
+        addr("", "a@example-.com"),
+        addr("", "a@example..com"),
+        addr("", "a@example_com.org"),
+        addr("", "a@example.com\r\nBcc: injected@example.com"),
+        addr("Injected\r\nBcc: other@example.com", "a@example.com"),
+    ];
+    for field in ["To", "Cc", "Bcc"] {
+        for recipient in &invalid {
+            for send_at in [None, Some(now_ms() + 3_600_000)] {
+                let mut draft = Draft {
+                    account_id: account.id,
+                    to: vec![addr("Valid", "valid@example.org")],
+                    subject: "Invalid envelope".into(),
+                    send_at,
+                    ..Default::default()
+                };
+                match field {
+                    "To" => draft.to.push(recipient.clone()),
+                    "Cc" => draft.cc.push(recipient.clone()),
+                    _ => draft.bcc.push(recipient.clone()),
+                }
+                let error = engine
+                    .send(draft)
+                    .expect_err("invalid address must be rejected");
+                assert!(error.to_string().starts_with(field), "{error}");
+            }
+        }
+    }
+    // Incomplete recipients remain editable drafts, including after a blocked send.
+    let id = engine
+        .save_draft(Draft {
+            account_id: account.id,
+            to: vec![addr("", "unfinished")],
+            subject: "Keep editing".into(),
+            ..Default::default()
+        })
+        .expect("save incomplete draft");
+    let row = engine
+        .threads(&drafts(account.id), 0, 10)
+        .expect("drafts")
+        .remove(0);
+    let saved = engine.draft(row.id).expect("draft").expect("editable");
+    assert_eq!(saved.id, Some(id));
+    assert!(engine.send(saved.clone()).is_err());
+    assert_eq!(
+        engine.draft(row.id).expect("retained").expect("draft").to,
+        saved.to
+    );
+    assert!(world.lock().expect("world").sent.is_empty());
+    let store = kite_core::store::Store::open(&dir.join("kite.db")).expect("local store");
+    assert!(store.outbox_due(i64::MAX).expect("outbox").is_empty(), "no immediate or future invalid send was queued");
 }

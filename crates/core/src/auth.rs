@@ -160,28 +160,49 @@ async fn accept_code(listener: &tokio::net::TcpListener, state: &str) -> Result<
                 .find(|(key, _)| key == k)
                 .map(|(_, v)| v.into_owned())
         };
-        if let Some(err) = get("error") {
-            let _ = reply(&mut sock, 400).await;
-            bail!("Microsoft sign-in failed: {err}");
-        }
-        let Some(code) = get("code") else {
-            let _ = reply(&mut sock, 404).await;
+        if get("error").is_none() && get("code").is_none() {
+            let _ = reply(&mut sock, 404, None).await;
             continue;
-        };
+        }
         if get("state").as_deref() != Some(state) {
-            let _ = reply(&mut sock, 400).await;
+            let _ = reply(&mut sock, 400, None).await;
             bail!("Microsoft sign-in state mismatch");
         }
-        let _ = reply(&mut sock, 200).await;
+        if let Some(err) = get("error") {
+            let detail = get("error_description").unwrap_or_default();
+            let _ = reply(&mut sock, 400, Some(detail.as_str())).await;
+            let detail = detail.trim();
+            if detail.is_empty() {
+                bail!("Microsoft sign-in failed: {err}");
+            }
+            bail!("Microsoft sign-in failed: {err} — {detail}");
+        }
+        let Some(code) = get("code") else {
+            continue;
+        };
+        let _ = reply(&mut sock, 200, None).await;
         return Ok(code);
     }
 }
 
-async fn reply(sock: &mut tokio::net::TcpStream, status: u16) -> std::io::Result<()> {
+async fn reply(
+    sock: &mut tokio::net::TcpStream,
+    status: u16,
+    detail: Option<&str>,
+) -> std::io::Result<()> {
     let body = if status == 200 {
         "<!doctype html><title>Kite</title><p>You can close this tab and return to Kite."
+            .to_string()
     } else {
-        "<!doctype html><title>Kite</title><p>Sign-in failed. You can close this tab."
+        let mut page =
+            "<!doctype html><title>Kite</title><p>Sign-in failed. You can close this tab."
+                .to_string();
+        if let Some(detail) = detail.filter(|d| !d.trim().is_empty()) {
+            page.push_str("<p><small>");
+            page.push_str(&escape_html(detail.trim()));
+            page.push_str("</small>");
+        }
+        page
     };
     let head = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -189,6 +210,13 @@ async fn reply(sock: &mut tokio::net::TcpStream, status: u16) -> std::io::Result
     );
     sock.write_all(head.as_bytes()).await?;
     sock.write_all(body.as_bytes()).await
+}
+
+/// `error_description` is free text destined for a browser page.
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 #[derive(Deserialize)]
@@ -202,7 +230,7 @@ async fn read_tokens(res: reqwest::Response, prior_refresh: Option<&str>) -> Res
     let status = res.status();
     let text = res.text().await?;
     if !status.is_success() {
-        bail!("token request failed ({status}): {text}");
+        bail!("{}", oauth_error(status, &text));
     }
     let body: TokenBody = serde_json::from_str(&text).context("token response")?;
     let refresh = body
@@ -216,6 +244,56 @@ async fn read_tokens(res: reqwest::Response, prior_refresh: Option<&str>) -> Res
         refresh,
         expires_at,
     })
+}
+
+/// Turns a token-endpoint error body into a sentence a human can act on. Most failures here are
+/// registration problems (wrong audience, confidential client, missing loopback redirect), so
+/// known codes carry a hint instead of a raw JSON dump.
+fn oauth_error(status: reqwest::StatusCode, text: &str) -> String {
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(text) else {
+        return format!("token request failed ({status}): {}", clip(text));
+    };
+    let code = body["error"].as_str().unwrap_or_default();
+    // AADSTS descriptions are multi-line; the first line carries the message.
+    let description = body["error_description"]
+        .as_str()
+        .and_then(|d| d.lines().next())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let hint = match code {
+        "invalid_client" => {
+            "Check the app (client) ID in Settings › Connections: it must be the Application ID \
+             of a registration, and Kite signs in as a public client with no secret."
+        }
+        "unauthorized_client" => {
+            "The app registration does not allow this sign-in. In the Entra admin center set its \
+             supported account types to include personal Microsoft accounts, add \
+             http://localhost under Mobile and desktop redirect URIs, and enable public client \
+             flows."
+        }
+        "invalid_grant" => "The consent or session is no longer valid; connect the account again.",
+        "invalid_scope" => "A requested scope is not available for this account type.",
+        "temporarily_unavailable" | "service_unavailable" => {
+            "Microsoft sign-in is temporarily unavailable; try again shortly."
+        }
+        _ => "",
+    };
+    let mut message = format!("Microsoft sign-in failed ({status})");
+    if !code.is_empty() {
+        message.push_str(&format!(": {code}"));
+    }
+    if !description.is_empty() {
+        message.push_str(&format!(" — {description}"));
+    }
+    if !hint.is_empty() {
+        message.push_str(&format!(" {hint}"));
+    }
+    message
+}
+
+fn clip(text: &str) -> String {
+    text.trim().chars().take(400).collect()
 }
 
 fn random_token(bytes: usize) -> Result<String> {

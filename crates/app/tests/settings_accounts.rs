@@ -205,8 +205,20 @@ async fn outlook_saves_the_typed_app_id_before_signing_in(cx: &mut TestAppContex
         window.render_frame(cx);
         window.click(("settings-tab", 3usize), cx);
         window.render_frame(cx);
+        window.scroll(
+            "settings-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(-500.))),
+            cx,
+        );
+        window.render_frame(cx);
         window.click("ms-client-id", cx);
         window.input("00000000-1111-2222-3333-444444444444", cx);
+        window.scroll(
+            "settings-scroll",
+            ScrollDelta::Pixels(point(px(0.), px(1000.))),
+            cx,
+        );
+        window.render_frame(cx);
         window.click("add-microsoft", cx);
         window.render_frame(cx);
         window.click(("settings-tab", 2usize), cx);
@@ -279,7 +291,10 @@ async fn a_native_proton_sign_in_takes_the_second_step_and_adds_the_account(
     .unwrap();
     assert_eq!(
         *fixture.proton_attempts.lock().unwrap(),
-        vec![("kite@proton.me".to_string(), "my proton password".to_string())],
+        vec![(
+            "kite@proton.me".to_string(),
+            "my proton password".to_string()
+        )],
         "the address and password reach the engine, not the Bridge path"
     );
     assert_eq!(

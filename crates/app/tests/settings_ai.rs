@@ -3,7 +3,7 @@ mod common;
 use common::{Fixture, mount, update_content};
 use gpui_kit::test::TestWindowExt;
 use gpui_kit::{AppContext, TestAppContext};
-use kite_core::model::Event;
+use kite_core::model::{AiRequest, Event};
 
 /// A fixture with AI turned on and a model of its own.
 fn ai_on() -> std::sync::Arc<Fixture> {
@@ -64,15 +64,9 @@ fn shift_s_summarizes_the_open_thread_with_the_configured_endpoint(cx: &mut Test
     let requests = fixture.ai_requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 1, "shift-s asks the engine for a summary");
     let req = requests[0].0;
-    let prompt = requests[0]
-        .1
-        .iter()
-        .map(|message| message.content.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
     assert!(
-        prompt.contains("Thread 1") && prompt.contains("Plain body for thread 1"),
-        "the prompt carries the conversation: {prompt}"
+        matches!(requests[0].1, AiRequest::Summary { thread: 1 }),
+        "the engine receives the source identity and builds the prompt after checking privacy"
     );
     // The engine streams the answer back as one delta per chunk.
     fixture.emit(Event::Ai {
@@ -130,8 +124,8 @@ fn ctrl_j_writes_a_draft_that_can_be_inserted_into_compose(cx: &mut TestAppConte
     assert_eq!(requests.len(), 1, "ctrl-j asks the engine to write");
     let req = requests[0].0;
     assert!(
-        requests[0].1.iter().any(|m| m.content.contains("Q3 plan")),
-        "the draft's subject reaches the prompt"
+        matches!(&requests[0].1, AiRequest::Compose { draft } if draft.subject == "Q3 plan"),
+        "the draft reaches the engine with its source identity"
     );
     fixture.emit(Event::Ai {
         req,

@@ -2,6 +2,15 @@
 use serde::{Deserialize, Serialize};
 
 pub type Id = i64;
+/// Reserved local tag: excludes a conversation from Kite's AI helpers.
+pub const PRIVATE_TAG: &str = "Private";
+
+/// The engine builds AI prompts from identified sources, enforcing privacy before reading them.
+#[derive(Clone, Debug)]
+pub enum AiRequest {
+    Summary { thread: Id },
+    Compose { draft: Draft },
+}
 /// Unix epoch milliseconds.
 pub type Ms = i64;
 
@@ -112,11 +121,19 @@ pub enum Action {
     Unstar,
     Read,
     Unread,
-    Snooze { until: Ms },
-    Move { folder: String },
+    Snooze {
+        until: Ms,
+    },
+    Move {
+        folder: String,
+    },
     /// Local-only for now: no remote op is queued. Unknown tag names are an error.
-    Label { tag: String },
-    Unlabel { tag: String },
+    Label {
+        tag: String,
+    },
+    Unlabel {
+        tag: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -240,7 +257,9 @@ pub enum ProtonAuth {
     MailboxPassword,
     /// Proton wants a human-verification challenge solved at `url` (opened in the browser);
     /// the answer is the verification token.
-    HumanVerification { url: String },
+    HumanVerification {
+        url: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

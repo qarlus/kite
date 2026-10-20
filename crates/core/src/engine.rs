@@ -37,6 +37,56 @@ const APPLY_CHUNK: usize = 200;
 /// Sync calls per account per tick, so one huge mailbox cannot monopolise the loop.
 const SYNC_STEPS: usize = 64;
 
+/// Checks supported mailbox syntax only; it does not establish mailbox existence.
+/// Display names are separate from the address and may contain Unicode.
+pub fn valid_recipient_address(addr: &Addr) -> bool {
+    let email = &addr.email;
+    if addr.name.chars().any(char::is_control)
+        || email.chars().any(char::is_control)
+        || email.len() > 254
+    {
+        return false;
+    }
+    let Some((local, domain)) = email.rsplit_once('@') else {
+        return false;
+    };
+    let local_valid = if local.starts_with('"') && local.ends_with('"') && local.len() >= 2 {
+        let mut escaped = false;
+        let valid = local[1..local.len() - 1].bytes().all(|b| {
+            if escaped {
+                escaped = false;
+                (32..=126).contains(&b)
+            } else if b == b'\\' {
+                escaped = true;
+                true
+            } else {
+                (32..=126).contains(&b) && b != b'"'
+            }
+        });
+        valid && !escaped
+    } else {
+        local.split('.').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-/=?^_`{|}~".contains(&b))
+        })
+    };
+    local.len() <= 64
+        && local_valid
+        && domain.len() <= 253
+        && domain.contains('.')
+        && domain.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
 /// Where the store and config live for the current user.
 pub fn data_dir() -> PathBuf {
     let base = if cfg!(target_os = "windows") {
@@ -490,7 +540,8 @@ async fn send_due(
             inner.write(|s| s.outbox_sent(outbox_id))?;
             continue;
         };
-        let mime = match build_mime(inner, account, &draft, &message_id(&account.email)) {
+        let outgoing_id = message_id(&account.email);
+        let mime = match build_mime(inner, account, &draft, &outgoing_id) {
             Ok(mime) => mime,
             Err(e) => {
                 failed_send(inner, outbox_id, &draft, &e, true, changed)?;
@@ -501,6 +552,18 @@ async fn send_due(
             slot.insert(backend_for(inner, account)?);
         }
         let backend = backend_mut(backends, account.id)?;
+        if let Some(id) = draft.id {
+            inner.write(|s| {
+                s.remember_sent_tags(
+                    id,
+                    account.id,
+                    &format!(
+                        "m:{}",
+                        outgoing_id.trim_matches(['<', '>']).to_ascii_lowercase()
+                    ),
+                )
+            })?;
+        }
         match backend.apply(&Op::Send { mime }).await {
             Ok(_) => {
                 persist_tokens(inner, account.id, backend)?;
@@ -508,6 +571,13 @@ async fn send_due(
                     && let Some(message) = client.take_sent()
                 {
                     inner.write(|s| {
+                        if let Some(id) = draft.id {
+                            s.remember_sent_tags(
+                                id,
+                                account.id,
+                                &format!("r:{}", message.remote_id),
+                            )?;
+                        }
                         s.apply_deltas(account.id, &[Delta::Upsert(Box::new(message))])
                     })?;
                 }
@@ -1020,6 +1090,12 @@ impl Mail for Engine {
                 .any(|a| !a.email.trim().is_empty()),
             "Add a recipient before sending."
         );
+        for (field, recipients) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)] {
+            anyhow::ensure!(
+                recipients.iter().all(valid_recipient_address),
+                "{field}: correct the recipient address (use name@example.com) before sending."
+            );
+        }
         let seconds = self.inner.read(Store::settings)?.undo_send_secs;
         let due = draft
             .send_at
@@ -1220,11 +1296,13 @@ impl Mail for Engine {
         Ok(events)
     }
 
-    fn ai(&self, req: u32, messages: Vec<ChatMsg>) -> Result<()> {
+    fn ai(&self, req: u32, request: AiRequest) -> Result<()> {
         let settings = self.inner.read(Store::settings)?;
         if !settings.ai_enabled {
             bail!("AI is disabled in settings");
         }
+        self.inner
+            .read(|store| crate::ai::prepare(store, &request).map(|_| ()))?;
         let key = self
             .inner
             .secrets
@@ -1234,7 +1312,16 @@ impl Mail for Engine {
         std::thread::Builder::new()
             .name("kite-ai".into())
             .spawn(move || {
-                if let Err(e) = crate::ai::stream(&settings, &key, req, messages, &inner) {
+                // Recheck after queueing: the user may have marked the source Private.
+                let result = inner
+                    .read(|store| crate::ai::prepare(store, &request))
+                    .and_then(|messages| crate::ai::stream(&settings, &key, req, messages, &inner));
+                if let Err(e) = result {
+                    inner.emit(Event::Ai {
+                        req,
+                        delta: String::new(),
+                        done: true,
+                    });
                     inner.emit(Event::Error(format!("AI: {e:#}")));
                 }
             })

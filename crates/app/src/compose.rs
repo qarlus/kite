@@ -5,8 +5,9 @@ use crate::keys;
 use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::Sizable;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
-use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::{Action as MailAction, Addr, Draft, Id, Message, Ms};
@@ -26,7 +27,10 @@ pub struct Compose {
     /// The original message for replies and forwards (`None` for new mail).
     pub reply_to: Option<Id>,
     pub show_cc: bool,
-    bcc: Vec<Addr>,
+    pub bcc: Entity<InputState>,
+    show_bcc: bool,
+    expanded: bool,
+    recipient_errors: [Option<String>; 3],
     send_at: Option<Ms>,
     remind_at: Option<Ms>,
     title: &'static str,
@@ -66,6 +70,11 @@ impl Compose {
                 .placeholder("Cc")
                 .default_value(format_addrs(&parts.cc))
         });
+        let bcc = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Bcc")
+                .default_value(format_addrs(&parts.bcc))
+        });
         let subject = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Subject")
@@ -77,8 +86,8 @@ impl Compose {
                 .default_value(parts.body)
         });
         // Autosave is driven by real edits, so a keystroke never waits on the store.
-        let mut subs = Vec::with_capacity(4);
-        for input in [&to, &cc, &subject] {
+        let mut subs = Vec::with_capacity(5);
+        for input in [&to, &cc, &bcc, &subject] {
             subs.push(
                 cx.subscribe_in(input, window, |this, _, event: &InputEvent, _, cx| {
                     if matches!(event, InputEvent::Change) {
@@ -103,7 +112,10 @@ impl Compose {
             id: parts.id,
             reply_to: parts.reply_to,
             show_cc: !parts.cc.is_empty(),
-            bcc: parts.bcc,
+            show_bcc: !parts.bcc.is_empty(),
+            bcc,
+            expanded: false,
+            recipient_errors: Default::default(),
             send_at: parts.send_at,
             remind_at: parts.remind_at,
             title: parts.title,
@@ -140,13 +152,13 @@ impl Compose {
         )
     }
 
-    fn draft(&self, cx: &App) -> Draft {
+    pub(crate) fn draft(&self, cx: &App) -> Draft {
         Draft {
             id: self.id,
             account_id: self.account_id,
             to: parse_addrs(&self.to.read(cx).value()),
             cc: parse_addrs(&self.cc.read(cx).value()),
-            bcc: self.bcc.clone(),
+            bcc: parse_addrs(&self.bcc.read(cx).value()),
             subject: self.subject.read(cx).value().trim().to_string(),
             body: self.body.read(cx).value().to_string(),
             reply_to: self.reply_to,
@@ -160,7 +172,7 @@ impl Compose {
             && self.cc.read(cx).value().trim().is_empty()
             && self.subject.read(cx).value().trim().is_empty()
             && self.body.read(cx).value().trim().is_empty()
-            && self.bcc.is_empty()
+            && self.bcc.read(cx).value().trim().is_empty()
     }
 }
 
@@ -307,6 +319,7 @@ impl Kite {
             return;
         };
         compose.dirty = true;
+        compose.recipient_errors = Default::default();
         compose.save_gen = compose.save_gen.wrapping_add(1);
         let generation = compose.save_gen;
         let timer = cx.background_executor().timer(Duration::from_millis(1500));
@@ -403,6 +416,9 @@ impl Kite {
         if !self.compose_open {
             return;
         }
+        if !self.validate_compose_recipients(window, cx) {
+            return;
+        }
         self.send_later = true;
         self.overlay = Overlay::Snooze(crate::snooze::Snooze::new(Local::now()));
         window.focus(&self.focus, cx);
@@ -428,25 +444,13 @@ impl Kite {
         if !self.compose_open {
             return;
         }
+        if !self.validate_compose_recipients(window, cx) {
+            return;
+        }
         let Some(compose) = &self.compose else {
             return;
         };
         let draft = compose.draft(cx);
-        if draft.to.is_empty() && draft.cc.is_empty() && draft.bcc.is_empty() {
-            self.toast("Add a recipient", cx);
-            return;
-        }
-        if let Some(invalid) = draft
-            .to
-            .iter()
-            .chain(&draft.cc)
-            .chain(&draft.bcc)
-            .map(|addr| addr.email.trim())
-            .find(|&email| !valid_email(email))
-        {
-            self.toast(format!("Invalid address: {invalid}"), cx);
-            return;
-        }
         let scheduled = draft.send_at.is_some();
         match self.mail.send(draft) {
             Ok(id) => {
@@ -479,6 +483,43 @@ impl Kite {
             }
             Err(error) => self.toast(format!("Could not send: {error}"), cx),
         }
+    }
+
+    fn validate_compose_recipients(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(compose) = &mut self.compose else {
+            return false;
+        };
+        let draft = compose.draft(cx);
+        compose.recipient_errors = Default::default();
+        for (ix, (field, recipients)) in [("To", &draft.to), ("Cc", &draft.cc), ("Bcc", &draft.bcc)]
+            .into_iter()
+            .enumerate()
+        {
+            let raw = [&compose.to, &compose.cc, &compose.bcc][ix]
+                .read(cx)
+                .value();
+            if raw.contains(['\r', '\n'])
+                || recipients
+                    .iter()
+                    .any(|addr| !kite_core::engine::valid_recipient_address(addr))
+            {
+                compose.recipient_errors[ix] = Some(format!(
+                    "{field}: correct the address; use name@example.com or Name <name@example.com>."
+                ));
+            }
+        }
+        if draft.to.is_empty() && draft.cc.is_empty() && draft.bcc.is_empty() {
+            compose.recipient_errors[0] = Some("Add a recipient in To, Cc or Bcc.".into());
+        }
+        if let Some(ix) = compose.recipient_errors.iter().position(Option::is_some) {
+            compose.show_cc |= ix == 1;
+            compose.show_bcc |= ix == 2;
+            let input = [&compose.to, &compose.cc, &compose.bcc][ix];
+            window.focus(&input.read(cx).focus_handle(cx), cx);
+            cx.notify();
+            return false;
+        }
+        true
     }
 
     /// Reopens the draft returned by `cancel_send`, or keeps an existing draft.
@@ -577,9 +618,13 @@ impl Kite {
         let t = self.theme;
         let to = compose.to.clone();
         let cc = compose.cc.clone();
+        let bcc = compose.bcc.clone();
         let subject = compose.subject.clone();
         let body = compose.body.clone();
         let show_cc = compose.show_cc;
+        let show_bcc = compose.show_bcc;
+        let errors = compose.recipient_errors.clone();
+        let expanded = compose.expanded;
         let title = compose.title;
         let ai = match &self.ai {
             Some(ai) if matches!(ai.target, crate::app::AiFor::Compose) => {
@@ -594,10 +639,12 @@ impl Kite {
         } else {
             ""
         };
-        // DESIGN: a reply within a thread takes the full content pane; new mail
-        // and forwards float bottom-right at 560×480.
-        let is_reply = compose.reply_to.is_some() && compose.title != "Forward";
-        let reply_left = px(crate::sidebar::width(window));
+        let pane_left = crate::sidebar::width(window);
+        let pane_width = (window.viewport_size().width.as_f32() - pane_left).max(0.);
+        let available_height = (window.viewport_size().height.as_f32() - BAR_H).max(0.);
+        let margin = if pane_width < 400. { 4. } else { 18. };
+        let dock_width = (pane_width - margin * 2.).clamp(0., 560.);
+        let dock_height = (available_height - margin * 2.).clamp(0., 480.);
         Some(
             div()
                 .id("compose")
@@ -605,14 +652,14 @@ impl Kite {
                 .aria_label(title)
                 .key_context("KiteCompose")
                 .absolute()
-                .when(is_reply, |d| {
-                    d.top(px(BAR_H)).left(reply_left).right_0().bottom_0()
+                .when(expanded, |d| {
+                    d.top(px(BAR_H)).left(px(pane_left)).right_0().bottom_0()
                 })
-                .when(!is_reply, |d| {
-                    d.bottom(px(18.))
-                        .right(px(18.))
-                        .w(px(560.))
-                        .h(px(480.))
+                .when(!expanded, |d| {
+                    d.bottom(px(margin))
+                        .right(px(margin))
+                        .w(px(dock_width))
+                        .h(px(dock_height))
                         .rounded(px(RADIUS))
                         .shadow(vec![
                             BoxShadow::new(px(0.), px(20.), SHADOW.into()).blur_radius(px(60.)),
@@ -623,11 +670,13 @@ impl Kite {
                 .bg(t.bg2)
                 .border_1()
                 .border_color(t.line)
+                .overflow_hidden()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
+                        .flex_shrink_0()
                         .px_4()
                         .pt_3()
                         .pb_2()
@@ -638,134 +687,181 @@ impl Kite {
                                 .child(title),
                         )
                         .child(
-                            div()
-                                .id("compose-close")
-                                .test_support()
-                                .aria_label("Close compose")
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(24.))
-                                .rounded(px(RADIUS_SM))
-                                .cursor_pointer()
-                                .hover(|s| s.bg(t.bg3))
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| {
-                                        this.close_compose(window, cx)
-                                    }),
-                                )
-                                .child(Icon::new(IconName::X).with_size(px(14.)).text_color(t.fg2)),
+                            Button::new("compose-expand")
+                                .label(if expanded { "Collapse" } else { "Expand" })
+                                .accessibility_label(if expanded {
+                                    "Collapse compose"
+                                } else {
+                                    "Expand compose"
+                                })
+                                .small()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(compose) = &mut this.compose {
+                                        compose.expanded = !compose.expanded;
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("compose-close")
+                                .accessibility_label("Close compose")
+                                .icon(IconName::X)
+                                .small()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.close_compose(window, cx)
+                                })),
                         ),
                 )
-                .child(field_row(&t, "To", &to, "compose-to", "To"))
-                .when(show_cc, |d| {
-                    d.child(field_row(&t, "Cc", &cc, "compose-cc", "Cc"))
-                })
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .px_4()
-                        .when(!show_cc, |d| {
-                            d.child(
-                                div()
-                                    .id("compose-show-cc")
-                                    .test_support()
-                                    .aria_label("Show Cc")
-                                    .cursor_pointer()
-                                    .text_size(t.px(11.))
-                                    .text_color(t.fg3)
-                                    .hover(|s| s.text_color(t.fg))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        if let Some(compose) = &mut this.compose {
-                                            compose.show_cc = true;
-                                        }
-                                        cx.notify();
-                                    }))
-                                    .child("Cc"),
-                            )
-                        }),
-                )
-                .child(field_row(
-                    &t,
-                    "Subject",
-                    &subject,
-                    "compose-subject",
-                    "Subject",
-                ))
-                .when_some(ai, |d, (text, done)| {
-                    d.child(
-                        div()
-                            .id("compose-ai")
-                            .test_support()
-                            .aria_label(text.clone())
-                            .mx_4()
-                            .mb_2()
-                            .p_3()
-                            .rounded(px(RADIUS_SM))
-                            .bg(t.bg3)
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_size(t.px(11.))
-                                    .font_weight(FontWeight(650.))
-                                    .text_color(t.fg2)
-                                    .child(if done { "AI draft" } else { "Writing…" }),
-                            )
-                            .child(div().text_size(t.px(13.)).child(text))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .child(
-                                        crate::preferences::button("insert-ai", "Insert", t)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.insert_ai(window, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        crate::preferences::button("discard-ai", "Discard", t)
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.ai = None;
-                                                cx.notify();
-                                            })),
-                                    ),
-                            ),
-                    )
-                })
-                .child(
-                    div()
-                        .id("compose-body")
-                        .test_support()
-                        .aria_label("Message")
+                        .id("compose-editor")
                         .flex_1()
                         .min_h_0()
-                        .px_4()
-                        .py_2()
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if let Some(compose) = &this.compose {
-                                let handle = compose.body.read(cx).focus_handle(cx);
-                                window.focus(&handle, cx);
-                            }
-                        }))
+                        .overflow_y_scroll()
+                        .flex()
+                        .flex_col()
+                        .child(field_row(&t, "To", &to, "compose-to", "To"))
+                        .when_some(errors[0].clone(), |d, error| {
+                            d.child(recipient_error(&t, "compose-to-error", error))
+                        })
+                        .when(show_cc, |d| {
+                            d.child(field_row(&t, "Cc", &cc, "compose-cc", "Cc"))
+                                .when_some(errors[1].clone(), |d, error| {
+                                    d.child(recipient_error(&t, "compose-cc-error", error))
+                                })
+                        })
+                        .when(show_bcc, |d| {
+                            d.child(field_row(&t, "Bcc", &bcc, "compose-bcc", "Bcc"))
+                                .when_some(errors[2].clone(), |d, error| {
+                                    d.child(recipient_error(&t, "compose-bcc-error", error))
+                                })
+                        })
                         .child(
-                            Textarea::new(&body)
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .px_4()
+                                .gap_3()
+                                .when(!show_bcc, |d| {
+                                    d.child(
+                                        Button::new("compose-show-bcc")
+                                            .label("Bcc")
+                                            .accessibility_label("Show Bcc")
+                                            .small()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(compose) = &mut this.compose {
+                                                    compose.show_bcc = true;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                })
+                                .when(!show_cc, |d| {
+                                    d.child(
+                                        Button::new("compose-show-cc")
+                                            .label("Cc")
+                                            .accessibility_label("Show Cc")
+                                            .small()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(compose) = &mut this.compose {
+                                                    compose.show_cc = true;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                        .child(field_row(
+                            &t,
+                            "Subject",
+                            &subject,
+                            "compose-subject",
+                            "Subject",
+                        ))
+                        .when_some(ai, |d, (text, done)| {
+                            d.child(
+                                div()
+                                    .id("compose-ai")
+                                    .test_support()
+                                    .aria_label(text.clone())
+                                    .mx_4()
+                                    .mb_2()
+                                    .p_3()
+                                    .rounded(px(RADIUS_SM))
+                                    .bg(t.bg3)
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_size(t.px(11.))
+                                            .font_weight(FontWeight(650.))
+                                            .text_color(t.fg2)
+                                            .child(if done { "AI draft" } else { "Writing…" }),
+                                    )
+                                    .child(div().text_size(t.px(13.)).child(text))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                crate::preferences::button(
+                                                    "insert-ai",
+                                                    "Insert",
+                                                    t,
+                                                )
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.insert_ai(window, cx)
+                                                })),
+                                            )
+                                            .child(
+                                                crate::preferences::button(
+                                                    "discard-ai",
+                                                    "Discard",
+                                                    t,
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.ai = None;
+                                                    cx.notify();
+                                                })),
+                                            ),
+                                    ),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id("compose-body")
+                                .test_support()
                                 .aria_label("Message")
-                                .appearance(false)
-                                .bordered(false)
-                                .text_size(t.px(14.))
-                                .text_color(t.fg),
+                                .flex_1()
+                                .min_h(px(120.))
+                                .flex_shrink_0()
+                                .px_4()
+                                .py_2()
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if let Some(compose) = &this.compose {
+                                        let handle = compose.body.read(cx).focus_handle(cx);
+                                        window.focus(&handle, cx);
+                                    }
+                                }))
+                                .child(
+                                    Textarea::new(&body)
+                                        .aria_label("Message")
+                                        .appearance(false)
+                                        .bordered(false)
+                                        .text_size(t.px(14.))
+                                        .text_color(t.fg),
+                                ),
                         ),
                 )
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .gap_2()
                         .px_4()
                         .py_3()
                         .border_t_1()
@@ -799,51 +895,41 @@ impl Kite {
                                 .items_center()
                                 .gap_3()
                                 .child(
-                                    div()
-                                        .id("compose-discard")
-                                        .test_support()
-                                        .aria_label("Discard draft")
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded(px(RADIUS_SM))
-                                        .cursor_pointer()
-                                        .text_size(t.px(13.))
-                                        .text_color(t.fg2)
-                                        .hover(|s| s.bg(t.bg3).text_color(t.danger))
+                                    Button::new("compose-discard")
+                                        .label("Discard")
+                                        .tooltip(format!(
+                                            "Discard - {}",
+                                            keys::hint_for(&self.settings, keys::cmd::DISCARD)
+                                        ))
+                                        .accessibility_label("Discard draft")
+                                        .small()
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.discard_compose(window, cx)
-                                        }))
-                                        .child("Discard")
-                                        .child(div().text_size(t.px(11.)).text_color(t.fg3).child(
-                                            keys::hint_for(&self.settings, keys::cmd::DISCARD),
-                                        )),
+                                        })),
                                 )
                                 .child(
-                                    div()
-                                        .id("compose-send")
-                                        .test_support()
-                                        .aria_label("Send")
-                                        .flex()
-                                        .items_center()
-                                        .gap_2()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded(px(RADIUS_SM))
-                                        .cursor_pointer()
+                                    Button::new("compose-send-later")
+                                        .label("Send later")
+                                        .accessibility_label("Send later")
+                                        .small()
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.schedule_send(window, cx)
+                                        })),
+                                )
+                                .child(
+                                    Button::new("compose-send")
+                                        .label("Send")
+                                        .tooltip(format!(
+                                            "Send - {}",
+                                            keys::hint_for(&self.settings, keys::cmd::SEND)
+                                        ))
+                                        .accessibility_label("Send")
+                                        .small()
                                         .bg(theme::accent_glow(&t))
                                         .text_color(t.fg)
-                                        .text_size(t.px(13.))
-                                        .font_weight(FontWeight(600.))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.send_compose(window, cx)
-                                        }))
-                                        .child("Send")
-                                        .child(div().text_size(t.px(11.)).text_color(t.fg).child(
-                                            keys::hint_for(&self.settings, keys::cmd::SEND),
-                                        )),
+                                        })),
                                 ),
                         ),
                 )
@@ -861,6 +947,7 @@ fn field_row(
 ) -> AnyElement {
     div()
         .flex()
+        .flex_shrink_0()
         .items_center()
         .gap_2()
         .px_4()
@@ -922,7 +1009,18 @@ fn parse_addrs(value: &str) -> Vec<Addr> {
     let mut current = String::new();
     let mut in_quotes = false;
     let mut in_angle = false;
+    let mut escaped = false;
     for c in value.chars() {
+        if escaped {
+            current.push(c);
+            escaped = false;
+            continue;
+        }
+        if c == '\\' && in_quotes {
+            current.push(c);
+            escaped = true;
+            continue;
+        }
         match c {
             '"' => {
                 in_quotes = !in_quotes;
@@ -954,6 +1052,9 @@ fn push_addr(out: &mut Vec<Addr>, part: &str) {
     }
     if let Some(open) = part.rfind('<')
         && let Some(close) = part[open..].find('>')
+        && part[open + close + 1..].trim().is_empty()
+        && !part[open + 1..open + close].contains(['<', '>'])
+        && valid_display_name(part[..open].trim())
     {
         let email = part[open + 1..open + close].trim();
         let name = unquote_name(&part[..open]);
@@ -1080,18 +1181,36 @@ fn forward_body(message: &Message) -> String {
     out
 }
 
-/// A plausible `local@domain` shape for sending; not a full RFC 5322 validator.
-fn valid_email(email: &str) -> bool {
-    let email = email.trim();
-    let Some((local, domain)) = email.rsplit_once('@') else {
+fn valid_display_name(name: &str) -> bool {
+    if name.chars().any(char::is_control) {
         return false;
-    };
-    !local.is_empty()
-        && !domain.is_empty()
-        && !email.contains(char::is_whitespace)
-        && !local.contains('@')
-        && !domain.contains('@')
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
+    }
+    if !name.starts_with('"') {
+        return !name.contains(['"', '<', '>']);
+    }
+    let mut escaped = false;
+    for (ix, c) in name.char_indices().skip(1) {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == '"' {
+            return ix + 1 == name.len();
+        }
+    }
+    false
+}
+
+fn recipient_error(t: &Theme, id: &'static str, error: String) -> AnyElement {
+    div()
+        .id(id)
+        .test_support()
+        .aria_label(error.clone())
+        .px_4()
+        .py_1()
+        .flex_shrink_0()
+        .text_size(t.px(12.))
+        .text_color(t.danger)
+        .child(error)
+        .into_any_element()
 }
