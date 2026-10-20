@@ -1,5 +1,15 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+    branches: [main]
+  pull_request:
+# A new push to the same branch cancels the run it replaces.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_TERM_COLOR: always
 jobs:
   test:
     strategy:
@@ -10,10 +20,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with: { components: "clippy, llvm-tools" }
+        with: { components: clippy }
       - uses: Swatinem/rust-cache@v2
+        with: { shared-key: test }
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+  # Budgets need optimised code. The shipped exe is built once with the real release profile for
+  # the size budget; the timing budgets run under `perf` (thin LTO, parallel codegen), which is
+  # several times faster to build than linking every test binary with fat LTO.
+  budgets:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with: { shared-key: budgets }
       - run: cargo build --release -p kite
-      # Perf and size budgets are asserted only in release.
-      - run: cargo test --workspace --release
+      - run: cargo test --profile perf -p kite --test perf --test html --test budget
+      - run: cargo test --profile perf -p kite-core --test store
