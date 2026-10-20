@@ -1054,6 +1054,18 @@ fn expand_is_an_icon_as_small_as_close(cx: &mut TestAppContext) {
                 (bounds.center().y - close.center().y).abs() <= gpui_kit::px(1.),
                 "the icon sits on the close button's line"
             );
+            // Both chips share one centred line inside the header band at the panel's top.
+            let panel = window.find("compose").bounds();
+            assert_eq!(
+                bounds.center().y,
+                close.center().y,
+                "the header buttons are the same size and share one centre"
+            );
+            assert!(
+                bounds.center().y > panel.top()
+                    && bounds.center().y < panel.top() + gpui_kit::px(44.),
+                "the icon chips are vertically centred on the header row ({bounds:?} in {panel:?})"
+            );
             if !expanded {
                 window.click("compose-expand", cx);
             }

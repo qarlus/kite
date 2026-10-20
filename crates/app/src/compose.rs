@@ -5,10 +5,11 @@ use crate::keys;
 use crate::theme::{self, BAR_H, RADIUS, RADIUS_SM, SHADOW, Theme};
 use chrono::{Local, TimeZone as _};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::Sizable;
-use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::{Account, Action as MailAction, Addr, Draft, Id, Message, Ms, Provider};
@@ -673,6 +674,15 @@ impl Kite {
             ""
         };
         let (send_ink, send_hover) = send_colors(&t);
+        let discard_tip = format!(
+            "Discard - {}",
+            keys::hint_for(&self.settings, keys::cmd::DISCARD)
+        );
+        let later_tip = action_tip(
+            "Send later",
+            keys::hint_for(&self.settings, keys::cmd::SEND_LATER),
+        );
+        let send_tip = action_tip("Send", keys::hint_for(&self.settings, keys::cmd::SEND));
         let pane_left = crate::sidebar::width(window);
         let pane_width = (window.viewport_size().width.as_f32() - pane_left).max(0.);
         let available_height = (window.viewport_size().height.as_f32() - BAR_H).max(0.);
@@ -729,20 +739,31 @@ impl Kite {
                                 .items_center()
                                 .gap_1()
                                 .child(
-                                    Button::new("compose-expand")
-                                        .accessibility_label(if expanded {
+                                    crate::app::strip_chip(&t, 26.)
+                                        .id("compose-expand")
+                                        .test_support()
+                                        .aria_label(if expanded {
                                             "Collapse compose"
                                         } else {
                                             "Expand compose"
                                         })
-                                        .tooltip(if expanded { "Collapse" } else { "Expand" })
-                                        .icon(if expanded {
-                                            IconName::Minimize2
-                                        } else {
-                                            IconName::Maximize2
-                                        })
                                         .text_color(t.fg2)
-                                        .small()
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(if expanded {
+                                                "Collapse"
+                                            } else {
+                                                "Expand"
+                                            })
+                                            .build(window, cx)
+                                        })
+                                        .child(
+                                            Icon::new(if expanded {
+                                                IconName::Minimize2
+                                            } else {
+                                                IconName::Maximize2
+                                            })
+                                            .with_size(px(15.)),
+                                        )
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             if let Some(compose) = &mut this.compose {
                                                 compose.expanded = !compose.expanded;
@@ -751,10 +772,12 @@ impl Kite {
                                         })),
                                 )
                                 .child(
-                                    Button::new("compose-close")
-                                        .accessibility_label("Close compose")
-                                        .icon(IconName::X)
-                                        .small()
+                                    crate::app::strip_chip(&t, 26.)
+                                        .id("compose-close")
+                                        .test_support()
+                                        .aria_label("Close compose")
+                                        .text_color(t.fg2)
+                                        .child(Icon::new(IconName::X).with_size(px(15.)))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.close_compose(window, cx)
                                         })),
@@ -936,60 +959,58 @@ impl Kite {
                                 .gap_2()
                                 .flex_shrink_0()
                                 .child(
-                                    Button::new("compose-discard")
-                                        .icon(IconName::Trash)
-                                        .tooltip(format!(
-                                            "Discard - {}",
-                                            keys::hint_for(&self.settings, keys::cmd::DISCARD)
-                                        ))
-                                        .accessibility_label("Discard draft")
-                                        .small()
-                                        .ghost()
+                                    crate::app::strip_chip(&t, 32.)
+                                        .id("compose-discard")
+                                        .test_support()
+                                        .aria_label("Discard draft")
                                         .text_color(t.fg2)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(discard_tip.clone()).build(window, cx)
+                                        })
+                                        .child(Icon::new(IconName::Trash).with_size(px(16.)))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.discard_compose(window, cx)
                                         })),
                                 )
                                 .child(
-                                    Button::new("compose-send-later")
-                                        .label("Send later")
-                                        .tooltip(format!(
-                                            "Send later - {}",
-                                            keys::hint_for(&self.settings, keys::cmd::SEND_LATER)
-                                        ))
-                                        .accessibility_label("Send later")
-                                        .small()
-                                        .ghost()
+                                    crate::app::strip_chip(&t, 32.)
+                                        .id("compose-send-later")
+                                        .test_support()
+                                        .aria_label("Send later")
                                         .text_color(t.fg2)
+                                        .tooltip(move |window, cx| {
+                                            Tooltip::new(later_tip.clone()).build(window, cx)
+                                        })
+                                        .child(Icon::new(IconName::Clock).with_size(px(16.)))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.schedule_send(window, cx)
                                         })),
                                 )
                                 .child(
-                                    // The accent fill lives on the wrapper: the component's
-                                    // custom variant paints only a tint of its colour.
+                                    // The accent fill lives on the wrapper: hovering paints a
+                                    // tint over it rather than swapping the colour out.
                                     div()
                                         .flex()
                                         .flex_shrink_0()
-                                        .rounded(px(RADIUS))
+                                        .rounded(px(RADIUS_SM))
                                         .bg(t.accent)
                                         .child(
-                                            Button::new("compose-send")
-                                                .label("Send")
-                                                .tooltip(format!(
-                                                    "Send - {}",
-                                                    keys::hint_for(&self.settings, keys::cmd::SEND)
-                                                ))
-                                                .accessibility_label("Send")
-                                                .small()
-                                                .font_weight(FontWeight(500.))
-                                                .custom(
-                                                    ButtonCustomVariant::new(cx)
-                                                        .color(transparent_black())
-                                                        .foreground(send_ink)
-                                                        .hover(send_hover)
-                                                        .active(send_hover),
-                                                )
+                                            div()
+                                                .id("compose-send")
+                                                .test_support()
+                                                .aria_label("Send")
+                                                .size(px(32.))
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .rounded(px(RADIUS_SM))
+                                                .cursor_pointer()
+                                                .text_color(send_ink)
+                                                .hover(move |s| s.bg(send_hover))
+                                                .tooltip(move |window, cx| {
+                                                    Tooltip::new(send_tip.clone()).build(window, cx)
+                                                })
+                                                .child(Icon::new(IconName::Send).with_size(px(16.)))
                                                 .on_click(cx.listener(|this, _, window, cx| {
                                                     this.send_compose(window, cx)
                                                 })),
@@ -1176,6 +1197,16 @@ fn recipient_toggle(
         .on_click(on_click)
         .child(label)
         .into_any_element()
+}
+
+/// `"Send · Ctrl+Enter"` — the action and its bound key, or just the action when
+/// the command is unbound.
+fn action_tip(action: &'static str, hint: String) -> String {
+    if hint.is_empty() {
+        action.to_string()
+    } else {
+        format!("{action} · {hint}")
+    }
 }
 
 /// The ink that reads against the accent, and the veil that hovers over it: the

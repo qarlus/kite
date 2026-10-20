@@ -1322,7 +1322,7 @@ impl Kite {
                     .test_support(),
             )
             .child(
-                strip_chip(&t)
+                strip_chip(&t, STRIP_CHIP)
                     .id("open-settings")
                     .test_support()
                     .aria_label("Settings")
@@ -1344,7 +1344,7 @@ impl Kite {
     fn pane_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let shown = self.settings.reading_pane;
-        strip_chip(&t)
+        strip_chip(&t, STRIP_CHIP)
             .id("toggle-reading-pane")
             .test_support()
             .aria_label("Toggle list and reading pane")
@@ -1847,16 +1847,16 @@ fn body_column(window: &Window) -> f32 {
         .max(120.)
 }
 
-/// A strip icon button: a rounded hover chip, never a full-height square, so it matches the icon
+/// A quiet icon button: a rounded hover chip, never a full-height square, so it matches the icon
 /// buttons in the list header and the thread toolbar. It paints nothing until the pointer arrives.
-fn strip_chip(t: &Theme) -> Div {
+pub(crate) fn strip_chip(t: &Theme, size: f32) -> Div {
     let t = *t;
     div()
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
-        .size(px(STRIP_CHIP))
+        .size(px(size))
         .rounded(px(RADIUS_SM))
         .cursor_pointer()
         .hover(move |s| s.bg(Theme::alpha(t.fg, CHIP_HOVER)).text_color(t.fg))
