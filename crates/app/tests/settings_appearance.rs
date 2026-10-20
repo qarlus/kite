@@ -3,7 +3,9 @@ mod common;
 use common::{Fixture, mount, read_settings, update_content};
 use gpui_kit::base::Root;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-use gpui_kit::{AppContext, ScrollDelta, TestAppContext, WindowHandle, point, px};
+use gpui_kit::{
+    AppContext, ElementId, ScrollDelta, SharedString, TestAppContext, WindowHandle, point, px,
+};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -238,6 +240,111 @@ async fn a_font_is_picked_from_the_list_and_system_default_clears_it(cx: &mut Te
     })
     .unwrap();
     assert_eq!(fixture.settings.lock().unwrap().font_family, "Georgia");
+}
+
+/// The list measures section 0's header once and gives every section's header row that
+/// height, so each group's label must own a fixed-height row instead of being drawn
+/// across the first item of the group below it.
+#[gpui_kit::test]
+fn font_picker_group_headers_own_a_row_and_never_overlap_their_items(cx: &mut TestAppContext) {
+    let fixture = Fixture::showcase();
+    // The headless text system installs no fonts, so the saved face is what gives the
+    // picker a second section ("Current") to check a later header against.
+    fixture.settings.lock().unwrap().font_family = "Georgia".into();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "secondary-,");
+    let (default_header, current_header, default_row, current_row) = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-tab", 1usize), cx);
+            window.render_frame(cx);
+            window.scroll(
+                "settings-scroll",
+                ScrollDelta::Pixels(point(px(0.), px(-480.))),
+                cx,
+            );
+            window.render_frame(cx);
+            window.within("font-family").click("input", cx);
+            window.render_frame(cx);
+            (
+                window.find(("font-group", 0usize)),
+                window.find(("font-group", 1usize)),
+                window.find((ElementId::from("font-choice"), SharedString::from(""))),
+                window.find((
+                    ElementId::from("font-choice"),
+                    SharedString::from("Georgia"),
+                )),
+            )
+        })
+        .unwrap();
+    assert_eq!(default_header.label(), Some("Default"));
+    assert_eq!(current_header.label(), Some("Current"));
+    assert_eq!(default_row.label(), Some("System default"));
+    assert_eq!(current_row.label(), Some("Georgia"));
+
+    let height = default_header.bounds().size.height;
+    assert!(
+        height >= px(20.),
+        "a group header needs a real row, not a zero-height one: {height:?}"
+    );
+    assert_eq!(
+        current_header.bounds().size.height,
+        height,
+        "every header is the same height, because the list measures just one"
+    );
+    for (header, row) in [
+        (default_header.clone(), default_row.clone()),
+        (current_header.clone(), current_row.clone()),
+    ] {
+        assert!(
+            !header.bounds().intersects(&row.bounds()),
+            "header {:?} is drawn over its own first row {:?}",
+            header.bounds(),
+            row.bounds()
+        );
+        assert!(
+            header.bounds().bottom() <= row.bounds().top(),
+            "header {:?} has to sit above its first row {:?}",
+            header.bounds(),
+            row.bounds()
+        );
+    }
+    assert!(
+        default_row.bounds().bottom() <= current_header.bounds().top(),
+        "the second group starts below the first group's rows"
+    );
+
+    // Filtering leaves one section: its header is now section 0 and still owns its row.
+    cx.update_window(window.into(), |_, window, cx| window.input("geor", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("font-family").expanded(),
+            Some(true),
+            "the filtered list stays open"
+        );
+        let header = window.find(("font-group", 0usize));
+        let row = window.find((
+            ElementId::from("font-choice"),
+            SharedString::from("Georgia"),
+        ));
+        assert_eq!(header.label(), Some("Current"));
+        assert_eq!(header.bounds().size.height, height);
+        assert!(
+            !header.bounds().intersects(&row.bounds())
+                && header.bounds().bottom() <= row.bounds().top(),
+            "a filtered header {:?} still has to sit above {:?}",
+            header.bounds(),
+            row.bounds()
+        );
+        assert!(
+            window.try_find(("font-group", 1usize)).is_none(),
+            "only the matching group is a section"
+        );
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

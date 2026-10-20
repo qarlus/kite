@@ -129,13 +129,19 @@ impl SearchableListItem for FontChoice {
     }
 
     fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
-        div().font_family(self.face()).child(self.title.clone())
+        div()
+            .id((ElementId::from("font-choice"), self.family.clone()))
+            .test_support()
+            .aria_label(self.title.clone())
+            .font_family(self.face())
+            .child(self.title.clone())
     }
 }
 
-/// The picker's rows, cached at startup: System default, the installed recommended
-/// faces, then every other installed family. `matched` mirrors the query so a
-/// keystroke only re-filters indices instead of re-reading the system fonts.
+/// The picker's rows, cached at startup: System default, the saved family when it is
+/// not installed, the installed recommended faces, then every other installed family.
+/// `matched` mirrors the query so a keystroke only re-filters indices instead of
+/// re-reading the system fonts.
 pub struct FontList {
     groups: Vec<(SharedString, Vec<FontChoice>)>,
     /// `(group, rows)` of every section the current query keeps, in display order.
@@ -172,18 +178,18 @@ impl FontList {
             .map(|name| FontChoice::new(name))
             .collect();
 
-        let mut default = vec![FontChoice::new("")];
-        // A saved family that is no longer installed stays selectable, never crashes.
+        // Every group carries a title: the list measures section 0's header once and
+        // reuses that height for every section, so no group may start headerless.
+        let mut groups: Vec<(SharedString, Vec<FontChoice>)> =
+            vec![("Default".into(), vec![FontChoice::new("")])];
+        // A saved family that is no longer installed keeps its own row, never a crash.
         let saved = settings.font_family.trim();
         if !saved.is_empty() && !has(saved) {
-            default.push(FontChoice::new(saved));
+            groups.push(("Current".into(), vec![FontChoice::new(saved)]));
         }
+        groups.push(("Recommended".into(), recommended));
+        groups.push(("All fonts".into(), others));
 
-        let groups = vec![
-            (SharedString::default(), default),
-            ("Recommended".into(), recommended),
-            ("All fonts".into(), others),
-        ];
         let matched = groups
             .iter()
             .enumerate()
@@ -258,16 +264,27 @@ impl SearchableListDelegate for FontList {
     ) -> Option<AnyElement> {
         let (group, _) = self.matched.get(section)?;
         let title = self.groups.get(*group)?.0.clone();
-        // The default group carries no heading: System default is the first row.
-        (!title.is_empty()).then(|| {
+        // The list measures section 0's header once and gives every section's header row
+        // that height. A missing or auto-sized header would therefore be a zero-height
+        // row, painting the next group's label on top of its first item, so this is a
+        // fixed-height block for every group, filtered or not.
+        Some(
             div()
-                .py_1()
+                .id(("font-group", section))
+                .test_support()
+                .aria_label(title.to_string())
+                .w_full()
+                .h(px(24.))
+                .flex()
+                .items_center()
                 .px_1()
-                .text_sm()
-                .text_color(cx.theme().muted_foreground)
-                .child(title)
-                .into_any_element()
-        })
+                .pt_1()
+                .text_size(px(11.))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(cx.theme().muted_foreground.opacity(0.8))
+                .child(SharedString::from(title.to_uppercase()))
+                .into_any_element(),
+        )
     }
 }
 
