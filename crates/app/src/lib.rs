@@ -35,6 +35,7 @@ gpui_kit::assets::icon_assets!(
         X,
         SquarePen,
         RefreshCw,
+        Sparkles,
         Lock,
         Plus,
         Tag,

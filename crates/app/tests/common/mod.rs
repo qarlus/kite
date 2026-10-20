@@ -1038,6 +1038,25 @@ impl Mail for Fixture {
     }
 
     fn ai(&self, req: u32, request: AiRequest) -> anyhow::Result<()> {
+        // The store refuses a Private source before it builds a prompt, so the fixture refuses
+        // it too: the UI must show that refusal, and no request may reach the engine.
+        if let AiRequest::Summary { thread } = &request {
+            let private = self
+                .threads
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|t| t.id == *thread)
+                .is_some_and(|t| {
+                    t.labels
+                        .iter()
+                        .any(|tag| tag.eq_ignore_ascii_case(kite_core::model::PRIVATE_TAG))
+                });
+            anyhow::ensure!(
+                !private,
+                "This conversation is private, so AI can't read it"
+            );
+        }
         self.ai_requests.lock().unwrap().push((req, request));
         Ok(())
     }
