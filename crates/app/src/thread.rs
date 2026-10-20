@@ -20,21 +20,18 @@ use std::sync::Arc;
 /// renders at is the width the body is shown at.
 pub const PANE_PAD: f32 = 32.;
 
-/// Past the avatar column, so everything a message holds lines up under its sender's name.
+/// Past the avatar column, so text bodies and everything else a message holds line up under its
+/// sender's name. An HTML body is not indented: it is the pane's own column, aligned with the
+/// header above it, so authored mail gets the whole width.
 pub const BODY_INDENT: f32 = 44.;
-
-/// The paper card's padding: mail text stops short of the card's rounded edge, and the padding
-/// is the paper's own colour, so the body still looks like one sheet.
-pub const PAPER_PAD: f32 = 12.;
 
 /// How many fetched remote images are kept in memory. A body that asks for more keeps its
 /// remaining images blocked, which bounds a long session without a retry loop.
 const IMAGE_CACHE: usize = 128;
 
-/// Cache key: a body is re-rendered when the message, width, DPI scale, the reader's type scale
-/// or font, the set of fetched remote images or the message's image permission changes. The
-/// appearance itself is absent: a body paints on its own paper, so switching light and dark
-/// must not re-render every conversation.
+/// Cache key: a body is re-rendered when the message, width, DPI scale, the appearance (the pane
+/// and ink a body is adapted to), the set of fetched remote images or the message's image
+/// permission changes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HtmlKey {
     pub id: Id,
@@ -56,8 +53,9 @@ impl HtmlKey {
     ) -> Self {
         Self {
             id,
-            // Quantised so a drag-resize does not miss the cache every frame.
-            width: (width * 4.).round() as u32,
+            // Quantised to whole pixels: a drag-resize re-renders once per pixel, not once per
+            // frame.
+            width: width.round() as u32,
             scale: (scale * 20.).round() as u32,
             appearance,
             images,
@@ -66,7 +64,7 @@ impl HtmlKey {
     }
 
     fn at(&self) -> (f32, f32) {
-        (self.width as f32 / 4., self.scale as f32 / 20.)
+        (self.width as f32, self.scale as f32 / 20.)
     }
 }
 
@@ -128,23 +126,22 @@ impl HtmlCache {
 }
 
 impl Kite {
-    /// The Blitz render width: the reading pane's column, less the indent a body hangs under.
+    /// The Blitz render width: the reading pane's column, edge to edge, so wide tables and long
+    /// lines are never clipped.
     pub(crate) fn body_width(&self) -> f32 {
-        (self.html_width - BODY_INDENT).max(120.)
+        self.html_width.max(120.)
     }
 
-    /// The card a body sits in, less its padding: the width Blitz lays the mail out at.
-    fn paper_width(&self) -> f32 {
-        (self.body_width() - 2. * PAPER_PAD).max(80.)
-    }
-
-    /// What a body takes from the appearance: the reader's type scale and font. Nothing else
-    /// reaches the paper, so a light/dark switch leaves every rendered body valid.
+    /// What a body takes from the appearance: the reader's type scale and font, plus the pane and
+    /// ink its colours are adapted to.
     fn html_appearance(&self) -> u64 {
         use std::hash::{Hash as _, Hasher as _};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         ((self.theme.scale * 1000.).round() as u64).hash(&mut hasher);
         crate::theme::font(&self.settings).hash(&mut hasher);
+        self.theme.dark.hash(&mut hasher);
+        crate::theme::hex(self.theme.fg).hash(&mut hasher);
+        crate::theme::hex(self.theme.accent).hash(&mut hasher);
         hasher.finish()
     }
 
@@ -250,8 +247,9 @@ impl Kite {
     }
 
     /// The reading-pane toolbar: icon-only buttons in the order they act on the conversation,
-    /// with back and the list/reading-pane toggle first. Each label carries the key that is bound
-    /// right now, so a click-first reader loses nothing.
+    /// with Back first. Each label carries the key that is bound right now, so a click-first
+    /// reader loses nothing. The list/reading-pane toggle lives in the window strip, above the
+    /// list column it acts on.
     fn thread_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         const GROUPS: [&[(u8, IconName, &str)]; 4] = [
@@ -293,7 +291,6 @@ impl Kite {
             .h(px(48.))
             .border_b_1()
             .border_color(t.line)
-            .child(self.pane_toggle(cx))
             .child(self.action_icon(
                 keys::cmd::BACK,
                 IconName::ArrowLeft,
@@ -430,35 +427,6 @@ impl Kite {
         }
     }
 
-    /// Side by side, or one at a time: `settings.reading_pane`, saved like any preference.
-    fn pane_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
-        let t = self.theme;
-        let shown = self.settings.reading_pane;
-        div()
-            .id("toggle-reading-pane")
-            .test_support()
-            .aria_label("Toggle list and reading pane")
-            .aria_selected(shown)
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(30.))
-            .rounded(px(RADIUS_SM))
-            .cursor_pointer()
-            .hover(|s| s.bg(t.bg3))
-            .child(
-                Icon::new(IconName::PanelRight)
-                    .with_size(px(16.))
-                    .text_color(if shown { t.fg } else { t.fg2 }),
-            )
-            .on_click(cx.listener(|this, _, window, cx| {
-                let mut settings = this.settings.clone();
-                settings.reading_pane = !settings.reading_pane;
-                this.save_preferences(settings, window, cx);
-            }))
-            .into_any_element()
-    }
-
     fn message(
         &mut self,
         message: Message,
@@ -481,56 +449,57 @@ impl Kite {
         let exact = at
             .map(|at: DateTime<Local>| at.format("%a, %-d %b %Y · %H:%M %:z").to_string())
             .unwrap_or_default();
-        let mut header = div()
-            .flex()
-            .items_start()
-            .gap_3()
-            .flex_shrink_0()
-            .child(avatar(&sender, ix, if open { 32. } else { 24. }))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .id(format!("message-from-{ix}"))
-                            .test_support()
-                            .aria_label(format!("From: {}", address(&message.from)))
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(t.px(14.))
-                                    .font_weight(FontWeight(650.))
-                                    .child(sender),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(t.px(12.))
-                                    .text_color(t.fg2)
-                                    .child(message.from.email.clone()),
-                            )
-                            .child(
-                                div()
-                                    .id(format!("message-date-{ix}"))
-                                    .test_support()
-                                    .aria_label(exact)
-                                    .flex_shrink_0()
-                                    .text_size(t.px(12.))
-                                    .text_color(t.fg2)
-                                    .child(stamp),
-                            ),
-                    )
-                    .when(open, |d| {
-                        d.child(
+        let date = || {
+            div()
+                .id(format!("message-date-{ix}"))
+                .test_support()
+                .aria_label(exact.clone())
+                .flex_shrink_0()
+                .text_size(t.px(12.))
+                .text_color(t.fg2)
+                .child(stamp.clone())
+        };
+        let name = || {
+            div()
+                .text_size(t.px(14.))
+                .font_weight(FontWeight(650.))
+                .child(sender.clone())
+        };
+        let header = if open {
+            div()
+                .id(format!("message-from-{ix}"))
+                .test_support()
+                .aria_label(format!("From: {}", address(&message.from)))
+                .flex()
+                .items_start()
+                .gap_3()
+                .flex_shrink_0()
+                .child(avatar(&sender, ix, 32.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .gap_2()
+                                .min_w_0()
+                                .child(name().flex_shrink_0())
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(t.px(12.))
+                                        .text_color(t.fg2)
+                                        .child(message.from.email.clone()),
+                                )
+                                .child(date()),
+                        )
+                        .child(
                             div()
                                 .id(format!("message-to-{ix}"))
                                 .test_support()
@@ -551,20 +520,43 @@ impl Kite {
                                     .text_color(t.fg2)
                                     .child(format!("Cc {}", names(&message.cc))),
                             )
-                        })
-                    }),
-            );
-        if !open {
-            header = header.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(t.px(12.))
-                    .text_color(t.fg2)
-                    .child(snippet(&message)),
-            );
-        }
+                        }),
+                )
+        } else {
+            // One line: who, what, when. The snippet takes whatever the name leaves and the
+            // date sits at the row's right edge, in the column an expanded message's date is in.
+            div()
+                .id(format!("message-from-{ix}"))
+                .test_support()
+                .aria_label(format!("From: {}", address(&message.from)))
+                .flex()
+                .items_center()
+                .gap_3()
+                .flex_shrink_0()
+                .child(avatar(&sender, ix, 24.))
+                .child(
+                    name()
+                        .id(format!("message-sender-{ix}"))
+                        .test_support()
+                        .aria_label(sender.clone())
+                        .min_w_0()
+                        .flex_shrink_1()
+                        .truncate(),
+                )
+                .child(
+                    div()
+                        .id(format!("message-snippet-{ix}"))
+                        .test_support()
+                        .aria_label(snippet(&message))
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(t.px(12.))
+                        .text_color(t.fg2)
+                        .child(snippet(&message)),
+                )
+                .child(date())
+        };
         let card = div()
             .id(format!("msg-{ix}"))
             .test_support()
@@ -575,7 +567,6 @@ impl Kite {
             .when(open, |d| d.pt_5().pb_6())
             .when(!open, |d| {
                 d.py_2()
-                    .px_2()
                     .rounded(px(RADIUS_SM))
                     .cursor_pointer()
                     .hover(|s| s.bg(t.bg3))
@@ -608,26 +599,25 @@ impl Kite {
                     .child(self.html_body(&message, source, allowed, scale, body_width, cx))
                     .into_any_element()
             }
+            // Text bodies keep their theme type and hang under the sender's name.
             None => div()
                 .id(format!("text-{}", message.id))
                 .test_support()
                 .aria_label(message.text.clone())
-                .max_w(px(body_width))
+                .ml(px(BODY_INDENT))
+                .max_w(px(body_width - BODY_INDENT))
                 .text_size(t.px(15.))
                 .line_height(relative(1.7))
                 .child(message.text.clone())
                 .into_any_element(),
         };
-        // Everything the message holds starts where its sender's name does.
-        let mut column = div()
-            .pt_5()
-            .pl(px(BODY_INDENT))
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(body);
+        let mut column = div().pt_5().flex().flex_col().gap_4().child(body);
+        // Attachment chips and the reply row still start where the sender's name does.
+        let mut tail = div().pl(px(BODY_INDENT)).flex().flex_col().gap_4();
+        let mut holds_tail = false;
         if !message.attachments.is_empty() {
-            column = column.child(div().flex().flex_wrap().gap_2().children(
+            holds_tail = true;
+            tail = tail.child(div().flex().flex_wrap().gap_2().children(
                 message.attachments.iter().map(|attachment| {
                     let id = attachment.id;
                     div()
@@ -675,8 +665,9 @@ impl Kite {
         }
         // The conversation ends where you answer it.
         if is_last {
+            holds_tail = true;
             let recipients = message.to.len() + message.cc.len();
-            column = column.child(
+            tail = tail.child(
                 div()
                     .flex()
                     .flex_wrap()
@@ -706,11 +697,14 @@ impl Kite {
                     )),
             );
         }
+        if holds_tail {
+            column = column.child(tail);
+        }
         card.child(column).into_any_element()
     }
 
-    /// The rendered HTML body: paper card around an image at the exact rendered height, with
-    /// link hit testing.
+    /// The rendered HTML body: the image at its exact rendered size, on the pane's own canvas,
+    /// with link hit testing.
     fn html_body(
         &mut self,
         message: &Message,
@@ -721,10 +715,9 @@ impl Kite {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
-        let width = (self.paper_width() * scale).round() / scale;
         let key = HtmlKey::new(
             message.id,
-            width,
+            body_width,
             scale,
             self.html_appearance(),
             self.images_version,
@@ -749,56 +742,50 @@ impl Kite {
         {
             Some(rendered) => {
                 let image: Arc<RenderImage> = rendered.image.clone();
-                let height = rendered.height;
+                let (width, height) = (rendered.width, rendered.height);
                 let id = message.id;
                 let bounds = self.html_bounds.clone();
+                // No card, border or padding: the render is the pane's own canvas, so it has no
+                // edge to round.
+                let page = img(ImageSource::Render(image)).w(px(width)).h(px(height));
                 div()
                     .id(format!("html-{id}"))
                     .test_support()
                     .aria_label(format!("HTML body, {height:.0}px"))
-                    .w(px(body_width))
-                    .p(px(PAPER_PAD))
-                    .rounded(px(RADIUS))
-                    .bg(white())
-                    .when(t.dark, |d| d.border_1().border_color(t.line))
+                    .relative()
+                    .w(px(width))
+                    .h(px(height))
+                    .child(page)
                     .child(
-                        div()
-                            .relative()
-                            .w(px(width))
-                            .h(px(height))
-                            .child(img(ImageSource::Render(image)).w(px(width)).h(px(height)))
-                            .child(
-                                canvas(
-                                    {
-                                        let bounds = bounds.clone();
-                                        move |area, _, _| {
-                                            bounds.borrow_mut().insert(id, area);
-                                        }
-                                    },
-                                    |_, _, _, _| {},
-                                )
-                                .absolute()
-                                .inset_0(),
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    let Some(area) = this.html_bounds.borrow().get(&id).copied()
-                                    else {
-                                        return;
-                                    };
-                                    let at = event.position - area.origin;
-                                    if let Some(href) = this
-                                        .html_cache
-                                        .get(&key)
-                                        .or_else(|| this.html_cache.shown(id))
-                                        .and_then(|r| r.link_at(at.x.into(), at.y.into()))
-                                    {
-                                        cx.open_url(&href);
-                                        cx.stop_propagation();
-                                    }
-                                }),
-                            ),
+                        canvas(
+                            {
+                                let bounds = bounds.clone();
+                                move |area, _, _| {
+                                    bounds.borrow_mut().insert(id, area);
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            let Some(area) = this.html_bounds.borrow().get(&id).copied() else {
+                                return;
+                            };
+                            let at = event.position - area.origin;
+                            if let Some(href) = this
+                                .html_cache
+                                .get(&key)
+                                .or_else(|| this.html_cache.shown(id))
+                                .and_then(|r| r.link_at(at.x.into(), at.y.into()))
+                            {
+                                cx.open_url(&href);
+                                cx.stop_propagation();
+                            }
+                        }),
                     )
                     .into_any_element()
             }
@@ -829,11 +816,11 @@ impl Kite {
         }
         let (width, scale) = key.at();
         let source = source.to_string();
-        let text = self.theme.scale;
+        let theme = self.theme;
         let font = crate::theme::font(&self.settings).to_string();
         let task = cx.background_executor().spawn(async move {
             let html = crate::html::inline_images(&source, &images);
-            html::render_styled(&html, width, scale, text, &font)
+            html::render_styled(&html, width, scale, theme, &font)
         });
         cx.spawn(async move |this, cx| {
             let rendered = task.await;
@@ -857,7 +844,7 @@ impl Kite {
                 self.settings.load_remote_images || self.images_allowed.contains(&message.id);
             let key = HtmlKey::new(
                 message.id,
-                self.paper_width(),
+                self.body_width(),
                 self.html_scale,
                 self.html_appearance(),
                 self.images_version,

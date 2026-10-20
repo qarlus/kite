@@ -332,6 +332,17 @@ impl Kite {
             }
         })
         .detach();
+        // A bare resize changes the reading pane's column, and a view that is not dirty is not
+        // rendered again: without this a body keeps the frame it was laid out for.
+        this.subs
+            .push(cx.observe_window_bounds(window, |this, window, cx| {
+                let width = body_column(window);
+                if (width - this.html_width).abs() >= 1. || window.scale_factor() != this.html_scale
+                {
+                    this.html_width = width;
+                    cx.notify();
+                }
+            }));
         this.reload();
         window.focus(&this.focus, cx);
         this
@@ -1266,14 +1277,39 @@ impl Kite {
         } else {
             panel
         };
-        div()
+        let mut strip = div()
             .id("window-strip")
             .test_support()
             .flex_shrink_0()
             .h(px(STRIP_H))
             .flex()
-            .items_center()
-            .when(wide > 0., |d| d.child(div().w(px(wide)).h_full().bg(panel)))
+            .items_center();
+        // The list/reading-pane toggle opens the strip at the list column's left edge, and stays
+        // on that spot when the list steps aside, so the control never jumps under the pointer.
+        strip = if wide > 0. {
+            strip.child(
+                div()
+                    .w(px(wide))
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .pl(px(STRIP_PAD))
+                    .bg(panel)
+                    .children((!settings_open).then(|| self.pane_toggle(cx))),
+            )
+        } else {
+            strip.when(!settings_open, |d| {
+                d.child(
+                    div()
+                        .h_full()
+                        .flex()
+                        .items_center()
+                        .pl(px(STRIP_PAD))
+                        .child(self.pane_toggle(cx)),
+                )
+            })
+        };
+        strip
             .child(
                 div()
                     .id("window-drag")
@@ -1314,6 +1350,35 @@ impl Kite {
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
             )
             .child(self.window_controls(window))
+            .into_any_element()
+    }
+
+    /// Side by side, or one at a time: `settings.reading_pane`, saved like any preference. It is
+    /// a strip control above the list column it acts on, in the same box as the cog and the
+    /// window buttons, so the icons share one line.
+    fn pane_toggle(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let shown = self.settings.reading_pane;
+        div()
+            .id("toggle-reading-pane")
+            .test_support()
+            .aria_label("Toggle list and reading pane")
+            .aria_selected(shown)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .w(px(WINDOW_CONTROL_W))
+            .h_full()
+            .cursor_pointer()
+            .text_color(if shown { t.fg } else { t.fg2 })
+            .hover(move |s| s.bg(Theme::alpha(t.fg, 0.08)).text_color(t.fg))
+            .child(Icon::new(IconName::PanelRight).with_size(px(14.)))
+            .on_click(cx.listener(|this, _, window, cx| {
+                let mut settings = this.settings.clone();
+                settings.reading_pane = !settings.reading_pane;
+                this.save_preferences(settings, window, cx);
+            }))
             .into_any_element()
     }
 
@@ -1790,6 +1855,16 @@ impl Kite {
 }
 
 const WINDOW_CONTROL_W: f32 = 46.;
+/// The window strip's inset before its first control, so the pane toggle sits at the list
+/// column's left edge rather than against the rail.
+const STRIP_PAD: f32 = 4.;
+
+/// The width a message body is rendered at: the reading pane's column, inside its own padding.
+fn body_column(window: &Window) -> f32 {
+    ((window.viewport_size().width.as_f32() - crate::sidebar::width(window)).min(MAX_COL)
+        - 2. * crate::thread::PANE_PAD)
+        .max(120.)
+}
 
 /// One window button. Windows resolves the click through its hit test, so no handler is needed.
 fn window_control(
@@ -1885,10 +1960,7 @@ impl Render for Kite {
         crate::sidebar::set_pane(pane);
         // The thread is laid out in the reading pane, not under the list; `html_width` is its
         // column inside the pane's padding, so a body renders at the width it is shown at.
-        self.html_width = ((window.viewport_size().width.as_f32() - crate::sidebar::width(window))
-            .min(MAX_COL)
-            - 2. * crate::thread::PANE_PAD)
-            .max(120.);
+        self.html_width = body_column(window);
         self.html_scale = window.scale_factor();
         let open = self.open.is_some();
         let preferences_open = self.preferences.is_some();

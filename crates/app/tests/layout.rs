@@ -246,6 +246,67 @@ fn the_settings_cog_is_centred_on_the_window_strip(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// The list/reading-pane toggle is a control of the window strip, at the list column's left
+/// edge — not a button in the reading pane's own toolbar — and it keeps that spot when the list
+/// steps aside, so the control never moves under the pointer.
+#[gpui_kit::test]
+fn the_pane_toggle_sits_in_the_window_strip_above_the_list(cx: &mut TestAppContext) {
+    let (window, _) = mount(cx, Fixture::showcase());
+    cx.simulate_keystrokes(window.into(), "j enter");
+    let (strip, list, beside) = cx
+        .update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            let strip = window.find("window-strip").bounds();
+            let list = window.find("list-column").bounds();
+            let toggle = window.find("toggle-reading-pane").bounds();
+            assert!(
+                strip.contains(&toggle.origin)
+                    && toggle.right() <= strip.right()
+                    && toggle.bottom() <= strip.bottom(),
+                "the toggle is in the window strip: {toggle:?} of {strip:?}"
+            );
+            assert!(
+                toggle.origin.x >= list.origin.x && toggle.right() <= list.right(),
+                "and above the list column: {toggle:?} of {list:?}"
+            );
+            assert!(
+                toggle.center().x < list.center().x,
+                "at its left edge, not floating at the right end: {toggle:?} of {list:?}"
+            );
+            assert_eq!(
+                toggle.center().y,
+                strip.center().y,
+                "in line with the cog and the window buttons"
+            );
+            let toolbar = window.find("thread-toolbar").bounds();
+            assert!(
+                !toolbar.contains(&toggle.origin),
+                "the reading pane's toolbar no longer carries it: {toggle:?} of {toolbar:?}"
+            );
+            window.click("toggle-reading-pane", cx);
+            (strip, list, toggle)
+        })
+        .unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("list-column").is_none(),
+            "the list stepped aside for one pane"
+        );
+        let alone = window.find("toggle-reading-pane").bounds();
+        assert_eq!(
+            alone.origin, beside.origin,
+            "the toggle holds its place in the strip: {alone:?} vs {beside:?}"
+        );
+        assert!(
+            alone.origin.x < list.center().x,
+            "still at the list column's left edge: {alone:?} of {list:?}"
+        );
+        assert!(strip.contains(&alone.origin) && alone.bottom() <= strip.bottom());
+    })
+    .unwrap();
+}
+
 #[gpui_kit::test]
 fn the_appearance_switch_turns_the_reading_pane_off_and_back_on(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
