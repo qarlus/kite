@@ -238,7 +238,7 @@ impl Default for Settings {
             load_remote_images: false,
             ai_enabled: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
-            ai_model: "deepseek-v4.1-flash".into(),
+            ai_model: "minimax-m3.1-flash-free".into(),
             input_mode: "keyboard".into(),
             shortcuts: Default::default(),
             reading_pane: true,
@@ -260,6 +260,17 @@ pub enum ProtonAuth {
     HumanVerification {
         url: String,
     },
+}
+
+/// A model the configured AI endpoint offers. Kite only offers free models whose provider keeps
+/// no data (zero data retention), so mail never trains or lingers on a third-party server.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct AiModel {
+    /// Sent as the request's `model`.
+    pub id: String,
+    pub name: String,
+    pub free: bool,
+    pub zdr: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

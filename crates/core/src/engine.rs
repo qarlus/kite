@@ -148,6 +148,8 @@ impl Secrets {
 /// Test seams. Production uses [`Options::default`].
 #[derive(Clone)]
 pub struct Options {
+    /// Provider host for AI protocol tests against a local HTTP server.
+    pub ai_provider_host: Option<String>,
     pub graph_base_url: Option<String>,
     pub graph_authority: Option<String>,
     pub proton_api_url: Option<String>,
@@ -159,6 +161,7 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            ai_provider_host: None,
             graph_base_url: None,
             graph_authority: None,
             proton_api_url: None,
@@ -1342,6 +1345,16 @@ impl Mail for Engine {
         self.inner.secrets.set("ai_key", key)
     }
 
+    fn ai_models(&self) -> Result<Vec<AiModel>> {
+        let settings = self.inner.read(Store::settings)?;
+        let key = self.inner.secrets.get("ai_key")?;
+        run_async(crate::ai::models(
+            &settings,
+            key.as_deref(),
+            self.inner.opts.ai_provider_host.as_deref(),
+        ))
+    }
+
     fn calendar_today(&self, account: Id) -> Result<Vec<CalEvent>> {
         if self.inner.read(|s| s.account_provider(account))? != Some(Provider::Microsoft) {
             return Ok(Vec::new());
@@ -1386,7 +1399,15 @@ impl Mail for Engine {
                 let result = inner
                     .read(|store| crate::ai::prepare(store, &request))
                     .and_then(|messages| {
-                        crate::ai::stream(&settings, &key, req, &session, messages, &inner)
+                        crate::ai::stream(
+                            &settings,
+                            inner.opts.ai_provider_host.as_deref(),
+                            &key,
+                            req,
+                            &session,
+                            messages,
+                            &inner,
+                        )
                     });
                 if let Err(e) = result {
                     inner.emit(Event::Ai {

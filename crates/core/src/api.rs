@@ -97,6 +97,11 @@ pub trait Mail: Send + Sync + 'static {
     /// Streams `Event::Ai { req, .. }` chunks. The engine checks source privacy and builds the
     /// prompt; callers cannot submit an unscoped prompt containing protected mail.
     fn ai(&self, req: u32, request: AiRequest) -> Result<()>;
+    /// The free, zero-data-retention models the configured AI endpoint offers. Blocks on the
+    /// network: call it from a background task.
+    fn ai_models(&self) -> Result<Vec<AiModel>> {
+        Ok(Vec::new())
+    }
     fn sync_now(&self);
     /// Engine -> UI notifications. Each call returns a new receiver.
     fn events(&self) -> async_channel::Receiver<Event>;
