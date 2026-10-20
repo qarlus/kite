@@ -1819,6 +1819,7 @@ impl Kite {
                                 .flex()
                                 .items_center()
                                 .gap_2()
+                                .max_w(px(560.))
                                 .px_3()
                                 .py_2()
                                 .rounded_full()
@@ -1846,7 +1847,7 @@ impl Kite {
                                             ),
                                     )
                                 })
-                                .child(toast.text.clone())
+                                .child(div().min_w_0().truncate().child(toast.text.clone()))
                                 .when(can_undo, |d| {
                                     d.child(
                                         div()

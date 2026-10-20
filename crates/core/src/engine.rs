@@ -1378,13 +1378,16 @@ impl Mail for Engine {
             .get("ai_key")?
             .context("no AI key configured")?;
         let inner = self.inner.clone();
+        let session = crate::ai::session(&request);
         std::thread::Builder::new()
             .name("kite-ai".into())
             .spawn(move || {
                 // Recheck after queueing: the user may have marked the source Private.
                 let result = inner
                     .read(|store| crate::ai::prepare(store, &request))
-                    .and_then(|messages| crate::ai::stream(&settings, &key, req, messages, &inner));
+                    .and_then(|messages| {
+                        crate::ai::stream(&settings, &key, req, &session, messages, &inner)
+                    });
                 if let Err(e) = result {
                     inner.emit(Event::Ai {
                         req,

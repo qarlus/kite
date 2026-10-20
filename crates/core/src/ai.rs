@@ -1,4 +1,5 @@
 //! OpenAI-compatible streaming chat over SSE. Each chunk is delivered as `Event::Ai`.
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -53,23 +54,45 @@ pub(crate) fn prepare(store: &Store, request: &AiRequest) -> Result<Vec<ChatMsg>
     ])
 }
 
+/// OpenCode Go rejects requests without a stable per-conversation `x-opencode-session` (it
+/// routes and caches prompts by it). One id per thread or draft, behind a per-run nonce so ids
+/// from different installs never collide.
+pub(crate) fn session(request: &AiRequest) -> String {
+    static NONCE: OnceLock<String> = OnceLock::new();
+    let nonce = NONCE.get_or_init(|| {
+        let mut bytes = [0u8; 8];
+        let _ = getrandom::fill(&mut bytes);
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    });
+    match request {
+        AiRequest::Summary { thread } => format!("kite-{nonce}-thread-{thread}"),
+        AiRequest::Compose { draft } => match (draft.id, draft.reply_to) {
+            (Some(id), _) => format!("kite-{nonce}-draft-{id}"),
+            (None, Some(reply)) => format!("kite-{nonce}-reply-{reply}"),
+            (None, None) => format!("kite-{nonce}-compose"),
+        },
+    }
+}
+
 pub(crate) fn stream(
     settings: &Settings,
     key: &str,
     req: u32,
+    session: &str,
     messages: Vec<ChatMsg>,
     out: &Inner,
 ) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    rt.block_on(request(settings, key, req, messages, out))
+    rt.block_on(request(settings, key, req, session, messages, out))
 }
 
 async fn request(
     settings: &Settings,
     key: &str,
     req: u32,
+    session: &str,
     messages: Vec<ChatMsg>,
     out: &Inner,
 ) -> Result<()> {
@@ -87,10 +110,12 @@ async fn request(
     });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
+        .user_agent(concat!("kite-mail/", env!("CARGO_PKG_VERSION")))
         .build()?;
     let res = client
         .post(&url)
         .bearer_auth(key)
+        .header("x-opencode-session", session)
         .json(&body)
         .send()
         .await
@@ -98,9 +123,14 @@ async fn request(
     let status = res.status();
     if !status.is_success() {
         let text = res.text().await.unwrap_or_default();
+        // OpenAI-compatible errors carry a readable `error.message`; fall back to the raw body.
+        let reason = serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|v| v["error"]["message"].as_str().map(str::to_owned))
+            .unwrap_or(text);
         bail!(
             "AI request failed ({status}): {}",
-            text.chars().take(200).collect::<String>()
+            reason.chars().take(200).collect::<String>()
         );
     }
 
