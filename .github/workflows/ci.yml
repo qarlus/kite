@@ -2,7 +2,9 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
   pull_request:
+    paths-ignore: ["**.md", "docs/**", "LICENSE"]
 # A new push to the same branch cancels the run it replaces.
 concurrency:
   group: ci-${{ github.ref }}
@@ -29,6 +31,8 @@ jobs:
   # the size budget; the timing budgets run under `perf` (thin LTO, parallel codegen), which is
   # several times faster to build than linking every test binary with fat LTO.
   budgets:
+    # Release builds are slow (fat LTO); PRs get lint and tests, main gets the budgets.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
