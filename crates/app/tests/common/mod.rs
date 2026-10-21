@@ -63,6 +63,12 @@ pub struct Fixture {
     pub image_bytes: Mutex<Vec<u8>>,
     /// Every `ai` request the UI made, with the prompt it sent.
     pub ai_requests: Mutex<Vec<(u32, AiRequest)>>,
+    /// The text the next `ai` call streams back as one chunk; empty stays silent.
+    pub ai_reply: Mutex<String>,
+    /// The `AiSources` an `Ask` request emits before its chunks.
+    pub ai_sources: Mutex<Vec<Id>>,
+    /// When set, `ai` ends the stream and emits `Event::Error`, like a failed stream.
+    pub ai_error: Mutex<Option<String>>,
     /// The model list `ai_models` answers with.
     pub ai_models: Mutex<Vec<AiModel>>,
     /// What `ai_models` answers instead of a list.
@@ -166,6 +172,9 @@ impl Fixture {
             image_bytes: Mutex::new(PNG.to_vec()),
             refreshes: AtomicI64::new(0),
             ai_requests: Mutex::new(Vec::new()),
+            ai_reply: Mutex::new(String::new()),
+            ai_sources: Mutex::new(Vec::new()),
+            ai_error: Mutex::new(None),
             ai_models: Mutex::new(Vec::new()),
             ai_models_error: Mutex::new(None),
             ai_model_calls: Mutex::new(0),
@@ -534,6 +543,36 @@ impl Fixture {
         }
     }
 
+    /// Stars a conversation without going through `act`, so the actions log stays clean.
+    pub fn set_starred(&self, thread: Id) {
+        if let Some(row) = self
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row.id == thread)
+        {
+            row.starred = true;
+        }
+    }
+
+    /// Snoozes a conversation until `until`, moving it out of the inbox like the engine does.
+    pub fn set_snoozed(&self, thread: Id, until: Ms) {
+        if let Some(row) = self
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|row| row.id == thread)
+        {
+            row.snoozed_until = Some(until);
+        }
+        self.locations
+            .lock()
+            .unwrap()
+            .insert(thread, (Mailbox::Snoozed, None));
+    }
+
     /// Adds a thread and tells the UI the store changed.
     pub fn push_thread(&self) -> Id {
         let id = self.next_id();
@@ -877,6 +916,24 @@ impl Mail for Fixture {
         Ok(())
     }
 
+    /// Same slice the store cuts: the view's threads, older than `before`, never snoozed,
+    /// starred only when asked for.
+    fn archivable(
+        &self,
+        view: &View,
+        before: Ms,
+        include_starred: bool,
+    ) -> anyhow::Result<Vec<Id>> {
+        Ok(self
+            .threads(view, 0, u32::MAX)?
+            .into_iter()
+            .filter(|t| t.date < before)
+            .filter(|t| t.snoozed_until.is_none())
+            .filter(|t| include_starred || !t.starred)
+            .map(|t| t.id)
+            .collect())
+    }
+
     fn send(&self, draft: Draft) -> anyhow::Result<Id> {
         let id = self.send_seq.fetch_add(1, Ordering::SeqCst);
         self.sent.lock().unwrap().push(draft.clone());
@@ -1108,13 +1165,17 @@ impl Mail for Fixture {
     fn ai(&self, req: u32, request: AiRequest) -> anyhow::Result<()> {
         // The store refuses a Private source before it builds a prompt, so the fixture refuses
         // it too: the UI must show that refusal, and no request may reach the engine.
-        if let AiRequest::Summary { thread } = &request {
+        let source = match &request {
+            AiRequest::Summary { thread } | AiRequest::Replies { thread } => Some(*thread),
+            _ => None,
+        };
+        if let Some(thread) = source {
             let private = self
                 .threads
                 .lock()
                 .unwrap()
                 .iter()
-                .find(|t| t.id == *thread)
+                .find(|t| t.id == thread)
                 .is_some_and(|t| {
                     t.labels
                         .iter()
@@ -1124,6 +1185,29 @@ impl Mail for Fixture {
                 !private,
                 "This conversation is private, so AI can't read it"
             );
+        }
+        if let AiRequest::Ask { .. } = &request {
+            self.emit(Event::AiSources {
+                req,
+                threads: self.ai_sources.lock().unwrap().clone(),
+            });
+        }
+        if let Some(error) = self.ai_error.lock().unwrap().clone() {
+            // A failed stream ends quietly and reports through the error event.
+            self.emit(Event::Ai {
+                req,
+                delta: String::new(),
+                done: true,
+            });
+            self.emit(Event::Error(format!("AI: {error}")));
+        }
+        let reply = self.ai_reply.lock().unwrap().clone();
+        if !reply.is_empty() {
+            self.emit(Event::Ai {
+                req,
+                delta: reply,
+                done: true,
+            });
         }
         self.ai_requests.lock().unwrap().push((req, request));
         Ok(())

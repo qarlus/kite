@@ -13,6 +13,10 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params, params_from_i
 use crate::model::*;
 use crate::sync::{Delta, Op, RemoteMsg};
 
+const AI_TRIAGE_SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_triaged (
+    thread_id INTEGER PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE
+);";
+
 const SCHEMA_V1: &str = r#"
 CREATE TABLE accounts (
   id INTEGER PRIMARY KEY, provider TEXT NOT NULL, email TEXT NOT NULL UNIQUE,
@@ -328,6 +332,8 @@ impl Store {
         }
         if version < 7 {
             let tx = conn.unchecked_transaction()?;
+            // Rethreading can merge conversations; its marker propagation needs the table.
+            tx.execute_batch(AI_TRIAGE_SCHEMA)?;
             rethread_messages(&tx, None)?;
             tx.execute_batch("DROP INDEX IF EXISTS messages_subject; PRAGMA user_version=7")?;
             tx.commit()?;
@@ -379,6 +385,12 @@ impl Store {
             )?;
             tx.commit()?;
         }
+        if version < 10 {
+            let tx = conn.unchecked_transaction()?;
+            tx.execute_batch(AI_TRIAGE_SCHEMA)?;
+            tx.execute_batch("PRAGMA user_version=10;")?;
+            tx.commit()?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO tags(name, color, position)
              VALUES (?1, '#64748b', (SELECT COALESCE(MAX(position), -1) + 1 FROM tags))",
@@ -427,6 +439,11 @@ fn rethread_messages(tx: &Transaction, only_thread: Option<Id>) -> Result<()> {
             params![thread, message],
         )?;
         tx.execute("INSERT INTO thread_tags(thread_id,tag_id) SELECT ?1,tag_id FROM thread_tags WHERE thread_id=?2", params![thread, old])?;
+        tx.execute(
+            "INSERT OR IGNORE INTO ai_triaged(thread_id)
+            SELECT ?1 FROM ai_triaged WHERE thread_id=?2",
+            params![thread, old],
+        )?;
         tx.execute(
             "UPDATE threads SET
             snoozed_until=(SELECT snoozed_until FROM threads WHERE id=?2),
@@ -1069,6 +1086,11 @@ fn merge_thread(tx: &Transaction, canon: Id, other: Id) -> Result<()> {
             params![canon, other],
         )?;
         tx.execute(
+            "INSERT OR IGNORE INTO ai_triaged(thread_id)
+            SELECT ?1 FROM ai_triaged WHERE thread_id=?2",
+            params![canon, other],
+        )?;
+        tx.execute(
             "UPDATE OR REPLACE thread_keys SET thread_id=?1 WHERE thread_id=?2",
             params![canon, other],
         )?;
@@ -1264,9 +1286,9 @@ fn refresh_labels(tx: &Transaction, thread_id: Id) -> Result<()> {
 // ------------------------------------------------------------- reads: views
 
 impl Store {
-    /// One indexed query over the denormalized `threads` table. User input never reaches SQL as
-    /// syntax: the search grammar only produces fixed fragments plus bound parameters.
-    pub fn threads(&self, view: &View, offset: u32, limit: u32) -> Result<Vec<ThreadSummary>> {
+    /// The WHERE clause a view produces: mailbox or folder, then the split and search grammar.
+    /// Shared by `threads` and `archivable` so both see exactly the same conversation set.
+    fn view_conds(&self, view: &View) -> Result<(Vec<String>, Vec<Value>)> {
         let split_q = match view.split {
             Some(id) => self
                 .conn
@@ -1315,6 +1337,33 @@ impl Store {
         }
         conds.extend(p.conds);
         ps.extend(p.params);
+        Ok((conds, ps))
+    }
+
+    /// Thread ids in `view` whose latest activity predates `before`: the bulk-archive dialog's
+    /// count and confirm set. Snoozed conversations always keep waiting; starred ones stay out
+    /// unless the dialog asked for them.
+    pub fn archivable(&self, view: &View, before: Ms, include_starred: bool) -> Result<Vec<Id>> {
+        let (mut conds, mut ps) = self.view_conds(view)?;
+        conds.push("t.date < ?".into());
+        ps.push(Value::Integer(before));
+        conds.push("t.snoozed_until IS NULL".into());
+        if !include_starred {
+            conds.push("t.starred=0".into());
+        }
+        let sql = format!(
+            "SELECT t.id FROM threads t WHERE {} ORDER BY t.date DESC",
+            conds.join(" AND ")
+        );
+        let mut s = self.conn.prepare(&sql)?;
+        let it = s.query_map(params_from_iter(ps), |r| r.get(0))?;
+        Ok(it.collect::<rusqlite::Result<Vec<Id>>>()?)
+    }
+
+    /// One indexed query over the denormalized `threads` table. User input never reaches SQL as
+    /// syntax: the search grammar only produces fixed fragments plus bound parameters.
+    pub fn threads(&self, view: &View, offset: u32, limit: u32) -> Result<Vec<ThreadSummary>> {
+        let (conds, mut ps) = self.view_conds(view)?;
         let sql = format!(
             "SELECT t.id, t.account_id, t.subject, t.snippet, t.participants, t.date, t.unread, t.starred,
                     t.important, t.attachments, t.labels, t.count, t.snoozed_until
@@ -2709,6 +2758,106 @@ impl Store {
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// Local retrieval excludes Private before ranking or loading any source content.
+    pub fn ai_search(&self, question: &str, account: Option<Id>) -> Result<Vec<Id>> {
+        let stop = [
+            "a", "an", "and", "are", "as", "at", "be", "by", "can", "did", "do", "does", "for",
+            "from", "had", "has", "have", "how", "i", "in", "is", "it", "me", "my", "of", "on",
+            "or", "please", "s", "tell", "that", "the", "their", "this", "to", "was", "were",
+            "what", "when", "where", "which", "who", "will", "with", "you",
+        ];
+        let mut terms = Vec::new();
+        for (index, part) in question.split('"').enumerate() {
+            if index % 2 == 1 {
+                let phrase = part
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !phrase.is_empty() {
+                    terms.push(format!("\"{phrase}\""));
+                }
+            } else {
+                for word in part
+                    .split(|c: char| !c.is_alphanumeric())
+                    .filter(|s| !s.is_empty())
+                {
+                    if !stop.contains(&word.to_lowercase().as_str()) {
+                        terms.push(format!("\"{word}\""));
+                    }
+                }
+            }
+            if terms.len() >= 32 {
+                break;
+            }
+        }
+        terms.truncate(32);
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT m.thread_id FROM msgs_fts
+            JOIN messages m ON m.id=msgs_fts.rowid JOIN threads t ON t.id=m.thread_id
+            WHERE msgs_fts MATCH ?1 AND (?2 IS NULL OR t.account_id=?2)
+            AND NOT EXISTS(SELECT 1 FROM thread_tags tt JOIN tags g ON g.id=tt.tag_id
+                WHERE tt.thread_id=t.id AND g.name=?3 COLLATE NOCASE)
+            AND NOT EXISTS(SELECT 1 FROM drafts d WHERE d.thread_id=t.id)
+            ORDER BY bm25(msgs_fts), t.date DESC, t.id LIMIT 8",
+        )?;
+        let rows = statement.query_map(params![terms.join(" OR "), account, PRIVATE_TAG], |r| {
+            r.get(0)
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn ai_arrival_watermark(&self) -> Result<Id> {
+        Ok(self
+            .conn
+            .query_row("SELECT COALESCE(MAX(id),0) FROM messages", [], |r| r.get(0))?)
+    }
+
+    pub fn ai_triage_candidates(&self, account: Id, after: Id) -> Result<Vec<Id>> {
+        let mut statement = self.conn.prepare("SELECT t.id FROM threads t
+            WHERE t.account_id=?1 AND t.mailbox='inbox'
+            AND EXISTS(SELECT 1 FROM messages m WHERE m.thread_id=t.id AND m.id>?2 AND m.mailbox='inbox' AND m.from_self=0)
+            AND NOT EXISTS(SELECT 1 FROM ai_triaged a WHERE a.thread_id=t.id)
+            AND NOT EXISTS(SELECT 1 FROM thread_tags tt JOIN tags g ON g.id=tt.tag_id
+                WHERE tt.thread_id=t.id AND g.name=?3 COLLATE NOCASE)
+            ORDER BY t.date DESC, t.id LIMIT 20")?;
+        let rows = statement.query_map(params![account, after, PRIVATE_TAG], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Claim before network work: even failures cannot cause repeated automatic disclosure.
+    pub fn claim_ai_triage(&self, thread: Id) -> Result<bool> {
+        self.check_ai_thread(thread)?;
+        Ok(self.conn.execute(
+            "INSERT OR IGNORE INTO ai_triaged(thread_id) VALUES (?1)",
+            [thread],
+        )? != 0)
+    }
+
+    pub fn apply_ai_triage(&self, thread: Id, label: &str) -> Result<()> {
+        if !AI_TRIAGE_LABELS.contains(&label) {
+            bail!("Invalid AI triage label");
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        self.check_ai_thread(thread)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO tags(name,color,position)
+            VALUES (?1,'#64748b',(SELECT COALESCE(MAX(position),-1)+1 FROM tags))",
+            [label],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO thread_tags(thread_id,tag_id)
+            SELECT ?1,id FROM tags WHERE name=?2 COLLATE NOCASE",
+            params![thread, label],
+        )?;
+        refresh_labels(&tx, thread)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Missing sources fail closed, so stale UI state cannot authorize an AI request.
     pub fn check_ai_thread(&self, thread: Id) -> Result<()> {
         self.check_ai_thread_path(thread, &mut HashSet::new())
@@ -3024,7 +3173,7 @@ fn apply_token(
         None if neg => p.not_match.push(term(value)),
         None => free.push((term(value), quoted)),
         Some(f @ ("from" | "to")) if !value.is_empty() => p.people(f == "from", value, neg),
-        Some("label") => p.label(value, neg),
+        Some("label" | "tag") => p.label(value, neg),
         Some("subject") => {
             let t = format!("subject:{}", term(value));
             if neg {
@@ -3173,10 +3322,18 @@ fn rewrite_label_tokens(query: &str, renames: &HashMap<String, String>) -> Strin
             Some(rest) => (true, rest),
             None => (false, token),
         };
+        let prefix = if rest
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("tag:"))
+        {
+            "tag:"
+        } else {
+            "label:"
+        };
         let Some(value) = rest
-            .get(..6)
-            .filter(|p| p.eq_ignore_ascii_case("label:"))
-            .map(|_| &rest[6..])
+            .get(..prefix.len())
+            .filter(|p| p.eq_ignore_ascii_case(prefix))
+            .map(|_| &rest[prefix.len()..])
         else {
             out.push(token.to_string());
             continue;
@@ -3206,7 +3363,7 @@ fn rewrite_label_tokens(query: &str, renames: &HashMap<String, String>) -> Strin
         } else {
             joined
         };
-        out.push(format!("{}label:{value}", if neg { "-" } else { "" }));
+        out.push(format!("{}{prefix}{value}", if neg { "-" } else { "" }));
     }
     out.join(" ")
 }

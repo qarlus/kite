@@ -61,6 +61,12 @@ pub trait Mail: Send + Sync + 'static {
     /// Applies locally at once and queues the remote op. Returns an undo token.
     fn act(&self, ids: &[Id], action: &Action) -> Result<i64>;
     fn undo(&self, token: i64) -> Result<()>;
+    /// Thread ids in `view` whose latest activity predates `before`, skipping snoozed and —
+    /// unless `include_starred` — starred conversations. The bulk-archive dialog counts and
+    /// confirms through this; archiving still goes through `act`, so providers sync normally.
+    fn archivable(&self, _view: &View, _before: Ms, _include_starred: bool) -> Result<Vec<Id>> {
+        Ok(Vec::new())
+    }
     /// May contact an unsubscribe service. Call off the UI thread.
     fn unsubscribe(&self, _thread: Id) -> Result<Unsubscribed> {
         anyhow::bail!("Unsubscribe is not available")
@@ -117,6 +123,7 @@ pub trait Mail: Send + Sync + 'static {
     fn calendar_today(&self, account: Id) -> Result<Vec<CalEvent>>;
     /// Streams `Event::Ai { req, .. }` chunks. The engine checks source privacy and builds the
     /// prompt; callers cannot submit an unscoped prompt containing protected mail.
+    /// Ask emits `Event::AiSources` in citation order before its first completion chunk.
     fn ai(&self, req: u32, request: AiRequest) -> Result<()>;
     /// The free, zero-data-retention models the configured AI endpoint offers. Blocks on the
     /// network: call it from a background task.

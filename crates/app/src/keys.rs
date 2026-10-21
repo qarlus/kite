@@ -48,6 +48,10 @@ pub mod cmd {
     pub const TAGS: u8 = 61;
     pub const UNSUBSCRIBE: u8 = 62;
     pub const INSERT_SNIPPET: u8 = 63;
+    pub const ZERO: u8 = 64;
+    pub const ASK: u8 = 65;
+    /// Not in the command table: reply suggestions are a click-only helper.
+    pub const SUGGEST: u8 = 66;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -549,6 +553,23 @@ pub static COMMANDS: &[Cmd] = &[
         Group::Compose,
         cmd::INSERT_SNIPPET,
     ),
+    c(
+        "ask_inbox",
+        "Ask your inbox",
+        &["secondary-shift-k"],
+        "Kite",
+        Group::App,
+        cmd::ASK,
+    ),
+    // Palette-only: there is no default key, so the cheat sheet never lists it.
+    c(
+        "archive_older",
+        "Archive older than…",
+        &[],
+        "Kite",
+        Group::Triage,
+        cmd::ZERO,
+    ),
 ];
 
 /// The mailboxes reachable through the `g` sequences, in the same order as the table above.
@@ -566,7 +587,7 @@ pub const GO_MAILBOXES: [(Mailbox, &str); 9] = [
 
 /// Whether a command only exists while Settings › AI is on.
 pub fn needs_ai(id: u8) -> bool {
-    matches!(id, cmd::AI_WRITE | cmd::AI_SUMMARY)
+    matches!(id, cmd::AI_WRITE | cmd::AI_SUMMARY | cmd::ASK)
 }
 
 /// Whether a command is offered at all. The AI helpers only exist once the reader turned AI on,
@@ -632,6 +653,45 @@ pub fn hint_for(settings: &Settings, id: u8) -> String {
     command(id)
         .map(|command| hint(settings, command))
         .unwrap_or_default()
+}
+
+/// A binding string ("secondary-u", "g i") as a human reads it ("Ctrl+U", "G I"), for the
+/// shortcut tips. Falls back to the raw binding for anything unparseable.
+pub fn pretty(binding: &str) -> String {
+    binding
+        .split_whitespace()
+        .map(|key| {
+            Keystroke::parse(key)
+                .ok()
+                .as_ref()
+                .map(gpui_kit::component::kbd::Kbd::format)
+                .unwrap_or_else(|| key.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The verb phrase a shortcut tip teaches: "Tip: press E to archive".
+pub fn verb(command: &Cmd) -> String {
+    match command.slug {
+        "mark_done" => "archive",
+        "move_to_inbox" => "move it back to the inbox",
+        "snooze" => "snooze it",
+        "toggle_read" => "toggle read",
+        "move_to_folder" => "move it to a folder",
+        "tags" => "tag it",
+        "open_thread" => "open it",
+        "back" | "back_to_list" => "go back",
+        "select" => "select it",
+        "settings" => "open Settings",
+        "palette" => "open the palette",
+        "shortcut_help" => "see every shortcut",
+        "insert_snippet" => "insert a snippet",
+        "new_folder" => "create a folder",
+        "switch_account" => "switch account",
+        _ => command.title,
+    }
+    .to_lowercase()
 }
 
 /// A recorded keystroke as a binding string that survives Settings and a restart.

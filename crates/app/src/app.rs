@@ -4,7 +4,8 @@
 //! so every keystroke paints from local state on the same frame.
 use crate::keys::{self, Act, GO_MAILBOXES, cmd};
 use crate::theme::{self, MAX_COL, RADIUS_SM, STRIP_H, Theme};
-use crate::{compose, folders, palette, snooze, tags, thread};
+use crate::{ask, compose, folders, palette, snooze, tags, thread};
+use chrono::Datelike as _;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
@@ -90,6 +91,8 @@ pub struct Open {
 pub enum AiFor {
     Compose,
     Summary(Id),
+    Ask,
+    Replies(Id),
 }
 
 /// One streamed AI answer, filled by `Event::Ai` chunks.
@@ -114,6 +117,10 @@ pub enum Overlay {
     Tags(tags::TagMenu),
     /// The "New tag…" name field, with the conversations it will apply to.
     NewTag(tags::NewTag),
+    /// "Get me to zero": archive everything older than a chosen age in the current view.
+    Zero(palette::Zero),
+    /// "Ask your inbox": a question over local mail with a streamed, cited answer.
+    Ask(ask::Ask),
 }
 
 /// Which pane the keyboard is working in: the list, or the open conversation beside it.
@@ -121,6 +128,13 @@ pub enum Overlay {
 pub(crate) enum Pane {
     List,
     Thread,
+}
+
+/// How a command reached `run`. Only a command the mouse ran may teach its key.
+#[derive(Clone, Copy, PartialEq)]
+pub enum Src {
+    Key,
+    Click,
 }
 
 pub struct Kite {
@@ -183,6 +197,8 @@ pub struct Kite {
     pub(crate) loaded_all: bool,
     /// The last action that ran, with a sequence number, so its icon can animate once.
     pub(crate) pulse: Option<(u8, u64)>,
+    /// When the last shortcut tip showed: tips stay at least ~30 s apart.
+    pub(crate) hint_at: Option<chrono::DateTime<chrono::Local>>,
     pub(crate) seq: u64,
     subs: Vec<Subscription>,
 }
@@ -297,6 +313,7 @@ impl Kite {
             html_scale: 1.,
             loaded_all: false,
             pulse: None,
+            hint_at: None,
             seq: 0,
             subs: Vec::new(),
         };
@@ -315,7 +332,7 @@ impl Kite {
                         this.set_query(query, cx);
                     }
                 }
-                InputEvent::PressEnter { .. } => this.run(cmd::OPEN, window, cx),
+                InputEvent::PressEnter { .. } => this.run(cmd::OPEN, Src::Key, window, cx),
                 _ => {}
             },
         ));
@@ -424,7 +441,28 @@ impl Kite {
                 }
                 cx.notify();
             }
-            Event::Error(message) => self.toast(message, cx),
+            Event::Error(message) => {
+                // An AI failure lands where the answer was expected, not only in a toast.
+                if matches!(self.ai.as_ref().map(|ai| &ai.target), Some(AiFor::Ask))
+                    && let Overlay::Ask(ask) = &mut self.overlay
+                {
+                    ask.error = Some(message);
+                    self.ai = None;
+                } else {
+                    self.toast(message, cx);
+                }
+            }
+            Event::AiSources { req, threads } => {
+                // Citation order for the answer that follows: Ask's sources list.
+                if self
+                    .ai
+                    .as_ref()
+                    .is_some_and(|ai| ai.req == req && matches!(ai.target, AiFor::Ask))
+                    && let Overlay::Ask(ask) = &mut self.overlay
+                {
+                    ask.sources = threads;
+                }
+            }
             Event::Ai { req, delta, done } => {
                 let Some(ai) = &mut self.ai else {
                     return;
@@ -505,13 +543,18 @@ impl Kite {
 
     // ---- commands -------------------------------------------------------------
 
-    pub(crate) fn toggle_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_settings(
+        &mut self,
+        src: Src,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let cmd = if self.preferences.is_some() {
             cmd::BACK
         } else {
             cmd::SETTINGS
         };
-        self.run(cmd, window, cx);
+        self.run(cmd, src, window, cx);
     }
 
     fn next(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -540,7 +583,7 @@ impl Kite {
     }
 
     /// The list column's title: the folder, the search, the split tab or the mailbox.
-    fn view_name(&self) -> &str {
+    pub(crate) fn view_name(&self) -> &str {
         if let Some(folder) = self.folders.iter().find(|folder| {
             Some(folder.account_id) == self.view.account_id
                 && Some(&folder.id) == self.view.folder.as_ref()
@@ -767,14 +810,83 @@ impl Kite {
         self.set_query(String::new(), cx);
     }
 
-    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.send_later = false;
         cx.notify();
     }
 
-    /// The single entry point for every command, from the keymap or the palette.
-    pub fn run(&mut self, id: u8, window: &mut Window, cx: &mut Context<Self>) {
+    /// A clicked action's quiet "the keyboard does this too" toast. Keyboard mode and the
+    /// Settings › Shortcuts switch gate it; a command shows at most one tip a day, retires
+    /// once its key ran the command three times, and tips stay ~30 s apart.
+    pub(crate) fn shortcut_hint(&mut self, id: u8, cx: &mut Context<Self>) {
+        if self.settings.input_mode != "keyboard" || !self.settings.shortcut_tips {
+            return;
+        }
+        let Some(command) = keys::command(id) else {
+            return;
+        };
+        let key = keys::hint(&self.settings, command);
+        if key.is_empty() {
+            return;
+        }
+        let now = chrono::Local::now();
+        if self.hint_at.is_some_and(|at| (now - at).num_seconds() < 30) {
+            return;
+        }
+        let day = now.date_naive().num_days_from_ce() as i64;
+        let stat = self
+            .settings
+            .shortcut_hints
+            .get(command.slug)
+            .cloned()
+            .unwrap_or_default();
+        if stat.uses >= 3 || stat.shown_day == day {
+            return;
+        }
+        self.settings
+            .shortcut_hints
+            .entry(command.slug.to_string())
+            .or_default()
+            .shown_day = day;
+        self.hint_at = Some(now);
+        self.mail.set_settings(self.settings.clone()).ok();
+        self.toast(
+            format!(
+                "Tip: press {} to {}",
+                keys::pretty(&key),
+                keys::verb(command)
+            ),
+            cx,
+        );
+    }
+
+    /// The key ran its command: one more use toward retiring the tip. Uses are counted in
+    /// memory and persisted only once a tip showed or the count retires the hint, so a
+    /// keystroke never forces a settings write.
+    fn note_key_use(&mut self, id: u8) {
+        let Some(command) = keys::command(id) else {
+            return;
+        };
+        if keys::hint(&self.settings, command).is_empty() {
+            return;
+        }
+        let stat = self
+            .settings
+            .shortcut_hints
+            .entry(command.slug.to_string())
+            .or_default();
+        if stat.uses >= 3 {
+            return;
+        }
+        stat.uses += 1;
+        if stat.uses >= 3 || stat.shown_day != 0 {
+            self.mail.set_settings(self.settings.clone()).ok();
+        }
+    }
+
+    /// The single entry point for every command, from the keymap, a click or the palette.
+    pub fn run(&mut self, id: u8, src: Src, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.overlay, Overlay::Snooze(_)) && id != cmd::BACK {
             return;
         }
@@ -900,6 +1012,7 @@ impl Kite {
             cmd::TAGS => self.show_tag_menu(window, cx),
             cmd::AI_WRITE => self.ai_write(cx),
             cmd::AI_SUMMARY => self.ai_summary(cx),
+            cmd::ASK => self.show_ask(window, cx),
             cmd::CREATE_FOLDER => self.show_create_folder(window, cx),
             cmd::STAR => {
                 self.star(cx);
@@ -961,7 +1074,62 @@ impl Kite {
                     self.select_account(Some(account.id), window, cx);
                 }
             }
+            cmd::ZERO => self.show_zero(cx),
             _ => {}
+        }
+        match src {
+            Src::Click => self.shortcut_hint(id, cx),
+            Src::Key => self.note_key_use(id),
+        }
+    }
+
+    // ---- get me to zero ----------------------------------------------------------
+
+    /// The bulk-archive dialog: presets over the current view, live count, one undoable act.
+    pub(crate) fn show_zero(&mut self, cx: &mut Context<Self>) {
+        let mut zero = palette::Zero::default();
+        zero.count = self.zero_ids(zero.sel, zero.include_starred).len();
+        self.overlay = Overlay::Zero(zero);
+        cx.notify();
+    }
+
+    /// The conversations the zero dialog would archive at `sel`, starred included on request.
+    fn zero_ids(&self, sel: usize, include_starred: bool) -> Vec<Id> {
+        let cutoff = chrono::Local::now().timestamp_millis() - palette::AGES[sel].1;
+        self.mail
+            .archivable(&self.view, cutoff, include_starred)
+            .unwrap_or_default()
+    }
+
+    /// Keeps the confirm button's count honest after a preset or the starred toggle changes.
+    pub(crate) fn recount_zero(&mut self, cx: &mut Context<Self>) {
+        let Overlay::Zero(zero) = &self.overlay else {
+            return;
+        };
+        let count = self.zero_ids(zero.sel, zero.include_starred).len();
+        if let Overlay::Zero(zero) = &mut self.overlay {
+            zero.count = count;
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn confirm_zero(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::Zero(zero) = &self.overlay else {
+            return;
+        };
+        let ids = self.zero_ids(zero.sel, zero.include_starred);
+        self.overlay = Overlay::None;
+        window.focus(&self.focus, cx);
+        if ids.is_empty() {
+            self.toast("Nothing older than that", cx);
+        } else {
+            self.act_on(
+                ids.clone(),
+                MailAction::Archive,
+                true,
+                &format!("Archived {} conversations", ids.len()),
+                cx,
+            );
         }
     }
 
@@ -970,7 +1138,13 @@ impl Kite {
     /// One AI answer, shared by "Write with AI" and "Summarize thread". The engine owns the
     /// prompt, the endpoint and the model, so it — not the UI — decides what may leave the
     /// machine. It refuses Private conversations and streams the answer back as `Event::Ai`.
-    fn ai_request(&mut self, id: u8, target: AiFor, request: AiRequest, cx: &mut Context<Self>) {
+    pub(crate) fn ai_request(
+        &mut self,
+        id: u8,
+        target: AiFor,
+        request: AiRequest,
+        cx: &mut Context<Self>,
+    ) {
         if !self.settings.ai_enabled {
             self.toast("AI is off. Turn it on in Settings › AI.", cx);
             return;
@@ -991,7 +1165,17 @@ impl Kite {
                 });
                 self.pulse = Some((id, self.seq));
             }
-            Err(error) => self.toast(format!("AI: {error}"), cx),
+            // An Ask keeps its failure in the panel, next to a Retry; the other
+            // helpers keep the toast they always had.
+            Err(error) => {
+                if matches!(target, AiFor::Ask)
+                    && let Overlay::Ask(ask) = &mut self.overlay
+                {
+                    ask.error = Some(format!("AI: {error}"));
+                } else {
+                    self.toast(format!("AI: {error}"), cx);
+                }
+            }
         }
         cx.notify();
     }
@@ -1020,6 +1204,66 @@ impl Kite {
         self.ai_request(cmd::AI_SUMMARY, AiFor::Summary(id), request, cx);
     }
 
+    /// The sparkle button under the last message: three short replies, on request only.
+    /// The engine refuses Private threads; the button is hidden there too.
+    pub(crate) fn suggest_replies(&mut self, cx: &mut Context<Self>) {
+        let Some(open) = &self.open else {
+            return;
+        };
+        let id = open.id;
+        let request = AiRequest::Replies { thread: id };
+        self.ai_request(cmd::SUGGEST, AiFor::Replies(id), request, cx);
+    }
+
+    /// A thread's summary for display, from the list or an all-mail query, for a
+    /// conversation that may not sit in the current view (an Ask source).
+    pub(crate) fn summary_of(&self, id: Id) -> Option<ThreadSummary> {
+        if let Some(row) = self.rows.iter().find(|row| row.id == id) {
+            return Some(row.clone());
+        }
+        let all = View {
+            account_id: None,
+            mailbox: Mailbox::All,
+            split: None,
+            query: None,
+            folder: None,
+        };
+        self.mail
+            .threads(&all, 0, PAGE)
+            .unwrap_or_default()
+            .into_iter()
+            .find(|row| row.id == id)
+    }
+
+    /// Opens a conversation that may not be in the current view's list.
+    pub(crate) fn open_any_thread(&mut self, id: Id, cx: &mut Context<Self>) {
+        let Some(row) = self.summary_of(id) else {
+            return;
+        };
+        let messages = match self.msgs.get(&id) {
+            Some(messages) => messages.clone(),
+            None => {
+                let messages = self.mail.thread(id).unwrap_or_default();
+                self.msgs.insert(id, messages.clone());
+                messages
+            }
+        };
+        if let Some(ix) = self.rows.iter().position(|row| row.id == id) {
+            self.sel = ix;
+        }
+        self.pane = Pane::Thread;
+        self.open = Some(Open {
+            id,
+            account_id: row.account_id,
+            subject: row.subject,
+            expanded: messages.len().saturating_sub(1),
+            messages,
+        });
+        self.thread_scroll = ScrollHandle::new();
+        self.prefetch(cx);
+        cx.notify();
+    }
+
     fn action(&mut self, action: &Act, window: &mut Window, cx: &mut Context<Self>) {
         // A shortcut being recorded needs the raw keystroke, not the command it currently runs.
         if crate::preferences::shortcuts::recording(self) {
@@ -1031,7 +1275,7 @@ impl Kite {
             cx.propagate();
             return;
         }
-        self.run(action.cmd, window, cx);
+        self.run(action.cmd, Src::Key, window, cx);
     }
 
     // ---- keyboard -----------------------------------------------------------------
@@ -1125,12 +1369,48 @@ impl Kite {
                     "down" => menu.selected = (menu.selected + 1).min(last),
                     "enter" => {
                         let index = menu.selected;
-                        self.activate_tag_item(index, window, cx);
+                        self.activate_tag_item(index, Src::Key, window, cx);
                     }
                     _ => {}
                 }
                 cx.notify();
                 cx.stop_propagation();
+            }
+            Overlay::Zero(zero) => {
+                let presets = palette::AGES.len();
+                let handled = match key {
+                    "escape" => {
+                        self.close_overlay(cx);
+                        true
+                    }
+                    "enter" => {
+                        self.confirm_zero(window, cx);
+                        true
+                    }
+                    "up" | "left" => {
+                        zero.sel = zero.sel.saturating_sub(1);
+                        true
+                    }
+                    "down" | "right" => {
+                        zero.sel = (zero.sel + 1).min(presets - 1);
+                        true
+                    }
+                    _ => match typed {
+                        Some(c @ '1'..='5') => {
+                            zero.sel = (c as usize - '1' as usize).min(presets - 1);
+                            true
+                        }
+                        Some('s') => {
+                            zero.include_starred = !zero.include_starred;
+                            true
+                        }
+                        _ => false,
+                    },
+                };
+                if handled {
+                    self.recount_zero(cx);
+                    cx.stop_propagation();
+                }
             }
             Overlay::NewTag(_) => match key {
                 "escape" => {
@@ -1186,7 +1466,7 @@ impl Kite {
                         let id = palette.selected_id();
                         self.overlay = Overlay::None;
                         if let Some(id) = id {
-                            self.run(id, window, cx);
+                            self.run(id, Src::Key, window, cx);
                         }
                         true
                     }
@@ -1217,6 +1497,21 @@ impl Kite {
                 if handled {
                     cx.notify();
                     cx.stop_propagation();
+                }
+            }
+            Overlay::Ask(_) => {
+                // The field's own keys are the input's; only Escape and Enter are ours.
+                match key {
+                    "escape" => {
+                        self.close_overlay(cx);
+                        window.focus(&self.focus, cx);
+                        cx.stop_propagation();
+                    }
+                    "enter" => {
+                        self.ask_submit(cx);
+                        cx.stop_propagation();
+                    }
+                    _ => {}
                 }
             }
             Overlay::Snooze(snooze) => {
@@ -1331,7 +1626,7 @@ impl Kite {
                     cx.notify();
                 }
             }))
-            .on_click(cx.listener(move |this, _, window, cx| this.run(cmd, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.run(cmd, Src::Click, window, cx)))
             .child(glyph)
             .into_any_element()
     }
@@ -1408,7 +1703,9 @@ impl Kite {
                     .text_color(if settings_open { t.fg } else { t.fg2 })
                     .when(settings_open, |d| d.bg(Theme::alpha(t.fg, CHIP_HOVER)))
                     .child(Icon::new(IconName::Settings).with_size(px(16.)))
-                    .on_click(cx.listener(|this, _, window, cx| this.toggle_settings(window, cx))),
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_settings(Src::Click, window, cx)
+                    })),
             )
             .child(self.window_controls(window))
             .into_any_element()
@@ -1782,7 +2079,7 @@ impl Kite {
                                     .text_color(t.fg2)
                                     .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.run(cmd::REFRESH, window, cx)
+                                        this.run(cmd::REFRESH, Src::Click, window, cx)
                                     }))
                                     .child(Icon::new(IconName::RefreshCw).with_size(px(16.))),
                             )
@@ -1801,9 +2098,26 @@ impl Kite {
                                     .text_color(t.fg2)
                                     .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
                                     .on_click(cx.listener(|this, _, window, cx| {
-                                        this.run(cmd::COMPOSE, window, cx)
+                                        this.run(cmd::COMPOSE, Src::Click, window, cx)
                                     }))
                                     .child(Icon::new(IconName::SquarePen).with_size(px(16.))),
+                            )
+                            .child(
+                                div()
+                                    .id("list-actions")
+                                    .test_support()
+                                    .aria_label("Archive older mail")
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .size(px(30.))
+                                    .flex_shrink_0()
+                                    .rounded(px(RADIUS_SM))
+                                    .cursor_pointer()
+                                    .text_color(t.fg2)
+                                    .hover(|s| s.bg(Theme::alpha(t.fg, 0.06)).text_color(t.fg))
+                                    .on_click(cx.listener(|this, _, _, cx| this.show_zero(cx)))
+                                    .child(Icon::new(IconName::Ellipsis).with_size(px(16.))),
                             ),
                     ),
             )
@@ -1848,7 +2162,9 @@ impl Kite {
                                 .aria_label(toast.text.clone())
                                 .when(can_undo, |d| {
                                     d.cursor_pointer().on_click(cx.listener(
-                                        |this, _, window, cx| this.run(cmd::UNDO, window, cx),
+                                        |this, _, window, cx| {
+                                            this.run(cmd::UNDO, Src::Click, window, cx)
+                                        },
                                     ))
                                 })
                                 .flex()
@@ -2184,6 +2500,8 @@ impl Kite {
             Overlay::Snooze(_) => Some(snooze::render(self, window, cx)),
             Overlay::Move(_) | Overlay::CreateFolder(_) => Some(folders::render(self, window, cx)),
             Overlay::Tags(_) | Overlay::NewTag(_) => Some(tags::render(self, window, cx)),
+            Overlay::Zero(_) => Some(palette::render_zero(self, window, cx)),
+            Overlay::Ask(_) => Some(ask::render(self, window, cx)),
         }
     }
 }

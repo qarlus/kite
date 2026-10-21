@@ -3,8 +3,110 @@ mod common;
 use common::{Fixture, HTML, mount, update_content};
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use gpui_kit::{AppContext, TestAppContext};
-use kite_core::model::{Action, Event};
+use kite_core::api::Mail as _;
+use kite_core::model::{Action, AiRequest, Event, PRIVATE_TAG};
 use std::time::Duration;
+
+/// A fixture with AI on and three scripted reply suggestions.
+fn ai_on() -> std::sync::Arc<Fixture> {
+    let fixture = Fixture::new(3);
+    let mut settings = fixture.settings.lock().unwrap();
+    settings.ai_enabled = true;
+    settings.ai_base_url = "https://ai.example.com/v1".into();
+    settings.ai_model = "kite-test".into();
+    drop(settings);
+    *fixture.ai_reply.lock().unwrap() =
+        "1. Sounds good to me.\n2. Can we move it to Friday?\n3. Thanks, but I'll pass.".into();
+    fixture
+}
+
+#[gpui_kit::test]
+fn suggest_replies_offers_three_chips_that_seed_a_reply(cx: &mut TestAppContext) {
+    let fixture = ai_on();
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("suggest-replies", cx);
+        window.render_frame(cx);
+        // While the stream warms up, three quiet placeholders hold the spot.
+        assert!(window.try_find(("suggestion-skeleton", 0usize)).is_some());
+    })
+    .unwrap();
+    let requests = fixture.ai_requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1, "the button asks on click, never before");
+    assert!(
+        matches!(requests[0].1, AiRequest::Replies { thread: 1 }),
+        "the open conversation is the source: {:?}",
+        requests[0].1
+    );
+    cx.run_until_parked();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("suggestion", 0usize)).label(),
+            Some("Sounds good to me.")
+        );
+        assert_eq!(
+            window.find(("suggestion", 1usize)).label(),
+            Some("Can we move it to Friday?")
+        );
+        assert_eq!(
+            window.find(("suggestion", 2usize)).label(),
+            Some("Thanks, but I'll pass.")
+        );
+        window.click(("suggestion", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_some(), "a chip opens a reply");
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, cx| {
+        let body = kite.compose_body(cx);
+        assert!(
+            body.starts_with("Can we move it to Friday?\n\n"),
+            "the suggestion sits above the quote, editable: {body:?}"
+        );
+        assert!(
+            body.contains("Plain body for thread 1"),
+            "the quote follows"
+        );
+        assert_eq!(
+            kite.compose_subject(cx),
+            "Re: Subject 1",
+            "it is the reply the buttons would open"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn a_private_thread_never_offers_suggestions(cx: &mut TestAppContext) {
+    let fixture = ai_on();
+    fixture
+        .act(
+            &[1],
+            &Action::Label {
+                tag: PRIVATE_TAG.into(),
+            },
+        )
+        .unwrap();
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("suggest-replies").is_none(),
+            "a Private conversation does not offer AI"
+        );
+        assert!(
+            window
+                .try_find(("inline-action", kite::keys::cmd::REPLY as usize))
+                .is_some(),
+            "the human verbs stay"
+        );
+    })
+    .unwrap();
+    assert!(fixture.ai_requests.lock().unwrap().is_empty());
+}
 
 #[gpui_kit::test]
 fn archiving_from_the_reading_view_returns_to_the_remaining_inbox(cx: &mut TestAppContext) {
