@@ -8,7 +8,7 @@ use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::Settings;
+use kite_core::model::{Mailbox, Settings};
 use std::collections::HashSet;
 
 pub struct Palette {
@@ -18,15 +18,17 @@ pub struct Palette {
     pub items: Vec<u8>,
     /// The AI helpers stay out of the list until Settings › AI turns them on.
     pub show_ai: bool,
+    mailbox: Mailbox,
 }
 
 impl Palette {
-    pub fn new(settings: &Settings) -> Self {
+    pub fn new(settings: &Settings, mailbox: Mailbox) -> Self {
         let mut palette = Self {
             query: String::new(),
             sel: 0,
             items: Vec::new(),
             show_ai: settings.ai_enabled,
+            mailbox,
         };
         palette.refilter();
         palette
@@ -61,6 +63,13 @@ impl Palette {
         let mut scored: Vec<(i32, u8)> = keys::COMMANDS
             .iter()
             .filter(|c| self.show_ai || !keys::needs_ai(c.id))
+            .filter(|c| match c.id {
+                keys::cmd::DONE_WAITING => self.mailbox == Mailbox::Waiting,
+                keys::cmd::CANCEL_SCHEDULE | keys::cmd::RESCHEDULE | keys::cmd::SEND_NOW => {
+                    self.mailbox == Mailbox::Scheduled
+                }
+                _ => true,
+            })
             .filter_map(|c| {
                 let score = if query.is_empty() {
                     Some(0)

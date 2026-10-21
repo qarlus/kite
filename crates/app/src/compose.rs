@@ -355,13 +355,22 @@ impl Kite {
         } else {
             ("Reply", "Re: ")
         };
-        let (to, cc) = if forward {
+        let (mut to, mut cc) = if forward {
             (Vec::new(), Vec::new())
         } else if all {
             reply_all(&message, &own)
         } else {
             (reply_to(&message, &own), Vec::new())
         };
+        if self.view.mailbox == kite_core::model::Mailbox::Waiting {
+            let is_own = |address: &Addr| {
+                self.accounts
+                    .iter()
+                    .any(|a| a.email.eq_ignore_ascii_case(&address.email))
+            };
+            to.retain(|a| !is_own(a));
+            cc.retain(|a| !is_own(a));
+        }
         let reply_to = Some(message.id);
         let signature = signature_block(&self.settings, account_id);
         let body = signature.clone()
@@ -514,6 +523,11 @@ impl Kite {
     /// or, when opened from compose, schedules the send at the chosen time.
     pub(crate) fn confirm_snooze(&mut self, at: Ms, window: &mut Window, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
+        if let Some(id) = self.reschedule.take() {
+            self.send_later = false;
+            self.change_schedule(id, Some(Some(at)), false, cx);
+            return;
+        }
         if std::mem::take(&mut self.send_later) {
             if let Some(compose) = &mut self.compose {
                 compose.send_at = Some(at);

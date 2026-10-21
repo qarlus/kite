@@ -2058,6 +2058,17 @@ fn seed_threads(s: &Store, account: Id, threads: usize) {
                 m = replying_to(m, &parent);
                 m.subject = format!("Re: Subject {i}");
             }
+            if i < 400 && k == PER_THREAD - 1 {
+                m.from = Addr {
+                    name: "Me".into(),
+                    email: "me@x.com".into(),
+                };
+                m.to = vec![Addr {
+                    name: String::new(),
+                    email: "bob@x.com".into(),
+                }];
+                m.mailbox = Mailbox::Sent;
+            }
             batch.push(up(m));
             if batch.len() == 200 {
                 s.apply_deltas(account, &batch).unwrap();
@@ -2131,6 +2142,20 @@ fn perf_budgets() {
         fts_from <= Duration::from_millis(20),
         "from: + FTS took {fts_from:?}"
     );
+
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let rows = s.threads(&view(Mailbox::Waiting), 0, 200).unwrap();
+        times.push(start.elapsed());
+        assert_eq!(rows.len(), 200);
+    }
+    let waiting = median(times);
+    assert!(
+        waiting <= Duration::from_millis(20),
+        "Waiting on 50k messages took {waiting:?}"
+    );
+    eprintln!("Waiting on 50k messages: {waiting:?}");
 
     let mut times = Vec::new();
     for _ in 0..5 {
@@ -2849,7 +2874,7 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        10
+        11
     );
     assert!(
         !connection
@@ -2999,4 +3024,273 @@ fn triage_tags_are_searchable_removable_and_split_renames_follow_tag_alias() {
             .is_empty()
     );
     assert!(!s.claim_ai_triage(thread).unwrap());
+}
+
+#[test]
+fn waiting_threshold_replies_self_only_dismissal_and_undo() {
+    let s = Store::memory().unwrap();
+    let me = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s.add_account(Provider::Microsoft, "other@x.com", "Other")
+        .unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let outgoing = |id: &str, from: &str, to: &str, age: i64| {
+        let mut m = in_mailbox(msg(id, from, id, now - age * 86_400_000), Mailbox::Sent);
+        m.to = vec![Addr {
+            name: String::new(),
+            email: to.into(),
+        }];
+        m
+    };
+    s.apply_deltas(
+        me.id,
+        &[
+            up(outgoing("old", "other@x.com", "bob@x.com", 3)),
+            up(outgoing("young", "me@x.com", "bob@x.com", 1)),
+            up(outgoing("self", "me@x.com", "OTHER@x.com", 3)),
+            up(in_mailbox(
+                outgoing("archived", "me@x.com", "bob@x.com", 3),
+                Mailbox::Archive,
+            )),
+        ],
+    )
+    .unwrap();
+    let rows = s.threads(&view(Mailbox::Waiting), 0, 200).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].subject, "old");
+    let id = rows[0].id;
+    let archived = s.act(&[id], &Action::Archive).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Waiting), 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    s.apply_deltas(me.id, &[up(outgoing("old", "other@x.com", "bob@x.com", 3))])
+        .unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Waiting), 0, 200)
+            .unwrap()
+            .is_empty(),
+        "provider Sent membership cannot re-arm an archived conversation"
+    );
+    s.undo(archived).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Waiting), 0, 200).unwrap().len(), 1);
+    let undo = s.act(&[id], &Action::DoneWaiting).unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Waiting), 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    // A metadata update is not a new message and cannot reset Done waiting.
+    s.apply_deltas(me.id, &[up(outgoing("old", "other@x.com", "bob@x.com", 3))])
+        .unwrap();
+    assert!(
+        s.threads(&view(Mailbox::Waiting), 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    s.undo(undo).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Waiting), 0, 200).unwrap().len(), 1);
+    s.act(&[id], &Action::DoneWaiting).unwrap();
+    s.apply_deltas(
+        me.id,
+        &[up(replying_to(
+            outgoing("nudge", "me@x.com", "bob@x.com", 0),
+            "old",
+        ))],
+    )
+    .unwrap();
+    s.set_settings(Settings {
+        waiting_after_days: 0,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Waiting), 0, 200).unwrap().len(), 2);
+    s.apply_deltas(
+        me.id,
+        &[up(replying_to(
+            msg("reply", "bob@x.com", "Re: old", now + 1),
+            "nudge",
+        ))],
+    )
+    .unwrap();
+    let rows = s.threads(&view(Mailbox::Waiting), 0, 200).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].subject, "young");
+    s.remind_if_no_reply(rows[0].id, now + 86_400_000).unwrap();
+    s.set_settings(Settings::default()).unwrap();
+    assert_eq!(
+        s.threads(&view(Mailbox::Waiting), 0, 200).unwrap().len(),
+        1,
+        "explicit reminders bypass age threshold"
+    );
+}
+
+#[test]
+fn waiting_done_survives_reopen_and_new_mail_rearms() {
+    let path = std::env::temp_dir().join(format!("kite-waiting-{}-{}.db", std::process::id(), D0));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let mut outgoing = in_mailbox(
+        msg("persistent", "me@x.com", "Wait", now - 3 * 86_400_000),
+        Mailbox::Sent,
+    );
+    outgoing.to = vec![Addr {
+        name: String::new(),
+        email: "bob@x.com".into(),
+    }];
+    let a;
+    {
+        let s = Store::open(&path).unwrap();
+        a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+        s.apply_deltas(a.id, &[up(outgoing.clone())]).unwrap();
+        let id = s.threads(&view(Mailbox::Waiting), 0, 10).unwrap()[0].id;
+        s.act(&[id], &Action::DoneWaiting).unwrap();
+    }
+    {
+        let s = Store::open(&path).unwrap();
+        assert!(
+            s.threads(&view(Mailbox::Waiting), 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let mut next = replying_to(outgoing, "persistent");
+        next.remote_id = "new-persistent".into();
+        next.message_id = Some("<new-persistent@x>".into());
+        next.date += 1;
+        s.apply_deltas(a.id, &[up(next)]).unwrap();
+        assert_eq!(s.threads(&view(Mailbox::Waiting), 0, 10).unwrap().len(), 1);
+    }
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn scheduled_view_reads_local_and_handed_over_outbox_across_accounts() {
+    let s = Store::memory().unwrap();
+    let p = s.add_account(Provider::Proton, "me@p.com", "Me").unwrap();
+    let g = s
+        .add_account(Provider::Microsoft, "me@g.com", "Me")
+        .unwrap();
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 600_000;
+    let d = Draft {
+        account_id: p.id,
+        subject: "Local".into(),
+        send_at: Some(at),
+        ..Default::default()
+    };
+    let local = s.outbox_add(&d, at).unwrap();
+    let remote = s
+        .outbox_add(
+            &Draft {
+                account_id: g.id,
+                subject: "Exchange".into(),
+                ..d.clone()
+            },
+            at,
+        )
+        .unwrap();
+    s.outbox_prepared(remote, "remote-schedule").unwrap();
+    s.outbox_handed_over(remote).unwrap();
+    s.outbox_add(&Draft { send_at: None, ..d }, at).unwrap();
+    let rows = s.threads(&view(Mailbox::Scheduled), 0, 20).unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![local, remote]
+    );
+    assert_eq!(s.view_count(&view(Mailbox::Scheduled)).unwrap(), 2);
+    let mut scoped = view(Mailbox::Scheduled);
+    scoped.account_id = Some(g.id);
+    assert_eq!(s.threads(&scoped, 0, 20).unwrap()[0].subject, "Exchange");
+    s.outbox_cancel(local).unwrap();
+    assert_eq!(
+        s.threads(&view(Mailbox::Scheduled), 0, 20).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn new_message_rearms_waiting_even_when_sqlite_reuses_a_deleted_message_id() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let mut sent = in_mailbox(
+        replying_to(msg("outgoing", "me@x.com", "Re: Waiting", D0 + 1), "parent"),
+        Mailbox::Sent,
+    );
+    sent.to = vec![Addr {
+        name: String::new(),
+        email: "bob@x.com".into(),
+    }];
+    s.apply_deltas(
+        a.id,
+        &[
+            up(msg("parent", "bob@x.com", "Waiting", D0)),
+            up(sent.clone()),
+        ],
+    )
+    .unwrap();
+    let id = s.threads(&view(Mailbox::Waiting), 0, 10).unwrap()[0].id;
+    let old_id = s.thread(id).unwrap().last().unwrap().id;
+    s.act(&[id], &Action::DoneWaiting).unwrap();
+    s.apply_deltas(
+        a.id,
+        &[Delta::Delete {
+            remote_id: "outgoing".into(),
+        }],
+    )
+    .unwrap();
+    sent.remote_id = "new-outgoing".into();
+    sent.message_id = Some("<new-outgoing@x>".into());
+    sent.date += 1;
+    s.apply_deltas(a.id, &[up(sent)]).unwrap();
+    assert_eq!(
+        s.thread(id).unwrap().last().unwrap().id,
+        old_id,
+        "exercise SQLite row-id reuse"
+    );
+    assert_eq!(s.threads(&view(Mailbox::Waiting), 0, 10).unwrap().len(), 1);
+}
+
+#[test]
+fn full_graph_headers_preserve_done_waiting_when_a_fallback_conversation_splits() {
+    let s = Store::memory().unwrap();
+    let a = s
+        .add_account(Provider::Microsoft, "me@x.com", "Me")
+        .unwrap();
+    let outgoing = |id: &str, date| {
+        let mut m = in_mailbox(msg(id, "me@x.com", id, date), Mailbox::Sent);
+        m.to = vec![Addr {
+            name: String::new(),
+            email: "bob@x.com".into(),
+        }];
+        m.message_id = None;
+        m.thread_hint = Some("legacy-conversation".into());
+        m
+    };
+    let mut one = outgoing("one", D0);
+    let mut two = outgoing("two", D0 + 1);
+    s.apply_deltas(a.id, &[up(one.clone()), up(two.clone())])
+        .unwrap();
+    let rows = s.threads(&view(Mailbox::Waiting), 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    s.act(&[rows[0].id], &Action::DoneWaiting).unwrap();
+    one.message_id = Some("<one@x>".into());
+    one.thread_hint = None;
+    two.message_id = Some("<two@x>".into());
+    two.thread_hint = None;
+    s.apply_deltas(a.id, &[up(one), up(two)]).unwrap();
+    assert_eq!(s.threads(&view(Mailbox::Sent), 0, 10).unwrap().len(), 2);
+    assert!(
+        s.threads(&view(Mailbox::Waiting), 0, 10)
+            .unwrap()
+            .is_empty(),
+        "metadata repair does not undo a dismissal"
+    );
 }
