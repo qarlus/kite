@@ -22,6 +22,7 @@ const MENU_ACTIONS: &[(u8, &str, IconName)] = &[
     (cmd::TOGGLE_READ, "Mark read/unread", IconName::MailOpen),
     (cmd::MOVE, "Move to folder", IconName::FolderInput),
     (cmd::SNOOZE, "Snooze", IconName::Clock),
+    (cmd::UNSUBSCRIBE, "Unsubscribe", IconName::MailOpen),
 ];
 
 /// A colour for a tag created in the menu: the same #rrggbb shape `set_tags` validates.

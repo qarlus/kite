@@ -1531,3 +1531,153 @@ fn switching_from_keeps_an_edited_signature(cx: &mut TestAppContext) {
         assert!(!body.contains("From Two"), "{body:?}");
     });
 }
+
+#[gpui_kit::test]
+fn a_semicolon_opens_the_picker_and_enter_inserts_the_expanded_snippet(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    fixture.settings.lock().unwrap().snippets = vec![kite_core::model::Snippet {
+        name: "Thanks".into(),
+        shortcut: "thx".into(),
+        body: "Hi {first_name},\n\nThanks!".into(),
+    }];
+    let (window, kite) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("Alice Example <alice@example.com>", cx);
+        window.click("compose-body", cx);
+        window.input(";thx", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snippet-picker").is_some(),
+            "typing ; opens the picker"
+        );
+        assert_eq!(
+            window.find(("snippet-row", 0usize)).label(),
+            Some("Thanks"),
+            "the query filters to the matching snippet"
+        );
+        window.press("enter", cx);
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snippet-picker").is_none(),
+            "enter closes the picker"
+        );
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(
+            kite.compose_body(cx),
+            "Hi Alice,\n\nThanks!",
+            "{{first_name}} came from the To recipient"
+        );
+    });
+}
+
+#[gpui_kit::test]
+fn the_modifier_shortcut_opens_the_picker_in_classic_mode(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    {
+        let mut settings = fixture.settings.lock().unwrap();
+        settings.input_mode = "classic".into();
+        settings.snippets = vec![kite_core::model::Snippet {
+            name: "Thanks".into(),
+            shortcut: "thx".into(),
+            body: "Hi {first_name},".into(),
+        }];
+    }
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-new", cx);
+        window.render_frame(cx);
+        assert!(window.try_find("compose").is_some());
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-;");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snippet-picker").is_some(),
+            "Ctrl+; opens the picker in classic mode"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_palette_opens_the_picker_in_classic_mode(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    {
+        let mut settings = fixture.settings.lock().unwrap();
+        settings.input_mode = "classic".into();
+        settings.snippets = vec![kite_core::model::Snippet {
+            name: "Thanks".into(),
+            shortcut: "thx".into(),
+            body: "Hi {first_name},".into(),
+        }];
+    }
+    let (window, _) = mount(cx, fixture);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-new", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "secondary-k");
+    cx.simulate_keystrokes(window.into(), "s n i p");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find(("palette-row", 0usize)).label(),
+            Some("Insert snippet…")
+        );
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window.try_find("snippet-picker").is_some(),
+            "the palette command opens the picker"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn a_snippet_starting_with_subject_fills_an_empty_subject(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    fixture.settings.lock().unwrap().snippets = vec![kite_core::model::Snippet {
+        name: "Intro".into(),
+        shortcut: "intro".into(),
+        body: "Subject: Quick hello\nHi {first_name},".into(),
+    }];
+    let (window, kite) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("Bob <bob@example.com>", cx);
+        window.click("compose-body", cx);
+        window.input(";i", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.press("enter", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(kite.compose_body(cx), "Hi Bob,");
+        assert_eq!(kite.compose_subject(cx), "Quick hello");
+    });
+}
+

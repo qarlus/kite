@@ -418,3 +418,275 @@ fn scheduled_and_undo_send_can_be_cancelled_back_to_editable_drafts() {
         engine.discard_draft(id).unwrap();
     }
 }
+
+fn newsletter(id: &str, header: &str) -> kite_core::sync::RemoteMsg {
+    serde_json::from_value(serde_json::json!({
+        "remote_id":id,"folder":"inbox","mailbox":"inbox","thread_hint":null,
+        "message_id":format!("<{id}@newsletter.example>"),"in_reply_to":null,"references":[],
+        "from":{"name":"News","email":"news@newsletter.example"},"to":[],"cc":[],
+        "date":now_ms(),"subject":id,"text":"News","html":null,"unread":true,"starred":false,
+        "important":null,"list_unsubscribe":true,"unsubscribe_header":header,
+        "unsubscribe_post":"List-Unsubscribe=One-Click","attachments":[]
+    }))
+    .unwrap()
+}
+
+#[test]
+fn mailto_unsubscribe_uses_receiving_account_archives_exact_sender_undo_and_future_arrivals() {
+    use kite_core::sync::Delta;
+    let dir = temp_dir();
+    let account = local_account(&dir);
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    let header = "<mailto:leave@newsletter.example?subject=Stop%20mail&body=Remove%20me>";
+    store
+        .apply_deltas(
+            account.id,
+            &[
+                Delta::Upsert(Box::new(newsletter("first", header))),
+                Delta::Upsert(Box::new(newsletter("second", header))),
+            ],
+        )
+        .unwrap();
+    let other = store
+        .add_account(Provider::Proton, "other@example.com", "Other")
+        .unwrap();
+    store
+        .apply_deltas(
+            other.id,
+            &[Delta::Upsert(Box::new(newsletter("other-account", header)))],
+        )
+        .unwrap();
+    let engine = engine(&dir);
+    let inbox = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Inbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
+    let result = engine.unsubscribe(thread).unwrap();
+    assert_eq!(result.archived, 2);
+    assert!(engine.threads(&inbox, 0, 10).unwrap().is_empty());
+    assert_eq!(
+        engine
+            .threads(
+                &View {
+                    account_id: Some(other.id),
+                    ..inbox.clone()
+                },
+                0,
+                10
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    let pending = store.outbox_due(i64::MAX).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].1.account_id, account.id);
+    assert_eq!(pending[0].1.to[0].email, "leave@newsletter.example");
+    assert_eq!(pending[0].1.subject, "Stop mail");
+    assert_eq!(pending[0].1.body, "Remove me");
+    engine.undo(result.undo).unwrap();
+    assert_eq!(engine.threads(&inbox, 0, 10).unwrap().len(), 2);
+    drop(store);
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    store
+        .apply_deltas(
+            account.id,
+            &[Delta::Upsert(Box::new(newsletter("third", header)))],
+        )
+        .unwrap();
+    assert_eq!(
+        engine.threads(&inbox, 0, 10).unwrap().len(),
+        2,
+        "new mail auto-archives while undo restores previous conversations"
+    );
+    assert_eq!(
+        engine
+            .threads(
+                &View {
+                    mailbox: Mailbox::Archive,
+                    ..inbox
+                },
+                0,
+                10
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn unsubscribe_refuses_private_addresses_before_archiving() {
+    use kite_core::sync::Delta;
+    for url in [
+        "https://127.0.0.1/unsubscribe",
+        "https://10.0.0.1/unsubscribe",
+        "https://[::ffff:127.0.0.1]/unsubscribe",
+        "http://example.com/unsubscribe",
+    ] {
+        let dir = temp_dir();
+        let account = local_account(&dir);
+        let store = Store::open(&dir.join("kite.db")).unwrap();
+        store
+            .apply_deltas(
+                account.id,
+                &[Delta::Upsert(Box::new(newsletter(
+                    "private",
+                    &format!("<{url}>"),
+                )))],
+            )
+            .unwrap();
+        let engine = engine(&dir);
+        let inbox = View {
+            account_id: Some(account.id),
+            mailbox: Mailbox::Inbox,
+            split: None,
+            query: None,
+            folder: None,
+        };
+        let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
+        assert!(engine.unsubscribe(thread).is_err(), "must refuse {url}");
+        assert_eq!(engine.threads(&inbox, 0, 10).unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn one_click_unsubscribe_posts_rfc8058_body_over_https() {
+    use kite_core::sync::Delta;
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    let dir = temp_dir();
+    let openssl = if cfg!(windows) {
+        "C:/Program Files/Git/usr/bin/openssl.exe"
+    } else {
+        "openssl"
+    };
+    let cert = dir.join("cert.pem");
+    let key = dir.join("key.pem");
+    assert!(
+        Command::new(openssl)
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-keyout"
+            ])
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut child = Command::new(openssl)
+        .args(["s_server", "-quiet", "-naccept", "1", "-accept"])
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("-cert")
+        .arg(&cert)
+        .arg("-key")
+        .arg(&key)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut header = String::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap() == 0 {
+                break;
+            }
+            header.push_str(&line);
+            if line == "\r\n" {
+                break;
+            }
+        }
+        let length = header
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length:")
+                    .map(str::to_owned)
+            })
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        stdin
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+        stdin.flush().unwrap();
+        tx.send((header, body)).unwrap();
+    });
+    // Wait for the helper to bind without consuming its single TLS connection.
+    std::thread::sleep(Duration::from_millis(200));
+    let account = local_account(&dir);
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    store
+        .apply_deltas(
+            account.id,
+            &[Delta::Upsert(Box::new(newsletter(
+                "https",
+                &format!("<https://127.0.0.1:{port}/leave>"),
+            )))],
+        )
+        .unwrap();
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::new())),
+        Options {
+            local_images: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let inbox = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Inbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
+    let result = engine.unsubscribe(thread);
+    let request = rx.recv_timeout(Duration::from_secs(2));
+    let _ = child.kill();
+    let _ = child.wait();
+    let result = result.unwrap();
+    let (header, body) = request.unwrap();
+    assert!(header.starts_with("POST /leave HTTP/1.1"));
+    assert!(
+        header
+            .to_ascii_lowercase()
+            .contains("content-type: application/x-www-form-urlencoded")
+    );
+    assert_eq!(body, b"List-Unsubscribe=One-Click");
+    assert_eq!(result.archived, 1);
+    assert!(
+        store.outbox_due(i64::MAX).unwrap().is_empty(),
+        "one-click never sends an email"
+    );
+    assert!(engine.threads(&inbox, 0, 10).unwrap().is_empty());
+}

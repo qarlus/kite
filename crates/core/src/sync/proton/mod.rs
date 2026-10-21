@@ -1004,6 +1004,18 @@ fn remote_msg(keys: &Keyring, message: &api::Message) -> Result<(RemoteMsg, Opti
             unread: meta.unread,
             starred: meta.label_ids.iter().any(|id| id == STARRED),
             important: None,
+            unsubscribe_header: parsed
+                .as_ref()
+                .and_then(|p| p.header_raw("List-Unsubscribe"))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string(),
+            unsubscribe_post: parsed
+                .as_ref()
+                .and_then(|p| p.header_raw("List-Unsubscribe-Post"))
+                .map(str::trim)
+                .unwrap_or_default()
+                .to_string(),
             list_unsubscribe: parsed
                 .as_ref()
                 .is_some_and(|p| !p.list_unsubscribe().is_empty() || !p.list_id().is_empty()),

@@ -46,6 +46,8 @@ pub mod cmd {
     pub const AI_WRITE: u8 = 59;
     pub const AI_SUMMARY: u8 = 60;
     pub const TAGS: u8 = 61;
+    pub const UNSUBSCRIBE: u8 = 62;
+    pub const INSERT_SNIPPET: u8 = 63;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -112,6 +114,14 @@ const fn c(
 }
 
 pub static COMMANDS: &[Cmd] = &[
+    c(
+        "unsubscribe",
+        "Unsubscribe",
+        &["secondary-u"],
+        "Kite",
+        Group::Triage,
+        cmd::UNSUBSCRIBE,
+    ),
     c(
         "refresh",
         "Refresh mail",
@@ -530,6 +540,14 @@ pub static COMMANDS: &[Cmd] = &[
         "KiteThread",
         Group::Compose,
         cmd::AI_SUMMARY,
+    ),
+    c(
+        "insert_snippet",
+        "Insert snippet…",
+        &["secondary-;"],
+        "KiteCompose",
+        Group::Compose,
+        cmd::INSERT_SNIPPET,
     ),
 ];
 

@@ -9,6 +9,7 @@ pub mod connections;
 pub mod general;
 pub mod privacy;
 pub mod shortcuts;
+pub mod snippets;
 pub mod typography;
 
 use crate::app::{Kite, Overlay};
@@ -29,19 +30,21 @@ pub enum Page {
     Appearance,
     Typography,
     Shortcuts,
+    Snippets,
     Privacy,
     Ai,
 }
 
 impl Page {
     /// Rail order. Reordering this list reorders the rail and moves every entry point.
-    pub const ALL: [Page; 8] = [
+    pub const ALL: [Page; 9] = [
         Page::General,
         Page::Accounts,
         Page::Connections,
         Page::Appearance,
         Page::Typography,
         Page::Shortcuts,
+        Page::Snippets,
         Page::Privacy,
         Page::Ai,
     ];
@@ -70,6 +73,7 @@ impl Page {
             Page::Appearance => "Appearance",
             Page::Typography => "Typography",
             Page::Shortcuts => "Shortcuts",
+            Page::Snippets => "Snippets",
             Page::Privacy => "Privacy",
             Page::Ai => "AI",
         }
@@ -83,6 +87,7 @@ impl Page {
             Page::Appearance => "Colours and palette",
             Page::Typography => "Type, size and colour",
             Page::Shortcuts => "Keys for every command",
+            Page::Snippets => "Reusable text for compose",
             Page::Privacy => "Remote images and tracking",
             Page::Ai => "Writing and summaries",
         }
@@ -96,6 +101,7 @@ impl Page {
             Page::Appearance => IconName::Palette,
             Page::Typography => IconName::ALargeSmall,
             Page::Shortcuts => IconName::Keyboard,
+            Page::Snippets => IconName::TextQuote,
             Page::Privacy => IconName::EyeOff,
             Page::Ai => IconName::Bot,
         }
@@ -139,6 +145,7 @@ pub struct Preferences {
     pub general: general::State,
     pub privacy: privacy::State,
     pub shortcuts: shortcuts::State,
+    pub snippets: snippets::State,
     pub ai: ai::State,
     pub error: Option<String>,
     pub notice: Option<String>,
@@ -169,9 +176,10 @@ impl Kite {
                 typography: typography::State::new(&settings, window, cx),
                 accounts: accounts::State::new(self, window, cx),
                 connections: connections::State::new(window, cx),
-                general: general::State,
+                general: general::State::default(),
                 privacy: privacy::State,
                 shortcuts: shortcuts::State::default(),
+                snippets: snippets::State::default(),
                 ai: ai::State::new(&settings, window, cx),
                 error: None,
                 notice: None,
@@ -344,6 +352,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
         Page::Appearance => appearance::render(kite, window, cx),
         Page::Typography => typography::render(kite, window, cx),
         Page::Shortcuts => shortcuts::render(kite, window, cx),
+        Page::Snippets => snippets::render(kite, window, cx),
         Page::Privacy => privacy::render(kite, window, cx),
         Page::Ai => ai::render(kite, window, cx),
     };

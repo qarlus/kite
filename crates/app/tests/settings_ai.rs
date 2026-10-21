@@ -183,7 +183,7 @@ fn open_ai(window: gpui_kit::WindowHandle<gpui_kit::base::Root>, cx: &mut TestAp
     cx.simulate_keystrokes(window.into(), "secondary-,");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
-        window.click(("settings-tab", 7usize), cx);
+        window.click(("settings-tab", 8usize), cx);
         window.render_frame(cx);
     })
     .unwrap();

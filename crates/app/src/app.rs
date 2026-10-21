@@ -801,7 +801,41 @@ impl Kite {
             }
             return;
         }
+        // While the snippet picker is open it owns the confirm and navigation
+        // commands: Enter inserts the choice, arrows move it, Escape closes the
+        // picker and leaves the `;` text and the draft alone.
+        if self.snippet_open() {
+            match id {
+                cmd::OPEN => self.snippet_confirm(window, cx),
+                cmd::NEXT => self.snippet_move(1, cx),
+                cmd::PREV => self.snippet_move(-1, cx),
+                cmd::COMPOSE_CLOSE | cmd::BACK => self.close_snippets(true, window, cx),
+                _ => {}
+            }
+            return;
+        }
         match id {
+            cmd::UNSUBSCRIBE => {
+                if let Some(thread) = self.target_ids().first().copied() {
+                    let mail = self.mail.clone();
+                    let task = cx
+                        .background_executor()
+                        .spawn(async move { mail.unsubscribe(thread) });
+                    cx.spawn(async move |this, cx| {
+                        let result = task.await;
+                        this.update(cx, |this, cx| match result {
+                            Ok(result) => {
+                                if let Some(url) = result.url { cx.open_url(&url); }
+                                this.record_undo(result.undo);
+                                this.reload();
+                                if this.open.as_ref().is_some_and(|open| open.id == thread) { this.open=None; }
+                                this.show_toast(format!("Unsubscribed from {} · archived {} · undo restores mail only", result.sender, result.archived), false, true, cx);
+                            }
+                            Err(error) => this.toast(format!("Could not unsubscribe: {error}"), cx),
+                        }).ok();
+                    }).detach();
+                }
+            }
             cmd::REFRESH => {
                 self.mail.sync_now();
                 self.toast("Refresh requested", cx);
@@ -834,6 +868,7 @@ impl Kite {
             cmd::SEND => self.send_compose(window, cx),
             cmd::SEND_LATER => self.schedule_send(window, cx),
             cmd::DISCARD => self.discard_compose(window, cx),
+            cmd::INSERT_SNIPPET => self.open_snippets(window, cx),
             cmd::SHOW_CC => {
                 if let Some(compose) = &mut self.compose {
                     compose.show_cc = true;

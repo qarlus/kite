@@ -519,11 +519,7 @@ fn profile_settings_round_trip_through_the_store() {
     let before = store.settings().unwrap();
     assert!(before.profiles.is_empty());
     let mut settings = before;
-    settings
-        .profiles
-        .entry(account.id)
-        .or_default()
-        .signature = "Regards,\nMe".into();
+    settings.profiles.entry(account.id).or_default().signature = "Regards,\nMe".into();
     store.set_settings(settings.clone()).unwrap();
     assert_eq!(
         store.settings().unwrap().profiles[&account.id].signature,
@@ -952,7 +948,8 @@ async fn internet_message_headers_mark_bulk_mail() {
                         "body": { "contentType": "text", "content": "weekly" },
                         "bodyPreview": "weekly",
                         "internetMessageHeaders": [
-                            { "name": "List-Unsubscribe", "value": "<mailto:unsub@stack.example>" }
+                            { "name": "List-Unsubscribe", "value": "<mailto:unsub@stack.example>" },
+                            { "name": "list-unsubscribe-post", "value": "List-Unsubscribe=One-Click" }
                         ]
                     },
                     {
@@ -1009,6 +1006,14 @@ async fn internet_message_headers_mark_bulk_mail() {
     let mut g = graph(&fake);
     let (deltas, _) = g.sync(None).await.unwrap();
     assert!(upsert(&deltas, "b1").list_unsubscribe, "List-Unsubscribe");
+    assert_eq!(
+        upsert(&deltas, "b1").unsubscribe_header,
+        "<mailto:unsub@stack.example>"
+    );
+    assert_eq!(
+        upsert(&deltas, "b1").unsubscribe_post,
+        "List-Unsubscribe=One-Click"
+    );
     assert!(upsert(&deltas, "b2").list_unsubscribe, "List-Id");
     assert!(!upsert(&deltas, "b3").list_unsubscribe, "ordinary mail");
 
@@ -2090,4 +2095,171 @@ fn microsoft_sized_tokens_round_trip_through_the_os_keychain() {
     assert_eq!(auth::secret_get(&key).unwrap().as_deref(), Some("short"));
     auth::secret_del(&key).unwrap();
     assert_eq!(auth::secret_get(&key).unwrap(), None);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_send_survives_restart_cancel_deletes_provider_item_and_short_delay_stays_local() {
+    use kite_core::{
+        api::Mail,
+        engine::{Engine, Options, Secrets},
+        model::{Draft, Provider},
+        store::Store,
+    };
+    use std::time::{Duration, Instant};
+    let reject_delete = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let rejected = reject_delete.clone();
+    let fake = Fake::start(move |c, base| match (c.method.as_str(), c.path.as_str()) {
+        ("POST", "/me/messages") => Reply::json(
+            201,
+            json!({"id":"scheduled-immutable", "internetMessageId":"<scheduled@example.com>"}),
+        ),
+        ("PATCH", "/me/messages/scheduled-immutable") => {
+            Reply::json(200, json!({"id":"scheduled-immutable"}))
+        }
+        ("POST", "/me/messages/scheduled-immutable/send") => Reply::empty(202),
+        ("DELETE", "/me/messages/scheduled-immutable") => {
+            if rejected.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                Reply::empty(503)
+            } else {
+                Reply::empty(204)
+            }
+        }
+        _ => Reply::json(
+            200,
+            json!({"value":[],"@odata.deltaLink":format!("{base}{}",c.path)}),
+        ),
+    })
+    .await;
+    let dir = temp_dir::TempDir::new("deferred-send");
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    let tokens = serde_json::to_string(&Tokens {
+        access: "token".into(),
+        refresh: "refresh".into(),
+        expires_at: auth::now_ms() + 3_600_000,
+    })
+    .unwrap();
+    let options = Options {
+        graph_base_url: Some(fake.base.clone()),
+        poll: Duration::from_millis(20),
+        ..Default::default()
+    };
+    let secrets = || {
+        Secrets::Memory(Mutex::new(HashMap::from([(
+            format!("ms:{}", account.id),
+            tokens.clone(),
+        )])))
+    };
+    let engine = Engine::open_with(&dir, secrets(), options.clone()).unwrap();
+    let at = auth::now_ms() + 600_000;
+    let draft = Draft {
+        account_id: account.id,
+        to: vec![Addr {
+            name: String::new(),
+            email: "recipient@example.com".into(),
+        }],
+        subject: "Scheduled test".into(),
+        body: "Later".into(),
+        send_at: Some(at),
+        ..Default::default()
+    };
+    let (saved, _) = store
+        .save_draft(&draft, "scheduled-local@example.com")
+        .unwrap();
+    let draft = Draft {
+        id: Some(saved),
+        ..draft
+    };
+    let id = engine.send(draft.clone()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if !fake
+            .path("/me/messages/scheduled-immutable/send")
+            .is_empty()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "schedule was not handed over");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let patches: Vec<_> = fake
+        .path("/me/messages/scheduled-immutable")
+        .into_iter()
+        .filter(|c| c.method == "PATCH")
+        .collect();
+    assert_eq!(
+        patches[0].json(),
+        json!({"singleValueExtendedProperties":[{"id":"SystemTime 0x3FEF","value":chrono::DateTime::from_timestamp_millis(at).unwrap().to_rfc3339_opts(chrono::SecondsFormat::Millis,true)}]})
+    );
+    let created = fake.path("/me/messages");
+    assert_eq!(created[0].header("prefer"), Some("IdType=\"ImmutableId\""));
+    assert!(
+        store.outbox_due(i64::MAX).unwrap().is_empty(),
+        "handed over mail must never be sent locally"
+    );
+    drop(engine);
+    let reopened = Engine::open_with(&dir, secrets(), options).unwrap();
+    let cancel = reopened.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || cancel.cancel_send(id))
+            .await
+            .unwrap()
+            .is_err(),
+        "failed provider cancellation must retain the schedule"
+    );
+    assert!(store.outbox_remote(id).unwrap().is_some());
+    let cancel = reopened.clone();
+    let recovered = tokio::task::spawn_blocking(move || cancel.cancel_send(id))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.subject, "Scheduled test");
+    assert_eq!(recovered.id, Some(saved));
+    assert_eq!(
+        store
+            .threads(
+                &kite_core::model::View {
+                    account_id: Some(account.id),
+                    mailbox: Mailbox::Drafts,
+                    split: None,
+                    query: None,
+                    folder: None
+                },
+                0,
+                10
+            )
+            .unwrap()
+            .len(),
+        1,
+        "cancel restores the saved draft after restart"
+    );
+    assert!(
+        fake.path("/me/messages/scheduled-immutable")
+            .iter()
+            .any(|c| c.method == "DELETE")
+    );
+    let before = fake.path("/me/messages").len();
+    let short = reopened
+        .send(Draft {
+            send_at: Some(auth::now_ms() + 60_000),
+            ..draft
+        })
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        fake.path("/me/messages").len(),
+        before,
+        "short schedules stay local"
+    );
+    let cancel = reopened.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || cancel.cancel_send(short))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_some()
+    );
 }

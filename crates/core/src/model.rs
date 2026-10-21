@@ -192,6 +192,16 @@ pub struct AccountProfile {
     pub signature: String,
 }
 
+/// A reusable text block inserted in compose (`;shortcut` or the palette).
+/// `{first_name}`-style variables expand on insert; a first line `Subject: …` sets
+/// an empty subject.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Snippet {
+    pub name: String,
+    pub body: String,
+    pub shortcut: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct CustomTheme {
@@ -209,6 +219,7 @@ pub struct Settings {
     pub font_size: u8,
     pub font_color: Option<String>,
     pub undo_send_secs: u32,
+    pub auto_update_check: bool,
     pub load_remote_images: bool,
     pub ai_enabled: bool,
     pub ai_base_url: String,
@@ -224,6 +235,9 @@ pub struct Settings {
     pub reading_pane: bool,
     /// Per-account profile (signature), keyed by account id. Display name is `Account.name`.
     pub profiles: std::collections::BTreeMap<Id, AccountProfile>,
+    /// Text snippets inserted in compose. Absent in settings written before they existed.
+    #[serde(default)]
+    pub snippets: Vec<Snippet>,
 }
 
 impl Default for Settings {
@@ -235,6 +249,7 @@ impl Default for Settings {
             font_size: 14,
             font_color: None,
             undo_send_secs: 5,
+            auto_update_check: true,
             load_remote_images: false,
             ai_enabled: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
@@ -243,6 +258,7 @@ impl Default for Settings {
             shortcuts: Default::default(),
             reading_pane: true,
             profiles: Default::default(),
+            snippets: Default::default(),
         }
     }
 }

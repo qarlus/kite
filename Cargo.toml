@@ -6,6 +6,8 @@ members = ["crates/core", "crates/app"]
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.91"
+license = "MIT"
+repository = "https://github.com/qarlus/kite"
 
 # Versions are pinned here once. Crates use `dep = { workspace = true }`.
 [workspace.dependencies]
@@ -33,6 +35,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 keyring = { version = "3", default-features = false, features = ["apple-native", "windows-native"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 sha2 = "0.10"
+minisign-verify = "=0.2.5"
 base64 = "0.22"
 getrandom = { version = "0.3", features = ["std"] }
 # Native Proton API: SRP (bcrypt + the big-int crate rpgp already links) and OpenPGP bodies.

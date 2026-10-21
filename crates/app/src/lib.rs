@@ -40,7 +40,8 @@ gpui_kit::assets::icon_assets!(
         Plus,
         Tag,
         Maximize2,
-        Minimize2
+        Minimize2,
+        TextQuote
     ]
 );
 

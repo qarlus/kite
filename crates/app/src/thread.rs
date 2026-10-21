@@ -9,11 +9,13 @@ use crate::list::when;
 use crate::theme::{MAX_COL, RADIUS, RADIUS_SM, Theme};
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui_kit::assets::IconName;
-use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::{Addr, Id, Message};
+use std::ops::Range;
 use std::sync::Arc;
 
 /// The reading pane's side padding. `app.rs` subtracts it from `html_width`, so the width Blitz
@@ -68,12 +70,37 @@ impl HtmlKey {
     }
 }
 
+/// The link under the pointer right now, in whichever body it sits.
+#[derive(Clone, PartialEq)]
+pub(crate) struct Hover {
+    pub message: Id,
+    pub href: String,
+    /// The link's visible text; for a text-body link it is the URL itself.
+    pub text: String,
+    /// The link's box inside its HTML body, for the accent highlight. `None` for a
+    /// plain-text link, which is highlighted as a run instead.
+    pub rect: Option<(f32, f32, f32, f32)>,
+    /// The plain-text link's index in its body's ranges, for the same highlight.
+    pub range: Option<usize>,
+}
+
+/// A link whose visible text and destination disagree, held for "Open anyway".
+pub(crate) struct Confirm {
+    pub url: String,
+    pub text_host: String,
+    pub link_host: String,
+}
+
 pub struct HtmlCache {
     inner: Lru<HtmlKey, Rendered>,
     pending: std::collections::HashSet<HtmlKey>,
     /// The key each message last painted, so a re-render under a new key keeps the previous
     /// frame on screen instead of dropping back to the placeholder.
     painted: std::collections::HashMap<Id, HtmlKey>,
+    /// The link under the pointer, for the cursor, the highlight and the status pill.
+    pub(crate) hover: Option<Hover>,
+    /// The suspicious link waiting on the reader's decision.
+    pub(crate) confirm: Option<Confirm>,
 }
 
 impl HtmlCache {
@@ -82,6 +109,8 @@ impl HtmlCache {
             inner: Lru::new(cap),
             pending: std::collections::HashSet::new(),
             painted: std::collections::HashMap::new(),
+            hover: None,
+            confirm: None,
         }
     }
 
@@ -219,13 +248,37 @@ impl Kite {
                 column.child(self.message(message, ix, expanded, is_last, (scale, body_width), cx));
         }
         let scroll = self.thread_scroll.clone();
+        let entity = cx.entity().downgrade();
+        // One context menu for the whole reading pane: over a link it is the link's menu,
+        // anywhere else it is the conversation's tag menu. A second menu inside would open
+        // on top of the first — neither stops right-click propagation.
+        let menu = move |menu: PopupMenu, window: &mut Window, cx: &mut Context<PopupMenu>| {
+            let link = entity
+                .upgrade()
+                .and_then(|kite| kite.read(cx).html_cache.hover.clone());
+            match link {
+                Some(link) => link_menu(entity.clone(), link, menu),
+                None => crate::tags::popup_with(entity.clone(), vec![open_id], menu, window, cx),
+            }
+        };
         div()
+            .id("reading-pane")
             .flex_1()
             .flex()
             .flex_col()
             .min_h_0()
             .overflow_hidden()
-            .context_menu(crate::tags::popup(cx.entity().downgrade(), vec![open_id]))
+            // One listener for every body: hit-test the painted links against the pointer.
+            // Only a change repaints, so j/k stays under its frame budget.
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _, cx| {
+                this.hover_link(event.position, cx);
+            }))
+            .on_hover(cx.listener(|this, inside: &bool, _, cx| {
+                if !*inside && this.html_cache.hover.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .context_menu(menu)
             .child(self.thread_toolbar(cx))
             .child(
                 div()
@@ -243,7 +296,209 @@ impl Kite {
                     .items_center()
                     .child(column),
             )
+            .when_some(self.link_confirm(cx), |d, card| d.child(card))
+            .when_some(self.link_pill(), |d, pill| d.child(pill))
             .into_any_element()
+    }
+
+    /// Hit-tests the pointer against the links of whatever painted bodies are on screen:
+    /// O(messages × links), no re-render of anything.
+    fn hover_link(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let mut hover = None;
+        for (id, area) in self.html_bounds.borrow().iter() {
+            if !area.contains(&position) {
+                continue;
+            }
+            let at = position - area.origin;
+            if let Some(link) = self
+                .html_cache
+                .shown(*id)
+                .and_then(|r| r.hit(at.x.into(), at.y.into()))
+            {
+                hover = Some(Hover {
+                    message: *id,
+                    href: link.href.clone(),
+                    text: link.text.clone(),
+                    rect: Some((link.x, link.y, link.w, link.h)),
+                    range: None,
+                });
+            }
+            break;
+        }
+        if self.html_cache.hover != hover {
+            self.html_cache.hover = hover;
+            cx.notify();
+        }
+    }
+
+    /// InteractiveText's character hover, mapped back onto the text body's link ranges.
+    fn hover_text(
+        &mut self,
+        message: Id,
+        index: Option<usize>,
+        ranges: &[Range<usize>],
+        hrefs: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        let hover = index
+            .and_then(|ix| ranges.iter().position(|range| range.contains(&ix)))
+            .map(|range| Hover {
+                message,
+                href: hrefs[range].clone(),
+                text: hrefs[range].clone(),
+                rect: None,
+                range: Some(range),
+            });
+        if self.html_cache.hover != hover {
+            self.html_cache.hover = hover;
+            cx.notify();
+        }
+    }
+
+    /// Runs a link. `mailto:` opens compose addressed to it, `http(s)` opens the browser
+    /// once tracking parameters are stripped and the text/href phishing check has passed,
+    /// and every other scheme (`javascript:`, `data:`, `file:`…) never leaves the app.
+    pub(crate) fn open_link(
+        &mut self,
+        href: &str,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let href = href.trim();
+        if let Some(addr) = crate::html::mailto(href) {
+            self.open_compose(window, cx);
+            if let Some(compose) = &self.compose {
+                compose.to.update(cx, |state, cx| {
+                    state.set_value(addr, window, cx);
+                });
+            }
+            return;
+        }
+        let lower = href.get(..10).unwrap_or(href).to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            return;
+        }
+        if let Some((text_host, link_host)) = crate::html::link_warning(text, href) {
+            self.html_cache.confirm = Some(Confirm {
+                url: crate::html::clean_url(href),
+                text_host,
+                link_host,
+            });
+            cx.notify();
+            return;
+        }
+        cx.open_url(&crate::html::clean_url(href));
+    }
+
+    /// The browser-style status pill at the reading pane's bottom-left, shown while a link
+    /// is under the pointer. It tells the truth about the destination: the cleaned URL,
+    /// or the mismatch warning when text and href disagree.
+    fn link_pill(&self) -> Option<AnyElement> {
+        let hover = self.html_cache.hover.as_ref()?;
+        let t = self.theme;
+        let pill = div()
+            .id("link-pill")
+            .test_support()
+            .absolute()
+            .left(px(PANE_PAD))
+            .bottom(px(10.))
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .max_w(px(440.))
+            .h(px(24.))
+            .px(px(10.))
+            .rounded(px(RADIUS_SM))
+            .bg(t.bg2)
+            .border_1()
+            .border_color(t.line)
+            .text_size(t.px(11.));
+        if let Some((text_host, link_host)) = crate::html::link_warning(&hover.text, &hover.href) {
+            let label = format!("Text says {text_host} — link goes to {link_host}");
+            return Some(
+                pill.aria_label(label.clone())
+                    .child(
+                        Icon::new(IconName::ShieldAlert)
+                            .with_size(px(12.))
+                            .text_color(t.danger)
+                            .flex_shrink_0(),
+                    )
+                    .child(div().min_w_0().truncate().child(label))
+                    .into_any_element(),
+            );
+        }
+        let url = crate::html::clean_url(&hover.href);
+        let (pre, host, rest) = url_parts(&url);
+        Some(
+            pill.aria_label(url.clone())
+                .child(div().flex_shrink_0().text_color(t.fg3).child(pre))
+                .child(div().flex_shrink_0().child(host))
+                .child(div().min_w_0().truncate().text_color(t.fg3).child(rest))
+                .into_any_element(),
+        )
+    }
+
+    /// The "Open anyway?" card for a link whose visible text disagrees with its destination.
+    fn link_confirm(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let confirm = self.html_cache.confirm.as_ref()?;
+        let t = self.theme;
+        let url = confirm.url.clone();
+        let label = format!(
+            "Text says {} — link goes to {}",
+            confirm.text_host, confirm.link_host
+        );
+        Some(
+            div()
+                .id("link-confirm")
+                .test_support()
+                .aria_label(label.clone())
+                .absolute()
+                .left(px(PANE_PAD))
+                .bottom(px(10.))
+                .w(px(360.))
+                .p_3()
+                .rounded(px(RADIUS))
+                .bg(t.bg2)
+                .border_1()
+                .border_color(t.line)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::ShieldAlert)
+                                .with_size(px(14.))
+                                .text_color(t.danger)
+                                .flex_shrink_0(),
+                        )
+                        .child(div().text_size(t.px(12.)).child(label)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(
+                            crate::preferences::button("link-confirm-open", "Open anyway", t)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.html_cache.confirm = None;
+                                    cx.open_url(&url);
+                                })),
+                        )
+                        .child(
+                            crate::preferences::button("link-confirm-cancel", "Cancel", t)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.html_cache.confirm = None;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The reading-pane toolbar: icon-only buttons in the order they act on the conversation,
@@ -598,6 +853,45 @@ impl Kite {
                     self.request_images(&remote, cx);
                 }
                 let mut stack = div().flex().flex_col().gap_3();
+                // The tracker shield's quiet report; a body without pixels shows no line.
+                let found = crate::html::trackers(source);
+                if !found.is_empty() {
+                    let mut names: Vec<&str> = Vec::new();
+                    for name in &found {
+                        if !names.contains(&name.as_str()) {
+                            names.push(name);
+                        }
+                    }
+                    let list = names.join(", ");
+                    let count = found.len();
+                    stack = stack.child(
+                        div()
+                            .id(format!("trackers-{}", message.id))
+                            .test_support()
+                            .aria_label(format!(
+                                "{count} tracker{} blocked: {list}",
+                                if count == 1 { "" } else { "s" }
+                            ))
+                            .ml(px(BODY_INDENT))
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .text_size(t.px(12.))
+                            .text_color(t.fg3)
+                            .child(
+                                Icon::new(IconName::ShieldAlert)
+                                    .with_size(px(13.))
+                                    .text_color(t.fg3),
+                            )
+                            .child(format!(
+                                "{count} tracker{} blocked: {list}",
+                                if count == 1 { "" } else { "s" }
+                            ))
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(format!("Blocked trackers: {list}")).build(window, cx)
+                            }),
+                    );
+                }
                 if blocked {
                     stack = stack.child(self.image_notice(message.id, cx));
                 }
@@ -605,17 +899,73 @@ impl Kite {
                     .child(self.html_body(&message, source, allowed, scale, body_width, cx))
                     .into_any_element()
             }
-            // Text bodies keep their theme type and hang under the sender's name.
-            None => div()
-                .id(format!("text-{}", message.id))
-                .test_support()
-                .aria_label(message.text.clone())
-                .ml(px(BODY_INDENT))
-                .max_w(px(body_width - BODY_INDENT))
-                .text_size(t.px(15.))
-                .line_height(relative(1.7))
-                .child(message.text.clone())
-                .into_any_element(),
+            // Text bodies keep their theme type and hang under the sender's name. URLs and
+            // addresses in them are real links: pointer cursor, accent ink, click and hover.
+            None => {
+                let (ranges, hrefs) = text_links(&message.text);
+                let body = div()
+                    .id(format!("text-{}", message.id))
+                    .test_support()
+                    .aria_label(message.text.clone())
+                    .ml(px(BODY_INDENT))
+                    .max_w(px(body_width - BODY_INDENT))
+                    .text_size(t.px(15.))
+                    .line_height(relative(1.7));
+                if ranges.is_empty() {
+                    body.child(message.text.clone()).into_any_element()
+                } else {
+                    let hovered = self
+                        .html_cache
+                        .hover
+                        .as_ref()
+                        .filter(|h| h.message == message.id)
+                        .and_then(|h| h.range);
+                    let styled = StyledText::new(message.text.clone()).with_highlights(
+                        ranges.iter().enumerate().map(|(ix, range)| {
+                            (
+                                range.clone(),
+                                HighlightStyle {
+                                    color: Some(t.accent.into()),
+                                    underline: Some(UnderlineStyle {
+                                        thickness: px(1.),
+                                        color: Some(t.accent.into()),
+                                        wavy: false,
+                                    }),
+                                    background_color: (hovered == Some(ix))
+                                        .then(|| Theme::alpha(t.accent, 0.16)),
+                                    ..Default::default()
+                                },
+                            )
+                        }),
+                    );
+                    let weak = cx.entity().downgrade();
+                    let mid = message.id;
+                    let click = {
+                        let hrefs = hrefs.clone();
+                        let weak = weak.clone();
+                        move |ix: usize, window: &mut Window, cx: &mut App| {
+                            let href = hrefs[ix].clone();
+                            let _ = weak
+                                .update(cx, |this, cx| this.open_link(&href, &href, window, cx));
+                        }
+                    };
+                    let hover = {
+                        let ranges = ranges.clone();
+                        let hrefs = hrefs.clone();
+                        move |ix: Option<usize>, _: MouseMoveEvent, _: &mut Window, cx: &mut App| {
+                            let _ = weak.update(cx, |this, cx| {
+                                this.hover_text(mid, ix, &ranges, &hrefs, cx)
+                            });
+                        }
+                    };
+                    body.child(
+                        InteractiveText::new(("text-links", message.id as usize), styled)
+                            .on_click(ranges.clone(), click)
+                            .on_hover(hover),
+                    )
+                    .into_any_element()
+                }
+            }
         };
         let mut column = div().pt_5().flex().flex_col().gap_4().child(body);
         // Attachment chips and the reply row still start where the sender's name does.
@@ -751,16 +1101,18 @@ impl Kite {
                 let (width, height) = (rendered.width, rendered.height);
                 let id = message.id;
                 let bounds = self.html_bounds.clone();
+                let hover = self.html_cache.hover.clone().filter(|h| h.message == id);
                 // No card, border or padding: the render is the pane's own canvas, so it has no
                 // edge to round.
                 let page = img(ImageSource::Render(image)).w(px(width)).h(px(height));
-                div()
+                let mut body = div()
                     .id(format!("html-{id}"))
                     .test_support()
                     .aria_label(format!("HTML body, {height:.0}px"))
                     .relative()
                     .w(px(width))
                     .h(px(height))
+                    .when(hover.is_some(), |d| d.cursor_pointer())
                     .child(page)
                     .child(
                         canvas(
@@ -774,26 +1126,43 @@ impl Kite {
                         )
                         .absolute()
                         .inset_0(),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            let Some(area) = this.html_bounds.borrow().get(&id).copied() else {
-                                return;
-                            };
-                            let at = event.position - area.origin;
-                            if let Some(href) = this
-                                .html_cache
-                                .get(&key)
-                                .or_else(|| this.html_cache.shown(id))
-                                .and_then(|r| r.link_at(at.x.into(), at.y.into()))
-                            {
-                                cx.open_url(&href);
-                                cx.stop_propagation();
-                            }
-                        }),
-                    )
-                    .into_any_element()
+                    );
+                // The browser-style link cue: a soft accent wash over the link's box.
+                if let Some((x, y, w, h)) = hover.and_then(|h| h.rect) {
+                    body = body.child(
+                        div()
+                            .id("link-highlight")
+                            .test_support()
+                            .aria_label("Link")
+                            .absolute()
+                            .left(px(x - 2.))
+                            .top(px(y - 2.))
+                            .w(px(w + 4.))
+                            .h(px(h + 4.))
+                            .rounded(px(4.))
+                            .bg(Theme::alpha(t.accent, 0.16)),
+                    );
+                }
+                body.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                        let Some(area) = this.html_bounds.borrow().get(&id).copied() else {
+                            return;
+                        };
+                        let at = event.position - area.origin;
+                        let link = this
+                            .html_cache
+                            .get(&key)
+                            .or_else(|| this.html_cache.shown(id))
+                            .and_then(|r| r.hit(at.x.into(), at.y.into()))
+                            .map(|l| (l.href.clone(), l.text.clone()));
+                        if let Some((href, text)) = link {
+                            this.open_link(&href, &text, window, cx);
+                            cx.stop_propagation();
+                        }
+                    }),
+                )
+                .into_any_element()
             }
             None => div()
                 .id(format!("html-{}", message.id))
@@ -957,6 +1326,105 @@ fn names(addrs: &[Addr]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The right-click menu over a link, chosen by the reading pane's single context menu when
+/// the pointer is on one. The same rules a click follows: web links open in the browser,
+/// mailto opens compose, everything else is copy-only.
+fn link_menu(entity: WeakEntity<Kite>, link: Hover, mut menu: PopupMenu) -> PopupMenu {
+    let href = link.href.trim().to_string();
+    let mailto = crate::html::mailto(&href);
+    let web = {
+        let lower = href.get(..10).unwrap_or(&href).to_ascii_lowercase();
+        lower.starts_with("http://") || lower.starts_with("https://")
+    };
+    if web || mailto.is_some() {
+        let (entity, link) = (entity.clone(), link.clone());
+        let label = if mailto.is_some() {
+            "Compose to this address"
+        } else {
+            "Open in browser"
+        };
+        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            let _ = entity.update(cx, |kite, cx| {
+                kite.open_link(&link.href, &link.text, window, cx);
+            });
+        }));
+    }
+    let label = if mailto.is_some() {
+        "Copy address"
+    } else {
+        "Copy link"
+    };
+    let value = mailto.unwrap_or_else(|| crate::html::clean_url(&href));
+    menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+    }))
+}
+
+/// `(byte range, href)` of every URL or address in a plain-text body. Web URLs open in the
+/// browser, `user@domain` addresses open compose — the same treatment HTML links get.
+fn text_links(text: &str) -> (Vec<Range<usize>>, Vec<String>) {
+    /// Punctuation that hugs a token in prose but is never part of its URL or address.
+    const TRIM: &str = ".,;:!?'\"()[]{}<>»”";
+    let mut ranges = Vec::new();
+    let mut hrefs = Vec::new();
+    let mut start = None;
+    for (ix, c) in text
+        .char_indices()
+        .chain(std::iter::once((text.len(), ' ')))
+    {
+        if !c.is_whitespace() {
+            start.get_or_insert(ix);
+            continue;
+        }
+        let Some(begin) = start.take() else {
+            continue;
+        };
+        let raw = &text[begin..ix];
+        let token = raw.trim_matches(|c: char| TRIM.contains(c));
+        if token.is_empty() {
+            continue;
+        }
+        let at = begin + raw.find(token).unwrap_or(0);
+        let lower = token.to_ascii_lowercase();
+        let href = if lower.starts_with("http://") || lower.starts_with("https://") {
+            token.to_string()
+        } else if !token.contains("://") && !token.contains(' ') && {
+            let mut parts = token.rsplitn(2, '@');
+            let domain = parts.next().unwrap_or_default();
+            !parts.next().unwrap_or_default().is_empty() && domain.contains('.')
+        } {
+            format!("mailto:{token}")
+        } else {
+            continue;
+        };
+        ranges.push(at..at + token.len());
+        hrefs.push(href);
+    }
+    (ranges, hrefs)
+}
+
+/// `(scheme, host, rest)` of a URL for the status pill, so the host reads in `fg` and the
+/// rest in `fg3`. `mailto:` counts as a scheme; anything else is all "rest".
+fn url_parts(url: &str) -> (String, String, String) {
+    let after = match url.find("://") {
+        Some(at) => at + 3,
+        None if url
+            .get(..7)
+            .is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) =>
+        {
+            7
+        }
+        None => return (String::new(), String::new(), url.to_string()),
+    };
+    let rest = &url[after..];
+    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    (
+        url[..after].to_string(),
+        rest[..host_end].to_string(),
+        rest[host_end..].to_string(),
+    )
 }
 
 /// `178 KB`, `2.4 MB`: what an attachment chip shows.

@@ -18,12 +18,14 @@ const BLOCKED: &str =
 
 /// A link's hit box in logical pixels, resolved once at render time so the
 /// document itself never has to cross a thread boundary.
-struct Link {
-    href: String,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
+pub struct Link {
+    pub href: String,
+    /// The link's visible text, for the status pill and the phishing check.
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
 }
 
 pub struct Rendered {
@@ -112,6 +114,7 @@ pub fn render_styled(html: &str, width: f32, scale: f32, theme: Theme, font: &st
             });
             Some(Link {
                 href,
+                text: node.text_content().trim().to_string(),
                 x: x * fit,
                 y: y * fit,
                 w: w * fit,
@@ -669,12 +672,16 @@ fn union(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> (f32, f32, f32, f3
 }
 
 impl Rendered {
-    /// The `href` of the link under logical point (x, y), if any.
-    pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
+    /// The link under logical point (x, y), if any.
+    pub fn hit(&self, x: f32, y: f32) -> Option<&Link> {
         self.links
             .iter()
             .find(|l| x >= l.x && x <= l.x + l.w && y >= l.y && y <= l.y + l.h)
-            .map(|l| l.href.clone())
+    }
+
+    /// The `href` of the link under logical point (x, y), if any.
+    pub fn link_at(&self, x: f32, y: f32) -> Option<String> {
+        self.hit(x, y).map(|l| l.href.clone())
     }
 }
 
@@ -735,11 +742,16 @@ pub fn data_url(bytes: &[u8]) -> String {
 }
 
 /// A remote `http(s)` reference the body would load, with the spans it occupies.
-/// `href` is skipped: a link must stay clickable, whatever its scheme.
+/// `href` is skipped: a link must stay clickable, whatever its scheme. Tracking
+/// pixels never appear here either — they are stripped before rendering, not fetched.
 pub fn remote_images(source: &str) -> Vec<String> {
+    let tracked = tracker_srcs(source);
     let mut urls = Vec::new();
     for (_, url) in references(source) {
-        if (url.starts_with("http://") || url.starts_with("https://")) && !urls.contains(&url) {
+        if (url.starts_with("http://") || url.starts_with("https://"))
+            && !tracked.contains(&url)
+            && !urls.contains(&url)
+        {
             urls.push(url);
         }
     }
@@ -748,8 +760,11 @@ pub fn remote_images(source: &str) -> Vec<String> {
 
 /// The body with every remote reference pointed at its fetched `data:` URL, or at a
 /// transparent pixel when it has not been loaded. This is the only way an image appears,
-/// so a message that was not allowed loads nothing.
+/// so a message that was not allowed loads nothing. Tracking pixels are removed entirely:
+/// they are never fetched, however the reader set the remote-image policy.
 pub fn inline_images(source: &str, images: &HashMap<String, String>) -> String {
+    let stripped = strip_trackers(source);
+    let source = stripped.as_ref();
     let mut out = String::with_capacity(source.len());
     let mut last = 0;
     for (range, url) in references(source) {
@@ -805,4 +820,356 @@ fn references(source: &str) -> Vec<((usize, usize), String)> {
         at = end.max(ix + attr.len());
     }
     found
+}
+
+// ---- Tracker shield -------------------------------------------------------------------
+//
+// Senders watch opens through invisible images: 1x1 beacons, display:none imgs and pixels
+// hosted on tracking domains. They are stripped before rendering, so they can never be
+// fetched — not when remote images are blocked, and not when the reader allowed them.
+
+/// Hosts that exist mainly to track mail or serve ESP assets: an image on one is a
+/// beacon whatever its size. Suffix-matched, so `ct.sendgrid.net` counts as SendGrid.
+const TRACKER_HOSTS: [(&str, &str); 22] = [
+    ("list-manage.com", "Mailchimp"),
+    ("mailchi.mp", "Mailchimp"),
+    ("sendgrid.net", "SendGrid"),
+    ("sendgrid.com", "SendGrid"),
+    ("hs-analytics.net", "HubSpot"),
+    ("hubspotlinks.com", "HubSpot"),
+    ("hubspotemail.net", "HubSpot"),
+    ("mixmax.com", "Mixmax"),
+    ("superhuman.com", "Superhuman"),
+    ("mailtrack.io", "Mailtrack"),
+    ("yesware.com", "Yesware"),
+    ("streak.com", "Streak"),
+    ("mailfoogae.appspot.com", "Streak"),
+    ("bananatag.com", "Bananatag"),
+    ("bl-1.com", "Bananatag"),
+    ("exct.net", "Salesforce"),
+    ("exacttarget.com", "Salesforce"),
+    ("klaviyomail.com", "Klaviyo"),
+    ("customeriomail.com", "Customer.io"),
+    ("mandrillapp.com", "Mandrill"),
+    ("postmarkapp.com", "Postmark"),
+    ("mg.substack.com", "Substack"),
+];
+
+/// The vendor name a tracker host belongs to, if it is on the list.
+fn tracker_vendor(host: &str) -> Option<&'static str> {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    TRACKER_HOSTS
+        .iter()
+        .find(|(suffix, _)| host == *suffix || host.ends_with(&format!(".{suffix}")))
+        .map(|(_, name)| *name)
+}
+
+/// `(start, end)` spans of every `<img …>` start tag in the body.
+fn img_tags(source: &str) -> Vec<(usize, usize)> {
+    let lower = source.to_ascii_lowercase();
+    let mut tags = Vec::new();
+    let mut at = 0;
+    while let Some(ix) = lower[at..].find("<img").map(|i| at + i) {
+        // `<imgx` is not an img tag: the byte after the name must not be a name character.
+        if lower[ix + 4..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        {
+            at = ix + 4;
+            continue;
+        }
+        let end = ix + tag_end(&source[ix..]);
+        tags.push((ix, end));
+        at = end;
+    }
+    tags
+}
+
+/// The value of an attribute inside a start tag, quoted or bare.
+fn tag_attr<'a>(tag: &'a str, want: &str) -> Option<&'a str> {
+    let bytes = tag.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || matches!(bytes[i], b'>' | b'/') {
+            break;
+        }
+        let name_at = i;
+        while i < bytes.len()
+            && !matches!(bytes[i], b'=' | b'>' | b'/')
+            && !bytes[i].is_ascii_whitespace()
+        {
+            i += 1;
+        }
+        let name = &tag[name_at..i];
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'=' {
+            continue;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let quote = matches!(bytes.get(i), Some(b'"' | b'\'')).then(|| bytes[i] as char);
+        let start = i + usize::from(quote.is_some());
+        let end = match quote {
+            Some(q) => tag[start..].find(q).map_or(tag.len(), |e| start + e),
+            None => tag[start..]
+                .find(|c: char| c.is_ascii_whitespace() || c == '>')
+                .map_or(tag.len(), |e| start + e),
+        };
+        if name.eq_ignore_ascii_case(want) {
+            return Some(&tag[start..end]);
+        }
+        i = end;
+    }
+    None
+}
+
+/// A pixel size like `1`, `1px` or `1.0px`; `None` when the value is not a size.
+fn small_dim(value: Option<&str>) -> Option<f32> {
+    value?.trim().trim_end_matches("px").parse().ok()
+}
+
+/// A `width:`/`height:` declaration inside a style attribute, in px. Declarations are
+/// matched whole, so `border-width` is not `width`.
+fn style_dim(style: &str, dim: &str) -> Option<f32> {
+    for decl in style.split(';') {
+        if let Some(value) = decl
+            .trim()
+            .strip_prefix(dim)
+            .and_then(|v| v.strip_prefix(':'))
+        {
+            return small_dim(Some(value.trim()));
+        }
+    }
+    None
+}
+
+/// Whether an `<img>` tag is a tracking pixel: hidden, tiny, or hosted on a beacon domain.
+fn is_tracker(tag: &str) -> bool {
+    let src = tag_attr(tag, "src").unwrap_or_default();
+    if let Some(host) = url_host(src)
+        && tracker_vendor(&host).is_some()
+    {
+        return true;
+    }
+    let style = tag_attr(tag, "style")
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if style.contains("display:none")
+        || style.contains("display: none")
+        || style.contains("visibility:hidden")
+        || style.contains("visibility: hidden")
+        || style.contains("opacity:0")
+        || style.contains("max-height:0")
+    {
+        return true;
+    }
+    // Tiny by attribute or by CSS. A dimension left unset does not make an image a pixel;
+    // every stated dimension must be no more than two CSS pixels.
+    let dims = [
+        small_dim(tag_attr(tag, "width")).or_else(|| style_dim(&style, "width")),
+        small_dim(tag_attr(tag, "height")).or_else(|| style_dim(&style, "height")),
+    ];
+    dims.iter().any(Option::is_some) && dims.iter().flatten().all(|d| *d <= 2.)
+}
+
+/// The `src`s the tracker's tags carry, so fetch-time filtering agrees with strip-time.
+fn tracker_srcs(source: &str) -> std::collections::HashSet<String> {
+    img_tags(source)
+        .into_iter()
+        .filter(|(start, end)| is_tracker(&source[*start..*end]))
+        .filter_map(|(start, end)| tag_attr(&source[start..end], "src").map(str::to_string))
+        .collect()
+}
+
+/// The body with tracking pixels removed outright, before Blitz ever sees them.
+fn strip_trackers(source: &str) -> std::borrow::Cow<'_, str> {
+    let mut out: Option<String> = None;
+    let mut last = 0;
+    for (start, end) in img_tags(source) {
+        if is_tracker(&source[start..end]) {
+            let out = out.get_or_insert_with(|| String::with_capacity(source.len()));
+            out.push_str(&source[last..start]);
+            last = end;
+        }
+    }
+    match out {
+        Some(mut out) => {
+            out.push_str(&source[last..]);
+            std::borrow::Cow::Owned(out)
+        }
+        None => std::borrow::Cow::Borrowed(source),
+    }
+}
+
+/// The tracker pixels a body carries, as the vendor names the blocked-trackers line shows.
+/// One entry per tracker image; vendors repeat so the count matches the images.
+pub fn trackers(source: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    for (start, end) in img_tags(source) {
+        let tag = &source[start..end];
+        if !is_tracker(tag) {
+            continue;
+        }
+        let src = tag_attr(tag, "src").unwrap_or_default();
+        let name = url_host(src)
+            .map(|host| {
+                tracker_vendor(&host)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| registrable(&host).to_string())
+            })
+            .unwrap_or_else(|| "hidden pixel".to_string());
+        names.push(name);
+    }
+    names
+}
+
+// ---- Links ----------------------------------------------------------------------------
+
+/// The host a URL points at: userinfo, port and `www.` dropped; lowercased.
+fn url_host(url: &str) -> Option<String> {
+    let rest = url.get(url.find("://")? + 3..)?;
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()?
+        .rsplit('@')
+        .next()?
+        .split(':')
+        .next()?;
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+}
+
+/// Registrable domains under these suffixes take three labels (`example.co.uk`), not two.
+const TWO_LEVEL_SUFFIXES: [&str; 22] = [
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "me.uk", "ltd.uk", "plc.uk", "co.jp", "or.jp", "ne.jp",
+    "ac.jp", "co.kr", "or.kr", "com.au", "net.au", "org.au", "co.nz", "org.nz", "com.br", "com.cn",
+    "com.tw", "co.in",
+];
+
+/// The registrable domain of a host: its last two labels, or three under a two-level
+/// suffix. A stand-in for a public-suffix list, good enough for the phishing check.
+fn registrable(host: &str) -> &str {
+    let labels: Vec<&str> = host.split('.').collect();
+    let last_two = labels[labels.len().saturating_sub(2)..].join(".");
+    let take = if labels.len() > 2 && TWO_LEVEL_SUFFIXES.contains(&last_two.as_str()) {
+        3
+    } else {
+        2
+    };
+    &host[host.len() - labels[labels.len().saturating_sub(take)..].join(".").len()..]
+}
+
+/// `text` when it reads like a URL or a bare domain (`paypal.com`, `https://x.example/a`),
+/// else `None`. The host is extracted the same way `url_host` does it.
+fn text_host(text: &str) -> Option<String> {
+    let mut text = text.trim();
+    if text.contains(char::is_whitespace) {
+        return None;
+    }
+    if let Some(at) = text.find("://") {
+        text = &text[at + 3..];
+    }
+    let host = text
+        .split(['/', '?', '#'])
+        .next()?
+        .split(':')
+        .next()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    // A domain has a dot and an alphabetic last label of two or more letters.
+    let mut labels = host.rsplitn(2, '.');
+    let tld = labels.next()?;
+    if labels.next().is_none() || tld.len() < 2 || !tld.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    Some(host)
+}
+
+/// `(text host, link host)` when a link's visible text looks like a domain but its `href`
+/// goes to a different registrable domain — the classic phishing shape. `None` for
+/// non-URL text, matching domains and non-http(s) links.
+pub fn link_warning(text: &str, href: &str) -> Option<(String, String)> {
+    let text = text_host(text)?;
+    let link = url_host(href)?;
+    (registrable(&text) != registrable(&link)).then_some((text, link))
+}
+
+/// Query parameters that follow the reader rather than serve them, stripped from links
+/// when they open and from what the status pill shows.
+const TRACK_PARAMS: [&str; 22] = [
+    "fbclid",
+    "gclid",
+    "dclid",
+    "gbraid",
+    "wbraid",
+    "msclkid",
+    "yclid",
+    "twclid",
+    "igshid",
+    "mc_eid",
+    "mc_cid",
+    "_hsenc",
+    "_hsmi",
+    "mkt_tok",
+    "oly_enc_id",
+    "oly_anon_id",
+    "vero_id",
+    "rb_clickid",
+    "s_cid",
+    "li_fat_id",
+    "pk_campaign",
+    "pk_kwd",
+];
+
+/// The URL with tracking parameters removed: every `utm_*` plus the documented list above.
+pub fn clean_url(url: &str) -> String {
+    let Some(q) = url.find('?') else {
+        return url.to_string();
+    };
+    let body = &url[q + 1..];
+    let (query, frag) = match body.find('#') {
+        Some(f) => (&body[..f], &body[f..]),
+        None => (body, ""),
+    };
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|part| {
+            let name = part
+                .split('=')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            !name.starts_with("utm_") && !TRACK_PARAMS.contains(&name.as_str())
+        })
+        .collect();
+    if kept.is_empty() {
+        format!("{}{frag}", &url[..q])
+    } else {
+        format!("{}?{}{frag}", &url[..q], kept.join("&"))
+    }
+}
+
+/// The address a `mailto:` link points at, so Kite opens compose instead of a browser.
+pub fn mailto(href: &str) -> Option<String> {
+    let href = href.trim();
+    if !href
+        .get(..7)
+        .is_some_and(|s| s.eq_ignore_ascii_case("mailto:"))
+    {
+        return None;
+    }
+    let addr = href.get(7..)?.split(['?', '#']).next()?;
+    (!addr.is_empty()).then(|| addr.to_string())
 }
