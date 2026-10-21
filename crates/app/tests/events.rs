@@ -71,7 +71,7 @@ fn refresh_button_and_classic_shortcut_request_mail_and_show_feedback(cx: &mut T
         fixture.refreshes.load(std::sync::atomic::Ordering::Relaxed),
         1
     );
-    cx.simulate_keystrokes(window.into(), "ctrl-r");
+    cx.simulate_keystrokes(window.into(), "secondary-r");
     cx.update_window(window.into(), |_, window, cx| {
         window.render_frame(cx);
         assert_eq!(window.find("toast").label(), Some("Refresh requested"));
