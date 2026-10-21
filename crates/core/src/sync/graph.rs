@@ -880,7 +880,8 @@ fn well_known(mailbox: Mailbox) -> Option<&'static str> {
         | Mailbox::Scheduled
         | Mailbox::Starred
         | Mailbox::Snoozed
-        | Mailbox::All => None,
+        | Mailbox::All
+        | Mailbox::Attachments => None,
     }
 }
 

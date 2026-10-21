@@ -103,6 +103,16 @@ fn with_attachment(mut m: RemoteMsg, name: &str) -> RemoteMsg {
     m
 }
 
+fn attach(mut m: RemoteMsg, name: &str, mime: &str, size: u64) -> RemoteMsg {
+    m.attachments.push(RemoteAttachment {
+        remote_id: format!("att-{name}"),
+        name: name.into(),
+        mime: mime.into(),
+        size,
+    });
+    m
+}
+
 fn view(mb: Mailbox) -> View {
     View {
         account_id: None,
@@ -1773,6 +1783,133 @@ fn contacts_and_attachments_round_trip() {
     );
 }
 
+/// The Attachments browser's query: account scope, type chips, from-me/to-me, the text
+/// grammar, date ordering and the signature-image exclusion — over two accounts.
+#[test]
+fn the_attachments_browser_filters_scopes_and_orders_files() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let b = s
+        .add_account(Provider::Microsoft, "me@work.com", "Me")
+        .unwrap();
+
+    let mut zeta = msg("a1", "zeta@z.com", "Docs", JAN4);
+    zeta = attach(zeta, "report.pdf", "application/pdf", 2_000);
+    // A tiny image is signature art, never a file: the browser must not list it.
+    zeta = attach(zeta, "logo.png", "image/png", 400);
+    zeta = attach(zeta, "photo.jpg", "image/jpeg", 50_000);
+    let mut mine = sent(msg("a2", "me@x.com", "Numbers", JAN3), "bob@corp.com");
+    mine = attach(
+        mine,
+        "data.xlsx",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        1_000,
+    );
+    let mut bob = msg("b1", "bob@work.com", "Pack", JAN2);
+    bob = attach(
+        bob,
+        "notes.docx",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        3_000,
+    );
+    bob = attach(bob, "pack.zip", "application/zip", 9_999);
+    s.apply_deltas(a.id, &[up(zeta), up(mine)]).unwrap();
+    s.apply_deltas(b.id, &[up(bob)]).unwrap();
+
+    let names = |q: &AttachmentQuery| -> Vec<String> {
+        s.attachments(q, 0, 50)
+            .unwrap()
+            .iter()
+            .map(|r| r.name.clone())
+            .collect()
+    };
+    // Newest first, and the signature image is gone.
+    assert_eq!(
+        names(&AttachmentQuery::default()),
+        vec![
+            "report.pdf",
+            "photo.jpg",
+            "data.xlsx",
+            "notes.docx",
+            "pack.zip"
+        ]
+    );
+    // Account scoping follows the rail selection.
+    let scoped = AttachmentQuery {
+        account_id: Some(b.id),
+        ..Default::default()
+    };
+    assert_eq!(names(&scoped), vec!["notes.docx", "pack.zip"]);
+    // Type chips.
+    for (kind, wanted) in [
+        (AttachmentKind::Pdfs, vec!["report.pdf"]),
+        (AttachmentKind::Images, vec!["photo.jpg"]),
+        (AttachmentKind::Spreadsheets, vec!["data.xlsx"]),
+        (AttachmentKind::Documents, vec!["notes.docx"]),
+        (AttachmentKind::Archives, vec!["pack.zip"]),
+    ] {
+        let q = AttachmentQuery {
+            kind,
+            ..Default::default()
+        };
+        assert_eq!(names(&q), wanted, "kind {kind:?}");
+    }
+    // From me / to me follows the stored self flag.
+    let q = AttachmentQuery {
+        from_me: Some(true),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["data.xlsx"]);
+    let q = AttachmentQuery {
+        from_me: Some(false),
+        ..Default::default()
+    };
+    assert_eq!(
+        names(&q),
+        vec!["report.pdf", "photo.jpg", "notes.docx", "pack.zip"]
+    );
+    // The grammar: file-name text, `from:`, `before:`/`after:` and negation.
+    let q = AttachmentQuery {
+        text: "notes".into(),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["notes.docx"]);
+    let q = AttachmentQuery {
+        text: "zeta".into(),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["report.pdf", "photo.jpg"]);
+    let q = AttachmentQuery {
+        text: "from:bob@work.com".into(),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["notes.docx", "pack.zip"]);
+    let q = AttachmentQuery {
+        text: "after:2024-01-03".into(),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["report.pdf", "photo.jpg", "data.xlsx"]);
+    let q = AttachmentQuery {
+        text: "before:2024-01-03".into(),
+        ..Default::default()
+    };
+    assert_eq!(names(&q), vec!["notes.docx", "pack.zip"]);
+    let q = AttachmentQuery {
+        text: "-report".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        names(&q),
+        vec!["photo.jpg", "data.xlsx", "notes.docx", "pack.zip"]
+    );
+    // A row carries everything the view needs to open either the file or its conversation.
+    let row = &s.attachments(&AttachmentQuery::default(), 0, 1).unwrap()[0];
+    assert!(row.id > 0 && row.thread_id > 0 && row.account_id == a.id);
+    assert_eq!(row.sender.email, "zeta@z.com");
+    assert!(!row.from_me);
+    assert_eq!(row.subject, "Docs");
+}
+
 #[test]
 fn settings_and_splits_round_trip() {
     let s = Store::memory().unwrap();
@@ -2069,6 +2206,10 @@ fn seed_threads(s: &Store, account: Id, threads: usize) {
                 }];
                 m.mailbox = Mailbox::Sent;
             }
+            // One file in ten threads gives the Attachments budget real rows to skip.
+            if k == 0 && i % 10 == 0 {
+                m = attach(m, "contract.pdf", "application/pdf", 20_000 + i as u64);
+            }
             batch.push(up(m));
             if batch.len() == 200 {
                 s.apply_deltas(account, &batch).unwrap();
@@ -2170,8 +2311,40 @@ fn perf_budgets() {
         "contact card took {contact:?}"
     );
 
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        let rows = s.attachments(&AttachmentQuery::default(), 0, 200).unwrap();
+        times.push(t.elapsed());
+        assert_eq!(rows.len(), 200);
+    }
+    let files = median(times);
+    assert!(
+        files <= Duration::from_millis(20),
+        "attachments listing took {files:?}"
+    );
+
+    let filtered = AttachmentQuery {
+        text: "contract from:person0".into(),
+        kind: AttachmentKind::Pdfs,
+        from_me: Some(false),
+        account_id: Some(a.id),
+    };
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        let rows = s.attachments(&filtered, 0, 200).unwrap();
+        times.push(t.elapsed());
+        assert!(!rows.is_empty());
+    }
+    let files_filtered = median(times);
+    assert!(
+        files_filtered <= Duration::from_millis(20),
+        "filtered attachments listing took {files_filtered:?}"
+    );
+
     println!(
-        "perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?} contact={contact:?}"
+        "perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?} contact={contact:?} files={files:?} files+filter={files_filtered:?}"
     );
 }
 
@@ -2201,6 +2374,25 @@ fn budget_queries_still_return_rows_in_debug() {
     let card = s.contact("person7@example.com", None).unwrap().unwrap();
     assert!(card.conversations > 0);
     assert!(!card.recent.is_empty());
+    assert!(
+        !s.attachments(&AttachmentQuery::default(), 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !s.attachments(
+            &AttachmentQuery {
+                text: "contract from:person0".into(),
+                kind: AttachmentKind::Pdfs,
+                from_me: Some(false),
+                account_id: Some(a.id),
+            },
+            0,
+            200
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 // ------------------------------------------------------------------ contacts
@@ -2874,7 +3066,7 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        11
+        12
     );
     assert!(
         !connection

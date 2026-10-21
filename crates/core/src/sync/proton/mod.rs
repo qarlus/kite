@@ -1091,7 +1091,8 @@ fn system_label(mailbox: Mailbox) -> &'static str {
         | Mailbox::Scheduled
         | Mailbox::Starred
         | Mailbox::Snoozed
-        | Mailbox::All => ALL_MAIL,
+        | Mailbox::All
+        | Mailbox::Attachments => ALL_MAIL,
     }
 }
 
@@ -1108,7 +1109,8 @@ fn mailbox_label(mailbox: Mailbox) -> Option<&'static str> {
         | Mailbox::Scheduled
         | Mailbox::Starred
         | Mailbox::Snoozed
-        | Mailbox::All => None,
+        | Mailbox::All
+        | Mailbox::Attachments => None,
     }
 }
 

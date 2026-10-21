@@ -12,9 +12,9 @@ use gpui_kit::{
 };
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action, Addr, AiModel, AiRequest, Attachment, CalEvent, ContactCard, ContactFile,
-    ContactThread, Draft, Event, Folder, Id, Mailbox, Message, Ms, ProtonAuth, Settings, Split,
-    Tag, ThreadSummary, View,
+    Account, Action, Addr, AiModel, AiRequest, Attachment, AttachmentKind, AttachmentQuery,
+    AttachmentRow, CalEvent, ContactCard, ContactFile, ContactThread, Draft, Event, Folder, Id,
+    Mailbox, Message, Ms, ProtonAuth, Settings, Split, Tag, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -105,6 +105,8 @@ pub struct Fixture {
     /// Draft ids passed to `discard_draft`.
     discarded: Mutex<Vec<Id>>,
     draft_seq: AtomicI64,
+    /// Attachment ids handed out by `add_attachment`.
+    att_seq: AtomicI64,
     senders: Mutex<Vec<async_channel::Sender<Event>>>,
     next_token: AtomicI64,
     /// The fixture's own data dir; avatars are files under `<dir>/avatars/`.
@@ -218,6 +220,7 @@ impl Fixture {
             draft_threads: Mutex::new(HashMap::new()),
             discarded: Mutex::new(Vec::new()),
             draft_seq: AtomicI64::new(1),
+            att_seq: AtomicI64::new(10_000),
             senders: Mutex::new(Vec::new()),
             next_token: AtomicI64::new(1),
             dir: TempDir::new("fixture"),
@@ -290,6 +293,35 @@ impl Fixture {
         {
             message.from = from;
         }
+    }
+
+    /// Adds a file to the thread's latest message, like a synced attachment, and marks
+    /// the conversation as carrying files. Returns the id the store would give it.
+    pub fn add_attachment(&self, thread: Id, name: &str, mime: &str, size: u64) -> Id {
+        let id = self.att_seq.fetch_add(1, Ordering::SeqCst);
+        self.messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .and_then(|messages| messages.last_mut())
+            .expect("fixture thread has a message")
+            .attachments
+            .push(Attachment {
+                id,
+                name: name.into(),
+                mime: mime.into(),
+                size,
+            });
+        if let Some(row) = self
+            .threads
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .find(|t| t.id == thread)
+        {
+            row.attachments = true;
+        }
+        id
     }
 
     /// Replaces the latest message's subject, so subject prefixes can be exercised.
@@ -1232,6 +1264,67 @@ impl Mail for Fixture {
         }))
     }
 
+    /// Mirrors the store: the same kind sets, the same inline-image exclusion
+    /// (`image/*` under 10 KB) and the same `from:`/`after:`/`before:` text grammar.
+    fn attachments(
+        &self,
+        query: &AttachmentQuery,
+        offset: u32,
+        limit: u32,
+    ) -> anyhow::Result<Vec<AttachmentRow>> {
+        let threads = self.threads.lock().unwrap();
+        let messages = self.messages.lock().unwrap();
+        let accounts = self.accounts.lock().unwrap();
+        let mut rows = Vec::new();
+        for thread in threads.iter() {
+            if query
+                .account_id
+                .is_some_and(|account| account != thread.account_id)
+            {
+                continue;
+            }
+            let from_me = |m: &Message| {
+                accounts.iter().any(|a| {
+                    a.id == thread.account_id && a.email.eq_ignore_ascii_case(&m.from.email)
+                })
+            };
+            for m in messages.get(&thread.id).into_iter().flatten() {
+                for a in &m.attachments {
+                    if a.mime.starts_with("image/") && a.size < 10_240 {
+                        continue;
+                    }
+                    if !kind_matches(query.kind, &a.mime) {
+                        continue;
+                    }
+                    if query.from_me.is_some_and(|mine| mine != from_me(m)) {
+                        continue;
+                    }
+                    if !text_matches(&query.text, a, m) {
+                        continue;
+                    }
+                    rows.push(AttachmentRow {
+                        id: a.id,
+                        thread_id: thread.id,
+                        account_id: thread.account_id,
+                        name: a.name.clone(),
+                        mime: a.mime.clone(),
+                        size: a.size,
+                        date: m.date,
+                        sender: m.from.clone(),
+                        from_me: from_me(m),
+                        subject: m.subject.clone(),
+                    });
+                }
+            }
+        }
+        rows.sort_by(|a, b| b.date.cmp(&a.date).then(a.id.cmp(&b.id)));
+        Ok(rows
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect())
+    }
+
     fn open_attachment(&self, id: Id) -> anyhow::Result<()> {
         self.attachments_opened.lock().unwrap().push(id);
         Ok(())
@@ -1491,4 +1584,84 @@ pub fn update_content<V: Render, R>(
         content.update(cx, |view, cx| update(view, window, cx))
     })
     .unwrap()
+}
+
+/// The same mime sets `Store::attachments` uses for the type chips.
+fn kind_matches(kind: AttachmentKind, mime: &str) -> bool {
+    match kind {
+        AttachmentKind::All => true,
+        AttachmentKind::Images => mime.starts_with("image/"),
+        AttachmentKind::Pdfs => mime == "application/pdf",
+        AttachmentKind::Spreadsheets => {
+            mime.contains("spreadsheet")
+                || matches!(
+                    mime,
+                    "application/vnd.ms-excel" | "text/csv" | "application/vnd.apple.numbers"
+                )
+        }
+        AttachmentKind::Documents => {
+            mime.contains("word")
+                || mime.contains("opendocument.text")
+                || matches!(
+                    mime,
+                    "application/msword"
+                        | "application/rtf"
+                        | "text/plain"
+                        | "text/rtf"
+                        | "text/markdown"
+                )
+        }
+        AttachmentKind::Archives => matches!(
+            mime,
+            "application/zip"
+                | "application/x-tar"
+                | "application/gzip"
+                | "application/x-bzip2"
+                | "application/x-xz"
+                | "application/x-7z-compressed"
+                | "application/vnd.rar"
+                | "application/x-rar-compressed"
+                | "application/zstd"
+        ),
+    }
+}
+
+/// The same text grammar the store applies: `from:`, `after:`, `before:` and `-` negation;
+/// every other word must appear in the file name or the sender.
+fn text_matches(raw: &str, a: &Attachment, m: &Message) -> bool {
+    for token in raw.split_whitespace() {
+        let (neg, token) = match token.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, token),
+        };
+        let matched = if let Some(value) = token.strip_prefix("from:") {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .any(|p| {
+                    m.from.email.to_lowercase().starts_with(&p.to_lowercase())
+                        || m.from.name.to_lowercase().starts_with(&p.to_lowercase())
+                })
+        } else if let Some(value) = token.strip_prefix("after:") {
+            parse_day(value).is_some_and(|day| m.date >= day)
+        } else if let Some(value) = token.strip_prefix("before:") {
+            parse_day(value).is_some_and(|day| m.date < day)
+        } else {
+            let needle = token.to_lowercase();
+            a.name.to_lowercase().contains(&needle)
+                || m.from.name.to_lowercase().contains(&needle)
+                || m.from.email.to_lowercase().contains(&needle)
+        };
+        if matched == neg {
+            return false;
+        }
+    }
+    true
+}
+
+/// `YYYY-MM-DD` as UTC midnight in epoch milliseconds, like the store's `unixepoch(?)`.
+fn parse_day(value: &str) -> Option<Ms> {
+    let day = chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").ok()?;
+    Some(day.and_hms_opt(0, 0, 0)?.and_utc().timestamp_millis())
 }

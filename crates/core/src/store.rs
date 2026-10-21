@@ -420,6 +420,16 @@ impl Store {
             tx.execute_batch("PRAGMA user_version=11;")?;
             tx.commit()?;
         }
+        if version < 12 {
+            let tx = conn.unchecked_transaction()?;
+            // The Attachments browser walks messages in date order and probes `attachments_msg`;
+            // without this index the ORDER BY over a large mailbox sorts instead.
+            tx.execute_batch(
+                "CREATE INDEX IF NOT EXISTS messages_by_date ON messages(date DESC);
+                PRAGMA user_version=12;",
+            )?;
+            tx.commit()?;
+        }
         conn.execute(
             "INSERT OR IGNORE INTO tags(name, color, position)
              VALUES (?1, '#64748b', (SELECT COALESCE(MAX(position), -1) + 1 FROM tags))",
@@ -1611,6 +1621,47 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?)
+    }
+
+    /// The Attachments browser's one indexed join over every stored file. The schema does not
+    /// record Content-ID or an inline flag, so signature art is excluded by rule: `image/*`
+    /// parts under 10 KB are treated as inline images and never listed.
+    pub fn attachments(
+        &self,
+        q: &AttachmentQuery,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<AttachmentRow>> {
+        let (mut conds, mut ps) = attachment_conds(q);
+        conds.push("NOT (a.mime LIKE 'image/%' AND a.size < 10240)".into());
+        let sql = format!(
+            "SELECT a.id, m.thread_id, m.account_id, a.name, a.mime, a.size, m.date,
+                    m.from_name, m.from_email, m.from_self, m.subject
+             FROM attachments a JOIN messages m ON m.id=a.message_id
+             WHERE {} ORDER BY m.date DESC, a.id LIMIT ? OFFSET ?",
+            conds.join(" AND ")
+        );
+        ps.push(Value::Integer(limit as i64));
+        ps.push(Value::Integer(offset as i64));
+        let mut s = self.conn.prepare(&sql)?;
+        let it = s.query_map(params_from_iter(ps), |r| {
+            Ok(AttachmentRow {
+                id: r.get(0)?,
+                thread_id: r.get(1)?,
+                account_id: r.get(2)?,
+                name: r.get(3)?,
+                mime: r.get(4)?,
+                size: r.get::<_, i64>(5)? as u64,
+                date: r.get(6)?,
+                sender: Addr {
+                    name: r.get(7)?,
+                    email: r.get(8)?,
+                },
+                from_me: r.get(9)?,
+                subject: r.get(10)?,
+            })
+        })?;
+        Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// The thread a message belongs to, used to arm a post-send "remind me if no reply".
@@ -3599,6 +3650,122 @@ impl Parsed {
     }
 }
 
+/// The WHERE half of `Store::attachments`. User input only ever reaches SQL as bound
+/// parameters; every fragment here is fixed.
+fn attachment_conds(q: &AttachmentQuery) -> (Vec<String>, Vec<Value>) {
+    let mut conds: Vec<String> = Vec::new();
+    let mut ps: Vec<Value> = Vec::new();
+    if let Some(account) = q.account_id {
+        conds.push("m.account_id=?".into());
+        ps.push(Value::Integer(account));
+    }
+    match q.kind {
+        AttachmentKind::All => {}
+        AttachmentKind::Images => conds.push("a.mime LIKE 'image/%'".into()),
+        AttachmentKind::Pdfs => conds.push("a.mime='application/pdf'".into()),
+        AttachmentKind::Spreadsheets => conds.push(
+            "(a.mime LIKE '%spreadsheet%' OR a.mime IN ('application/vnd.ms-excel','text/csv','application/vnd.apple.numbers'))".into(),
+        ),
+        AttachmentKind::Documents => conds.push(
+            "(a.mime LIKE '%word%' OR a.mime LIKE '%opendocument.text%' OR a.mime IN ('application/msword','application/rtf','text/plain','text/rtf','text/markdown'))".into(),
+        ),
+        AttachmentKind::Archives => conds.push(
+            "a.mime IN ('application/zip','application/x-tar','application/gzip','application/x-bzip2','application/x-xz','application/x-7z-compressed','application/vnd.rar','application/x-rar-compressed','application/zstd')".into(),
+        ),
+    }
+    if let Some(from_me) = q.from_me {
+        conds.push(format!("m.from_self={}", usize::from(from_me)));
+    }
+    for (neg, field, value) in text_tokens(&q.text) {
+        match field.as_deref() {
+            Some("from") if !value.is_empty() => {
+                // A comma inside `from:` means OR, as in the mail grammar.
+                let mut groups = Vec::new();
+                for part in value.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    groups.push("(m.from_email GLOB ? OR lower(m.from_name) GLOB ?)");
+                    let pat = glob_pat(part);
+                    ps.push(Value::Text(pat.clone()));
+                    ps.push(Value::Text(pat));
+                }
+                if groups.is_empty() {
+                    conds.push("1=0".into());
+                } else {
+                    conds.push(format!(
+                        "{}({})",
+                        if neg { "NOT " } else { "" },
+                        groups.join(" OR ")
+                    ));
+                }
+            }
+            Some("before" | "after") if valid_date(&value) => {
+                let after = field.as_deref() == Some("after");
+                let op = if after != neg { ">=" } else { "<" };
+                conds.push(format!("m.date {op} unixepoch(?) * 1000"));
+                ps.push(Value::Text(value));
+            }
+            _ => {
+                // Free text — and unknown operators kept literal — must appear in the
+                // file name or the sender.
+                let raw = match &field {
+                    Some(other) if !matches!(other.as_str(), "from" | "before" | "after") => {
+                        format!("{other}:{value}")
+                    }
+                    _ => value,
+                };
+                if raw.is_empty() {
+                    continue;
+                }
+                let pat = contains_pat(&raw);
+                let cond = "(a.name GLOB ? OR lower(m.from_name) GLOB ? OR m.from_email GLOB ?)"
+                    .to_string();
+                conds.push(if neg { format!("NOT {cond}") } else { cond });
+                for _ in 0..3 {
+                    ps.push(Value::Text(pat.clone()));
+                }
+            }
+        }
+    }
+    (conds, ps)
+}
+
+/// Tokenizes the attachment search box: `-` negates, `"` quotes, `field:` selects an operator.
+/// Returns `(negated, field, value)` per token.
+fn text_tokens(raw: &str) -> Vec<(bool, Option<String>, String)> {
+    let mut out = Vec::new();
+    let (mut neg, mut field, mut in_quote) = (false, None, false);
+    let mut cur = String::new();
+    let mut flush = |neg: &mut bool, field: &mut Option<String>, cur: &mut String| {
+        if !cur.is_empty() {
+            out.push((*neg, field.take(), std::mem::take(cur)));
+        }
+        *neg = false;
+    };
+    for ch in raw.chars() {
+        match ch {
+            '"' => in_quote = !in_quote,
+            c if c.is_whitespace() && !in_quote => flush(&mut neg, &mut field, &mut cur),
+            '-' if cur.is_empty() && field.is_none() && !in_quote => neg = true,
+            ':' if field.is_none() && !cur.is_empty() && !in_quote => {
+                field = Some(cur.to_ascii_lowercase());
+                cur.clear();
+            }
+            c => cur.push(c),
+        }
+    }
+    flush(&mut neg, &mut field, &mut cur);
+    out
+}
+
+/// Lowercased contains pattern for `GLOB`, with GLOB metacharacters dropped.
+fn contains_pat(s: &str) -> String {
+    let inner: String = s
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|&c| !matches!(c, '*' | '?' | '[' | ']'))
+        .collect();
+    format!("*{inner}*")
+}
+
 /// Lowercased prefix pattern for `GLOB`, with GLOB metacharacters dropped so input stays literal.
 fn glob_pat(s: &str) -> String {
     let mut out: String = s
@@ -3749,6 +3916,8 @@ fn mailbox_cond(m: Mailbox) -> &'static str {
         }
         Mailbox::Trash => "t.mailbox='trash'",
         Mailbox::Spam => "t.mailbox='spam'",
+        // Attachments is not a stored mailbox; `Store::attachments` answers that view.
+        Mailbox::Attachments => "0",
     }
 }
 
@@ -3765,6 +3934,8 @@ fn mb_str(m: Mailbox) -> &'static str {
         Mailbox::All => "all",
         Mailbox::Waiting => "waiting",
         Mailbox::Scheduled => "scheduled",
+        // Never stored: only a `View` can carry it.
+        Mailbox::Attachments => "all",
     }
 }
 

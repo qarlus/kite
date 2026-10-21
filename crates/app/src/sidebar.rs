@@ -16,7 +16,7 @@ use std::time::UNIX_EPOCH;
 /// The icon rail: accounts down the left, window actions at the bottom.
 pub const RAIL_W: f32 = 64.;
 
-pub const MAILBOXES: [(Mailbox, &str, IconName); 11] = [
+pub const MAILBOXES: [(Mailbox, &str, IconName); 12] = [
     (Mailbox::Inbox, "Inbox", IconName::Inbox),
     (Mailbox::Drafts, "Drafts", IconName::FileText),
     (Mailbox::Sent, "Sent", IconName::Send),
@@ -28,6 +28,7 @@ pub const MAILBOXES: [(Mailbox, &str, IconName); 11] = [
     (Mailbox::Spam, "Spam", IconName::ShieldAlert),
     (Mailbox::Trash, "Trash", IconName::Trash),
     (Mailbox::All, "All mail", IconName::Mails),
+    (Mailbox::Attachments, "Attachments", IconName::Paperclip),
 ];
 
 thread_local! {
