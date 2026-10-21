@@ -111,6 +111,16 @@ pub trait Mail: Send + Sync + 'static {
     fn contact(&self, _email: &str, _exclude: Option<Id>) -> Result<Option<ContactCard>> {
         Ok(None)
     }
+    /// The Attachments browser's one indexed query over every stored file.
+    /// Local SQLite only; must return in a few ms.
+    fn attachments(
+        &self,
+        _query: &AttachmentQuery,
+        _offset: u32,
+        _limit: u32,
+    ) -> Result<Vec<AttachmentRow>> {
+        Ok(Vec::new())
+    }
     fn open_attachment(&self, id: Id) -> Result<()>;
     /// One remote image for HTML mail, fetched only when the reader allowed remote images for
     /// that message. Blocking; call it on the background executor.

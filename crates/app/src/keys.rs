@@ -59,6 +59,10 @@ pub mod cmd {
     pub const RESCHEDULE: u8 = 71;
     pub const SEND_NOW: u8 = 72;
     pub const CONTACT_PANEL: u8 = 73;
+    pub const GO_ATTACHMENTS: u8 = 74;
+    /// `o` / `Shift+Enter`: opens the conversation behind the selection. In the Attachments
+    /// browser this differs from Enter, which opens the file itself.
+    pub const OPEN_CONVERSATION: u8 = 75;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -232,10 +236,18 @@ pub static COMMANDS: &[Cmd] = &[
     c(
         "open_thread",
         "Open thread",
-        &["enter", "o"],
+        &["enter"],
         "KiteList",
         Group::Navigation,
         cmd::OPEN,
+    ),
+    c(
+        "open_conversation",
+        "Open conversation",
+        &["o", "shift-enter"],
+        "KiteList",
+        Group::Navigation,
+        cmd::OPEN_CONVERSATION,
     ),
     c(
         "back",
@@ -479,6 +491,14 @@ pub static COMMANDS: &[Cmd] = &[
         "Kite",
         Group::GoTo,
         cmd::GO + 8,
+    ),
+    c(
+        "go_attachments",
+        "Go to Attachments",
+        &["g f"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO_ATTACHMENTS,
     ),
     c(
         "all_inboxes",

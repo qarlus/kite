@@ -15,8 +15,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action as MailAction, AiRequest, ContactCard, Event, Folder, Id, Mailbox, Message,
-    Settings, ThreadSummary, View,
+    Account, Action as MailAction, AiRequest, AttachmentKind, AttachmentQuery, AttachmentRow,
+    ContactCard, Event, Folder, Id, Mailbox, Message, Settings, ThreadSummary, View,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -157,6 +157,11 @@ pub struct Kite {
     pub(crate) tabs: Vec<Tab>,
     pub(crate) view: View,
     pub(crate) rows: Vec<ThreadSummary>,
+    /// The Attachments browser's rows; only filled while `view.mailbox == Mailbox::Attachments`.
+    pub(crate) att_rows: Vec<AttachmentRow>,
+    /// The browser's quick filters: the type chip and the from-me/to-me toggle.
+    pub(crate) att_kind: AttachmentKind,
+    pub(crate) att_from: Option<bool>,
     pub(crate) sel: usize,
     pub(crate) multi: Vec<Id>,
     pub(crate) open: Option<Open>,
@@ -225,6 +230,11 @@ impl Kite {
         self.rows.iter().map(|r| r.id).collect()
     }
 
+    /// The Attachments browser's attachment ids, in row order.
+    pub fn attachment_ids(&self) -> Vec<Id> {
+        self.att_rows.iter().map(|r| r.id).collect()
+    }
+
     pub fn open_id(&self) -> Option<Id> {
         self.open.as_ref().map(|o| o.id)
     }
@@ -291,6 +301,9 @@ impl Kite {
             },
             tabs,
             rows: Vec::new(),
+            att_rows: Vec::new(),
+            att_kind: AttachmentKind::All,
+            att_from: None,
             sel: 0,
             multi: Vec::new(),
             open: None,
@@ -397,29 +410,87 @@ impl Kite {
             };
             self.followup_counts[ix] = self.mail.view_count(&view).unwrap_or(0);
         }
-        self.rows = self.mail.threads(&self.view, 0, PAGE).unwrap_or_default();
-        if self.view.mailbox == Mailbox::Scheduled
-            && let Some(id) = self.scheduled_busy
-        {
-            self.rows.retain(|r| r.id != id);
+        if self.attachments_mode() {
+            self.att_rows = self
+                .mail
+                .attachments(&self.att_query(), 0, PAGE)
+                .unwrap_or_default();
+            self.rows.clear();
+        } else {
+            self.rows = self.mail.threads(&self.view, 0, PAGE).unwrap_or_default();
+            if self.view.mailbox == Mailbox::Scheduled
+                && let Some(id) = self.scheduled_busy
+            {
+                self.rows.retain(|r| r.id != id);
+            }
+            self.att_rows.clear();
         }
-        self.loaded_all = self.rows.len() < PAGE as usize;
-        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
+        self.loaded_all = self.row_total() < PAGE as usize;
+        self.sel = self.sel.min(self.row_total().saturating_sub(1));
         self.multi.clear();
     }
 
+    /// Whether the list column is the Attachments browser rather than a conversation list.
+    pub(crate) fn attachments_mode(&self) -> bool {
+        self.view.mailbox == Mailbox::Attachments && self.view.folder.is_none()
+    }
+
+    /// The query the Attachments browser runs: account scope, the search box and the chips.
+    pub(crate) fn att_query(&self) -> AttachmentQuery {
+        AttachmentQuery {
+            account_id: self.view.account_id,
+            text: self.view.query.clone().unwrap_or_default(),
+            kind: self.att_kind,
+            from_me: self.att_from,
+        }
+    }
+
+    /// How many rows the active list holds, whichever list that is.
+    pub(crate) fn row_total(&self) -> usize {
+        if self.attachments_mode() {
+            self.att_rows.len()
+        } else {
+            self.rows.len()
+        }
+    }
+
+    /// A chip click narrows the browser to one type, or to sent/received files.
+    pub(crate) fn set_attachment_filter(
+        &mut self,
+        kind: AttachmentKind,
+        from_me: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        self.att_kind = kind;
+        self.att_from = from_me;
+        self.sel = 0;
+        self.list_scroll = UniformListScrollHandle::new();
+        self.reload();
+        cx.notify();
+    }
+
     pub(crate) fn load_more(&mut self, cx: &mut Context<Self>) {
-        if self.loaded_all || self.rows.len() < PAGE as usize {
+        if self.loaded_all || self.row_total() < PAGE as usize {
             self.loaded_all = true;
             return;
         }
-        let offset = self.rows.len() as u32;
-        let page = self
-            .mail
-            .threads(&self.view, offset, PAGE)
-            .unwrap_or_default();
-        self.loaded_all = page.len() < PAGE as usize;
-        self.rows.extend(page);
+        if self.attachments_mode() {
+            let offset = self.att_rows.len() as u32;
+            let page = self
+                .mail
+                .attachments(&self.att_query(), offset, PAGE)
+                .unwrap_or_default();
+            self.loaded_all = page.len() < PAGE as usize;
+            self.att_rows.extend(page);
+        } else {
+            let offset = self.rows.len() as u32;
+            let page = self
+                .mail
+                .threads(&self.view, offset, PAGE)
+                .unwrap_or_default();
+            self.loaded_all = page.len() < PAGE as usize;
+            self.rows.extend(page);
+        }
         cx.notify();
     }
 
@@ -436,6 +507,11 @@ impl Kite {
             || view.folder != self.view.folder;
         self.view = view;
         if changed {
+            if self.view.mailbox == Mailbox::Attachments {
+                // Re-entering the browser starts unfiltered, as a fresh mailbox does.
+                self.att_kind = AttachmentKind::All;
+                self.att_from = None;
+            }
             self.sidebar_dirty = true;
             self.open = None;
             self.sel = 0;
@@ -591,10 +667,10 @@ impl Kite {
     }
 
     fn next(&mut self, delta: isize, cx: &mut Context<Self>) {
-        if self.rows.is_empty() {
+        if self.row_total() == 0 {
             return;
         }
-        let last = self.rows.len() - 1;
+        let last = self.row_total() - 1;
         let target = (self.sel as isize + delta).clamp(0, last as isize) as usize;
         if target == self.sel {
             // At the edge: say so rather than swallowing the key. Repeating it refreshes the
@@ -607,7 +683,7 @@ impl Kite {
         self.sel = target;
         // In the reading pane, moving in the list does not change the open conversation.
         if self.open.is_some() && self.pane == Pane::Thread {
-            self.open_thread(cx);
+            self.open_selected(cx);
         } else {
             self.list_scroll
                 .scroll_to_item(self.sel, ScrollStrategy::Nearest);
@@ -632,6 +708,15 @@ impl Kite {
             return tab.name.as_str();
         }
         crate::sidebar::mailbox_name(self.view.mailbox)
+    }
+
+    /// Opens the conversation behind the selection, whichever list is showing.
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        if self.attachments_mode() {
+            self.open_attachment_thread(cx);
+        } else {
+            self.open_thread(cx);
+        }
     }
 
     pub fn open_thread(&mut self, cx: &mut Context<Self>) {
@@ -665,31 +750,58 @@ impl Kite {
             cx.notify();
             return;
         }
-        let messages = match self.msgs.get(&row.id) {
+        self.open_messages(row.id, row.account_id, row.subject, cx);
+    }
+
+    /// Enter in the Attachments browser: open the file itself, through the engine.
+    fn open_file(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.att_rows.get(self.sel).cloned() else {
+            return;
+        };
+        if let Err(error) = self.mail.open_attachment(row.id) {
+            self.toast(format!("Could not open {}: {error}", row.name), cx);
+        }
+    }
+
+    /// `o` in the Attachments browser: open the conversation that holds the selected file.
+    fn open_attachment_thread(&mut self, cx: &mut Context<Self>) {
+        let Some(row) = self.att_rows.get(self.sel).cloned() else {
+            return;
+        };
+        self.open_messages(row.thread_id, row.account_id, row.subject, cx);
+    }
+
+    /// Loads a conversation into the reading pane and marks it read, shared by every
+    /// list that can point at one.
+    fn open_messages(&mut self, id: Id, account_id: Id, subject: String, cx: &mut Context<Self>) {
+        let messages = match self.msgs.get(&id) {
             Some(messages) => messages.clone(),
             None => {
-                let messages = self.mail.thread(row.id).unwrap_or_default();
-                self.msgs.insert(row.id, messages.clone());
+                let messages = self.mail.thread(id).unwrap_or_default();
+                self.msgs.insert(id, messages.clone());
                 messages
             }
         };
         self.multi.clear();
         // The keyboard is now reading, so j/k move through conversations rather than the list.
         self.pane = Pane::Thread;
+        // The list row is fresher than a cached conversation, so either one marks it unread.
+        let unread =
+            messages.iter().any(|m| m.unread) || self.rows.iter().any(|r| r.id == id && r.unread);
         self.open = Some(Open {
-            id: row.id,
-            account_id: row.account_id,
-            subject: row.subject.clone(),
+            id,
+            account_id,
+            subject,
             expanded: messages.len().saturating_sub(1),
             messages,
         });
         self.thread_scroll = ScrollHandle::new();
         self.refresh_contact(false, cx);
-        if row.unread {
-            if let Some(r) = self.rows.iter_mut().find(|r| r.id == row.id) {
+        if unread {
+            if let Some(r) = self.rows.iter_mut().find(|r| r.id == id) {
                 r.unread = false;
             }
-            if let Ok(token) = self.mail.act(&[row.id], &MailAction::Read) {
+            if let Ok(token) = self.mail.act(&[id], &MailAction::Read) {
                 self.record_undo(token);
             }
         }
@@ -704,9 +816,16 @@ impl Kite {
 
     /// Warms the thread-body cache for the neighbours so `j`/`k` in thread view are instant.
     fn prefetch(&mut self, cx: &mut Context<Self>) {
+        let thread_at = |ix: usize| -> Option<Id> {
+            if self.attachments_mode() {
+                self.att_rows.get(ix).map(|r| r.thread_id)
+            } else {
+                self.rows.get(ix).map(|r| r.id)
+            }
+        };
         let neighbours: Vec<Id> = [self.sel.wrapping_sub(1), self.sel + 1]
             .iter()
-            .filter_map(|ix| self.rows.get(*ix).map(|r| r.id))
+            .filter_map(|ix| thread_at(*ix))
             .filter(|id| self.msgs.get(id).is_none())
             .collect();
         for id in neighbours {
@@ -989,9 +1108,35 @@ impl Kite {
         {
             return;
         }
+        // The Attachments browser has files, not conversations: triage keys do not apply.
+        if self.attachments_mode()
+            && matches!(
+                id,
+                cmd::DONE
+                    | cmd::INBOX
+                    | cmd::TRASH
+                    | cmd::STAR
+                    | cmd::TOGGLE_READ
+                    | cmd::MOVE
+                    | cmd::TAGS
+                    | cmd::SELECT
+                    | cmd::REPLY
+                    | cmd::REPLY_ALL
+                    | cmd::FORWARD
+                    | cmd::SNOOZE
+                    | cmd::NEXT_SPLIT
+                    | cmd::PREV_SPLIT
+                    | cmd::UNSUBSCRIBE
+                    | cmd::AI_SUMMARY
+                    | cmd::ZERO
+            )
+        {
+            return;
+        }
         match id {
             cmd::GO_WAITING => self.select_mailbox(Mailbox::Waiting, window, cx),
             cmd::GO_SCHEDULED => self.select_mailbox(Mailbox::Scheduled, window, cx),
+            cmd::GO_ATTACHMENTS => self.select_mailbox(Mailbox::Attachments, window, cx),
             cmd::DONE_WAITING if self.view.mailbox == Mailbox::Waiting => {
                 self.act(MailAction::DoneWaiting, true, "Done waiting", cx)
             }
@@ -1046,7 +1191,14 @@ impl Kite {
             }
             cmd::NEXT => self.next(1, cx),
             cmd::PREV => self.next(-1, cx),
-            cmd::OPEN if !self.rows.is_empty() => self.open_thread(cx),
+            cmd::OPEN if self.row_total() > 0 => {
+                if self.attachments_mode() {
+                    self.open_file(cx);
+                } else {
+                    self.open_thread(cx);
+                }
+            }
+            cmd::OPEN_CONVERSATION if self.row_total() > 0 => self.open_selected(cx),
             cmd::BACK => {
                 if self.compose_open {
                     self.close_compose(window, cx);

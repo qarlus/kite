@@ -1539,6 +1539,15 @@ impl Mail for Engine {
         self.inner.read(|s| s.contact(email, exclude))
     }
 
+    fn attachments(
+        &self,
+        query: &AttachmentQuery,
+        offset: u32,
+        limit: u32,
+    ) -> Result<Vec<AttachmentRow>> {
+        self.inner.read(|s| s.attachments(query, offset, limit))
+    }
+
     fn open_attachment(&self, id: Id) -> Result<()> {
         let (account_id, message, attachment, name) = self
             .inner

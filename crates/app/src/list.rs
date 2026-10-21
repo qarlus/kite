@@ -10,7 +10,9 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Action as MailAction, Id, Mailbox, Ms, Provider, ThreadSummary};
+use kite_core::model::{
+    Action as MailAction, AttachmentKind, AttachmentRow, Id, Mailbox, Ms, Provider, ThreadSummary,
+};
 use std::ops::Range;
 use std::time::Duration;
 
@@ -64,7 +66,10 @@ fn days_ago(at: DateTime<Local>, now: DateTime<Local>) -> i64 {
 }
 
 impl Kite {
-    pub fn render_list(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    pub fn render_list(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.attachments_mode() {
+            return self.render_attachments(window, cx);
+        }
         if self.rows.is_empty() {
             return self.render_empty(cx);
         }
@@ -185,6 +190,10 @@ impl Kite {
                 Mailbox::All => (
                     "No mail".to_string(),
                     "Nothing has arrived in this account yet.".to_string(),
+                ),
+                Mailbox::Attachments => (
+                    "No attachments".to_string(),
+                    "Files you send and receive will appear here.".to_string(),
                 ),
             }
         };
@@ -348,6 +357,376 @@ impl Kite {
         )
         .into_any_element()
     }
+
+    /// The Attachments browser: quick-filter chips above a virtualised file list.
+    fn render_attachments(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let mut column = div()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .overflow_hidden()
+            .pb_2()
+            .child(self.attachment_chips(cx));
+        if self.att_rows.is_empty() {
+            return column.child(self.render_empty(cx)).into_any_element();
+        }
+        let scroll = self.list_scroll.clone();
+        let list = uniform_list(
+            "attachments",
+            self.att_rows.len(),
+            cx.processor(
+                move |this: &mut Kite,
+                      range: Range<usize>,
+                      _window: &mut Window,
+                      cx: &mut Context<Kite>| {
+                    if !this.loaded_all && range.end + 50 >= this.att_rows.len() {
+                        this.load_more(cx);
+                    }
+                    let now = Local::now();
+                    let mut items = Vec::with_capacity(range.len());
+                    for ix in range {
+                        let Some(row) = this.att_rows.get(ix) else {
+                            continue;
+                        };
+                        items.push(attachment_row(this, row, ix, now, cx));
+                    }
+                    items
+                },
+            ),
+        )
+        .track_scroll(&scroll)
+        .w_full()
+        .h_full();
+        column = column.child(div().flex_1().min_h_0().child(list));
+        column.into_any_element()
+    }
+
+    /// The type chips and the from-me/to-me toggles above the file list.
+    fn attachment_chips(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = self.theme;
+        let kinds: [(AttachmentKind, &str); 6] = [
+            (AttachmentKind::All, "All"),
+            (AttachmentKind::Documents, "Documents"),
+            (AttachmentKind::Images, "Images"),
+            (AttachmentKind::Spreadsheets, "Spreadsheets"),
+            (AttachmentKind::Pdfs, "PDFs"),
+            (AttachmentKind::Archives, "Archives"),
+        ];
+        div()
+            .id("attachment-chips")
+            .flex_shrink_0()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_4()
+            .pb_2()
+            .children(kinds.into_iter().map(|(kind, name)| {
+                let selected = self.att_kind == kind && self.att_from.is_none();
+                let all = kind == AttachmentKind::All;
+                att_chip(
+                    t,
+                    format!("att-chip-{}", slug(name)),
+                    name,
+                    selected,
+                    cx.listener(move |this, _, _, cx| {
+                        this.set_attachment_filter(kind, if all { None } else { this.att_from }, cx)
+                    }),
+                )
+            }))
+            .children(
+                [(true, "From me"), (false, "To me")]
+                    .into_iter()
+                    .map(|(mine, name)| {
+                        let selected = self.att_from == Some(mine);
+                        att_chip(
+                            t,
+                            format!("att-chip-{}", slug(name)),
+                            name,
+                            selected,
+                            cx.listener(move |this, _, _, cx| {
+                                this.set_attachment_filter(
+                                    this.att_kind,
+                                    if selected { None } else { Some(mine) },
+                                    cx,
+                                )
+                            }),
+                        )
+                    }),
+            )
+    }
+}
+
+fn slug(name: &str) -> String {
+    name.to_lowercase().replace(' ', "-")
+}
+
+/// One quick-filter chip.
+fn att_chip(
+    t: Theme,
+    id: String,
+    name: &'static str,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(ElementId::Name(id.into()))
+        .test_support()
+        .aria_label(name)
+        .aria_selected(selected)
+        .px_2()
+        .py_1()
+        .rounded(px(RADIUS_SM))
+        .text_size(t.px(11.))
+        .cursor_pointer()
+        .text_color(if selected { t.fg } else { t.fg2 })
+        .bg(if selected { t.sel } else { t.bg2 })
+        .hover(|s| s.bg(t.bg3))
+        .on_click(on_click)
+        .child(name)
+}
+
+/// The icon a file's mime type earns.
+fn file_icon(row: &AttachmentRow) -> IconName {
+    let mime = row.mime.as_str();
+    let ext = row.name.rsplit('.').next().unwrap_or_default();
+    if mime.starts_with("image/") {
+        IconName::FileImage
+    } else if mime.contains("spreadsheet") || matches!(ext, "csv" | "xls" | "xlsx" | "numbers") {
+        IconName::FileSpreadsheet
+    } else if mime.starts_with("audio/") {
+        IconName::FileMusic
+    } else if mime.starts_with("video/") {
+        IconName::FilePlay
+    } else if mime.contains("zip")
+        || mime.contains("tar")
+        || mime.contains("rar")
+        || mime.contains("compressed")
+        || mime.contains("7z")
+        || matches!(ext, "zip" | "tar" | "gz" | "rar" | "7z")
+    {
+        IconName::FileArchive
+    } else if mime.contains("word")
+        || mime == "application/pdf"
+        || mime.starts_with("text/")
+        || mime.contains("rtf")
+    {
+        IconName::FileText
+    } else {
+        IconName::File
+    }
+}
+
+/// `34 567` bytes as "34 KB".
+fn human_size(size: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    if size >= MB {
+        format!("{:.1} MB", size as f64 / MB as f64)
+    } else if size >= KB {
+        format!("{} KB", size.div_ceil(KB))
+    } else {
+        format!("{size} B")
+    }
+}
+
+/// One attachment row: a type tile, the file name and date, then sender · size and the
+/// conversation it came from. Enter opens the file; `o` opens the conversation.
+fn attachment_row(
+    kite: &Kite,
+    row: &AttachmentRow,
+    ix: usize,
+    now: DateTime<Local>,
+    cx: &mut Context<Kite>,
+) -> AnyElement {
+    let t = kite.theme;
+    let selected = ix == kite.sel;
+    let label = format!("{}: {}, {}", row.sender.name, row.name, row.subject);
+    let account = kite
+        .accounts
+        .iter()
+        .find(|account| account.id == row.account_id);
+    let sender = if row.sender.name.is_empty() {
+        row.sender.email.clone()
+    } else {
+        row.sender.name.clone()
+    };
+    let when = when(row.date, now);
+    let combined = kite.view.account_id.is_none() && kite.accounts.len() > 1;
+    let mark = account.and_then(|account| {
+        combined.then(|| {
+            (
+                SharedString::from(account.email.as_str()),
+                provider_mark(account.provider),
+            )
+        })
+    });
+    let meta = format!("{sender} · {}", human_size(row.size));
+    div()
+        .id(("att-row", ix))
+        .test_support()
+        .aria_label(label)
+        .aria_selected(selected)
+        .group("row")
+        .relative()
+        .flex()
+        .flex_row()
+        .flex_shrink_0()
+        .w_full()
+        .h(px(ROW_H * 2. * t.scale))
+        .cursor_pointer()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .h_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_3()
+                .px_3()
+                .py_1p5()
+                .rounded(px(RADIUS_SM))
+                .overflow_hidden()
+                .when(selected, |d| d.bg(t.sel))
+                .when(!selected, |d| d.hover(|s| s.bg(t.bg3)))
+                .child(
+                    div()
+                        .size(px(36.))
+                        .flex_shrink_0()
+                        .rounded(px(RADIUS_SM))
+                        .bg(t.bg2)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            Icon::new(file_icon(row))
+                                .with_size(px(18.))
+                                .text_color(t.fg2),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .justify_center()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .id(("att-name", ix))
+                                .test_support()
+                                .aria_label(row.name.clone())
+                                .truncate()
+                                .text_size(t.px(13.))
+                                .font_weight(FontWeight(500.))
+                                .text_color(t.fg)
+                                .child(row.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .id(("att-sender", ix))
+                                .test_support()
+                                .aria_label(meta.clone())
+                                .truncate()
+                                .text_size(t.px(12.))
+                                .text_color(t.fg2)
+                                .child(meta),
+                        )
+                        .child(
+                            div()
+                                .id(("att-subject", ix))
+                                .test_support()
+                                .aria_label(row.subject.clone())
+                                .truncate()
+                                .text_size(t.px(12.))
+                                .text_color(t.fg3)
+                                .child(row.subject.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .group_hover("row", |s| s.opacity(0.))
+                        .when_some(mark, |d, (email, (path, ink))| {
+                            d.child(
+                                div()
+                                    .id(("att-account", ix))
+                                    .test_support()
+                                    .aria_label(email.clone())
+                                    .tooltip(move |window, cx| {
+                                        let address = email.clone();
+                                        Tooltip::element(move |_, _| {
+                                            div()
+                                                .id("att-account-tip")
+                                                .test_support()
+                                                .aria_label(address.clone())
+                                                .child(address.clone())
+                                        })
+                                        .build(window, cx)
+                                    })
+                                    .child(svg().path(path).size(t.px(13.)).text_color(ink)),
+                            )
+                        })
+                        .child(
+                            div()
+                                .id(("att-time", ix))
+                                .test_support()
+                                .aria_label(when.clone())
+                                .text_size(t.px(12.))
+                                .text_color(t.fg3)
+                                .child(when),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .id(("att-actions", ix))
+                .test_support()
+                .aria_label("Row actions")
+                .absolute()
+                .right(px(12.))
+                .top_0()
+                .h_full()
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_1()
+                .rounded(px(RADIUS_SM))
+                .bg(if selected { t.sel } else { t.bg3 })
+                .opacity(0.)
+                .group_hover("row", |s| s.opacity(1.))
+                .children([
+                    followup_button(
+                        "att-open",
+                        "Open file",
+                        IconName::ExternalLink,
+                        crate::keys::cmd::OPEN,
+                        ix,
+                        cx,
+                    ),
+                    followup_button(
+                        "att-thread",
+                        "Open conversation",
+                        IconName::MailOpen,
+                        crate::keys::cmd::OPEN_CONVERSATION,
+                        ix,
+                        cx,
+                    ),
+                ]),
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            this.sel = ix;
+            window.focus(&this.focus, cx);
+            this.run(crate::keys::cmd::OPEN, crate::app::Src::Click, window, cx);
+        }))
+        .into_any_element()
 }
 
 /// One labelled block of the cheat sheet.

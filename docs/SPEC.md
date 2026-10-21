@@ -27,6 +27,7 @@ Compose docks within the reading area and can expand to fill that area. To, Cc a
 - **Snooze / remind** (`h`): presets (later today, tomorrow, weekend, next week, custom with natural language like "fri 9am"). There is also an optional "remind me if no reply in N days" on send.
 - **Send later** (`Cmd/Ctrl+Shift+Enter` in compose). Microsoft Graph hands schedules more than two minutes away to Exchange using `SystemTime 0x3FEF` (PidTagDeferredSendTime); once accepted, delivery works with Kite closed. Cancel deletes the provider item before restoring the draft. Proton and delays under two minutes use the local scheduled outbox: Kite must run, and overdue items send on next launch.
 - **Scheduled** (`g l`): one local outbox view across the selected accounts, including schedules already handed to Exchange until their send time. Rows show recipients and scheduled local time. Open cancels the schedule and opens the restored editable draft; Cancel schedule restores it to Drafts. Send now cancels the old schedule then queues a send with the undo window. Reschedule uses the send-later picker, deletes the old provider item before queuing the replacement, and retains the restored draft if re-queuing fails. Provider cancellation runs in the background; failure restores the row. Expired Exchange schedules report Already sent. Cancel schedule, Reschedule and Send now can be undone to the original future schedule while the replacement has not sent. Opening for editing restores a draft without queuing an automatic undo. Cancellation cannot recall sent mail.
+- **Attachments** (`g f`): every file across the selected accounts in one searchable list, something Superhuman does not have. Rows show a file-type icon, the name, sender · size, the conversation it came from, the date and the account's provider mark. `j`/`k` move, Enter opens the file (the same engine path as the reading pane's attachment pills), `o` or `Shift+Enter` opens the conversation holding it, and the row's hover strip offers both. The search box matches file names and senders and keeps the mail grammar's `from:`, `after:` and `before:` operators; quick chips narrow to Documents, Images, Spreadsheets, PDFs or Archives, plus From me / To me. The schema does not record Content-ID, so `image/*` parts under 10 KB are treated as signature art and never listed.
 - **Waiting on** (`g w`): conversations whose latest non-draft message was sent by any connected account to someone outside those accounts, with no subsequent reply. General sets the age threshold (default two days; zero shows immediately). Archive, Trash, Spam and drafts are excluded. Explicit no-reply reminders appear immediately with their remind date. Rows show Waiting N days; reply/nudge addresses all original recipients. Done waiting is local and undoable; dismissal survives restarts until a new message arrives, while metadata updates preserve it. Snooze temporarily hides ordinary waiting conversations.
 - **Unsubscribe** (`Cmd/Ctrl+U`): prefer RFC 8058 HTTPS one-click POST, then an unsubscribe email from the receiving account, then open the HTTPS unsubscribe page. Archive that exact sender's inbox conversations together; `z` restores those conversations but cannot recall the unsubscribe request. Schema v9 stores the two headers on messages and account-scoped exact normalized addresses in `unsubscribed_senders`; later inbox arrivals from those addresses are archived automatically. Undo preserves that sender preference. Upgrading re-walks provider metadata and fetches previously cached newsletter headers once.
 - **Read status**: not implemented (no tracking pixels, by design).
@@ -51,7 +52,8 @@ Settings › Shortcuts lists every command by group with its current keys. Each 
 | Key | Action |
 |---|---|
 | `j` / `k` | next / previous thread (or message, in thread view) |
-| `Enter` / `o` | open thread |
+| `Enter` | open thread (in Attachments: open the file) |
+| `o` / `Shift+Enter` | open conversation (in Attachments: the file's conversation) |
 | `Esc` / `u` (in thread) | back to list |
 | `e` | mark done (archive) |
 | `Shift+E` | move back to inbox |
@@ -70,6 +72,7 @@ Settings › Shortcuts lists every command by group with its current keys. Each 
 | `Tab` / `Shift+Tab` | next / previous split |
 | `g i` `g s` `g d` `g t` `g h` `g a` | go to inbox / starred / drafts / sent / snoozed / all mail |
 | `g w` / `g l` | Waiting on / Scheduled |
+| `g f` | Attachments |
 | `g e` / `g p` / `g b` | archive / spam / trash |
 | `Cmd/Ctrl+0` / `Cmd/Ctrl+1..9` | combined inbox / account |
 | `Cmd/Ctrl+Shift+N` | create folder |

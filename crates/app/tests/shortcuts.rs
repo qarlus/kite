@@ -16,7 +16,7 @@ fn mount_tall(
     cx.update(gpui_kit::init);
     common::open_window(
         cx,
-        Some(gpui_kit::size(px(1200.), px(1100.))),
+        Some(gpui_kit::size(px(1200.), px(1200.))),
         |window, cx| cx.new(|cx| kite::app::Kite::new(mail, window, cx)),
     )
 }

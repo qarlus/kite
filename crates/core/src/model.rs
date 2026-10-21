@@ -61,6 +61,8 @@ pub enum Mailbox {
     Trash,
     Spam,
     All,
+    /// The Attachments browser: not a stored mailbox, only a UI view over `Mail::attachments`.
+    Attachments,
 }
 
 /// What the list shows. `account_id: None` = unified across accounts.
@@ -113,6 +115,48 @@ pub struct Attachment {
     pub name: String,
     pub mime: String,
     pub size: u64,
+}
+
+/// The quick type chips of the Attachments browser.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentKind {
+    #[default]
+    All,
+    Documents,
+    Images,
+    Spreadsheets,
+    Pdfs,
+    Archives,
+}
+
+/// What the Attachments browser lists. `account_id: None` = unified across accounts.
+/// `text` keeps the mail grammar's `from:`, `after:` and `before:` operators; every other
+/// word must appear in the file name or the sender's name or address.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AttachmentQuery {
+    pub account_id: Option<Id>,
+    pub text: String,
+    pub kind: AttachmentKind,
+    /// `Some(true)` = sent by me, `Some(false)` = received, `None` = either.
+    pub from_me: Option<bool>,
+}
+
+/// One row of the Attachments browser.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AttachmentRow {
+    pub id: Id,
+    /// The conversation holding the file; `o` opens it.
+    pub thread_id: Id,
+    pub account_id: Id,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub date: Ms,
+    pub sender: Addr,
+    pub from_me: bool,
+    /// The message's subject, shown as context and used when opening the conversation.
+    pub subject: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
