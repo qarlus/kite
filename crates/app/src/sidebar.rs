@@ -16,10 +16,12 @@ use std::time::UNIX_EPOCH;
 /// The icon rail: accounts down the left, window actions at the bottom.
 pub const RAIL_W: f32 = 64.;
 
-pub const MAILBOXES: [(Mailbox, &str, IconName); 9] = [
+pub const MAILBOXES: [(Mailbox, &str, IconName); 11] = [
     (Mailbox::Inbox, "Inbox", IconName::Inbox),
     (Mailbox::Drafts, "Drafts", IconName::FileText),
     (Mailbox::Sent, "Sent", IconName::Send),
+    (Mailbox::Waiting, "Waiting on", IconName::Hourglass),
+    (Mailbox::Scheduled, "Scheduled", IconName::CalendarClock),
     (Mailbox::Starred, "Starred", IconName::Star),
     (Mailbox::Snoozed, "Snoozed", IconName::Clock),
     (Mailbox::Archive, "Archive", IconName::Archive),
@@ -548,7 +550,12 @@ pub fn mailbox_menu(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> Any
                         ("mailbox", mailbox as usize),
                         Some(Icon::new(*icon).with_size(px(15.)).into_any_element()),
                         name,
-                        "",
+                        &if matches!(mailbox, Mailbox::Waiting | Mailbox::Scheduled) {
+                            kite.followup_counts[usize::from(mailbox == Mailbox::Scheduled)]
+                                .to_string()
+                        } else {
+                            String::new()
+                        },
                         active,
                         selected == index,
                     )

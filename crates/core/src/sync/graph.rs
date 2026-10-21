@@ -876,7 +876,11 @@ fn well_known(mailbox: Mailbox) -> Option<&'static str> {
         Mailbox::Archive => Some("archive"),
         Mailbox::Trash => Some("deleteditems"),
         Mailbox::Spam => Some("junkemail"),
-        Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => None,
+        Mailbox::Waiting
+        | Mailbox::Scheduled
+        | Mailbox::Starred
+        | Mailbox::Snoozed
+        | Mailbox::All => None,
     }
 }
 

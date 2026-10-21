@@ -791,8 +791,76 @@ impl Mail for Fixture {
         Ok(folder)
     }
 
+    fn view_count(&self, view: &View) -> anyhow::Result<usize> {
+        if view.mailbox == Mailbox::Scheduled {
+            return Ok(self
+                .outbox
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|d| {
+                    d.send_at.is_some() && view.account_id.is_none_or(|a| a == d.account_id)
+                })
+                .count());
+        }
+        if view.mailbox == Mailbox::Waiting {
+            let all = self.threads.lock().unwrap();
+            let locations = self.locations.lock().unwrap();
+            let days = self.settings.lock().unwrap().waiting_after_days;
+            return Ok(all
+                .iter()
+                .filter(|t| {
+                    view.account_id.is_none_or(|a| a == t.account_id)
+                        && locations
+                            .get(&t.id)
+                            .is_some_and(|(m, _)| *m == Mailbox::Waiting)
+                        && chrono::Local::now().timestamp_millis() - t.date
+                            >= i64::from(days) * 86_400_000
+                })
+                .count());
+        }
+        Ok(self.threads(view, 0, u32::MAX)?.len())
+    }
+
     fn threads(&self, view: &View, offset: u32, limit: u32) -> anyhow::Result<Vec<ThreadSummary>> {
         self.queries.lock().unwrap().push((view.clone(), offset));
+        if view.mailbox == Mailbox::Scheduled {
+            let mut rows: Vec<_> = self
+                .outbox
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, d)| {
+                    d.send_at.is_some() && view.account_id.is_none_or(|a| a == d.account_id)
+                })
+                .map(|(id, d)| ThreadSummary {
+                    id: *id,
+                    account_id: d.account_id,
+                    subject: d.subject.clone(),
+                    snippet: d.body.clone(),
+                    participants: d
+                        .to
+                        .iter()
+                        .map(|a| a.email.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    date: d.send_at.unwrap(),
+                    unread: false,
+                    starred: false,
+                    important: false,
+                    attachments: false,
+                    labels: vec![],
+                    count: 1,
+                    snoozed_until: None,
+                })
+                .collect();
+            rows.sort_by_key(|r| r.date);
+            return Ok(rows
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect());
+        }
         let all = self.threads.lock().unwrap();
         // The engine resolves a split into its query; so does the fixture.
         let query = view
@@ -816,6 +884,12 @@ impl Mail for Fixture {
                     Mailbox::All => !matches!(mailbox, Mailbox::Trash | Mailbox::Spam),
                     Mailbox::Starred => {
                         t.starred && !matches!(mailbox, Mailbox::Trash | Mailbox::Spam)
+                    }
+                    Mailbox::Waiting => {
+                        mailbox == Mailbox::Waiting
+                            && (chrono::Local::now().timestamp_millis() - t.date
+                                >= i64::from(self.settings.lock().unwrap().waiting_after_days)
+                                    * 86_400_000)
                     }
                     Mailbox::Snoozed => t.snoozed_until.is_some(),
                     wanted => mailbox == wanted && folder.is_none(),
@@ -894,6 +968,7 @@ impl Mail for Fixture {
             action => {
                 for id in ids {
                     let location = match action {
+                        Action::DoneWaiting => (Mailbox::Sent, None),
                         Action::Archive => (Mailbox::Archive, None),
                         Action::Inbox => (Mailbox::Inbox, None),
                         Action::Trash => (Mailbox::Trash, None),
@@ -935,6 +1010,13 @@ impl Mail for Fixture {
     }
 
     fn send(&self, draft: Draft) -> anyhow::Result<Id> {
+        if let Some(id) = draft.id
+            && let Some(thread) = self.draft_threads.lock().unwrap().remove(&id)
+        {
+            self.threads.lock().unwrap().retain(|row| row.id != thread);
+            self.messages.lock().unwrap().remove(&thread);
+            self.locations.lock().unwrap().remove(&thread);
+        }
         let id = self.send_seq.fetch_add(1, Ordering::SeqCst);
         self.sent.lock().unwrap().push(draft.clone());
         self.outbox.lock().unwrap().insert(id, draft);
@@ -943,7 +1025,14 @@ impl Mail for Fixture {
 
     fn cancel_send(&self, id: Id) -> anyhow::Result<Option<Draft>> {
         self.cancelled.lock().unwrap().push(id);
-        Ok(self.outbox.lock().unwrap().remove(&id))
+        let removed = self.outbox.lock().unwrap().remove(&id);
+        if let Some(mut draft) = removed {
+            draft.send_at = None;
+            draft.id = Some(self.save_draft(draft.clone())?);
+            Ok(Some(draft))
+        } else {
+            Ok(None)
+        }
     }
 
     fn save_draft(&self, draft: Draft) -> anyhow::Result<Id> {

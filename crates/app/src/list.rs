@@ -5,7 +5,7 @@ use crate::theme::{RADIUS, RADIUS_SM, ROW_H, Theme};
 use chrono::{DateTime, Datelike, Local, TimeZone as _, Timelike as _};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::menu::ContextMenuExt;
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
@@ -157,6 +157,14 @@ impl Kite {
                 Mailbox::Drafts => (
                     "No drafts".to_string(),
                     "Your unfinished messages will appear here.".to_string(),
+                ),
+                Mailbox::Waiting => (
+                    "Nothing waiting".into(),
+                    "Conversations awaiting a reply will appear here.".into(),
+                ),
+                Mailbox::Scheduled => (
+                    "Nothing scheduled".into(),
+                    "Messages queued for later will appear here.".into(),
                 ),
                 Mailbox::Sent => (
                     "No sent mail".to_string(),
@@ -390,15 +398,86 @@ fn row_element(
         .iter()
         .find(|account| account.id == row.account_id);
     let row_id = row.id;
-    let buttons = row_actions(row);
-    let when = when(row.date, now);
+    let mut buttons = if kite.view.mailbox == Mailbox::Scheduled {
+        vec![
+            followup_button(
+                "send-now",
+                "Send now",
+                IconName::Send,
+                crate::keys::cmd::SEND_NOW,
+                ix,
+                cx,
+            ),
+            followup_button(
+                "reschedule",
+                "Reschedule",
+                IconName::Clock,
+                crate::keys::cmd::RESCHEDULE,
+                ix,
+                cx,
+            ),
+            followup_button(
+                "cancel-schedule",
+                "Cancel schedule",
+                IconName::X,
+                crate::keys::cmd::CANCEL_SCHEDULE,
+                ix,
+                cx,
+            ),
+        ]
+    } else {
+        row_actions(row)
+            .into_iter()
+            .map(|button| row_action(&t, ix, row_id, button, cx))
+            .collect()
+    };
+    if kite.view.mailbox == Mailbox::Waiting {
+        buttons.truncate(1);
+        buttons.push(followup_button(
+            "waiting-snooze",
+            "Snooze",
+            IconName::Clock,
+            crate::keys::cmd::SNOOZE,
+            ix,
+            cx,
+        ));
+        buttons.push(followup_button(
+            "waiting-nudge",
+            "Nudge (reply all)",
+            IconName::ReplyAll,
+            crate::keys::cmd::REPLY_ALL,
+            ix,
+            cx,
+        ));
+        buttons.push(followup_button(
+            "done-waiting",
+            "Done waiting",
+            IconName::Check,
+            crate::keys::cmd::DONE_WAITING,
+            ix,
+            cx,
+        ));
+    }
+    let when = match kite.view.mailbox {
+        Mailbox::Waiting if row.snoozed_until.is_some() => format!(
+            "Remind {}",
+            scheduled_time(row.snoozed_until.unwrap_or(row.date), now)
+        ),
+        Mailbox::Waiting => format!(
+            "Waiting {} days",
+            (now.timestamp_millis() - row.date).max(0) / 86_400_000
+        ),
+        Mailbox::Scheduled => scheduled_time(row.date, now),
+        _ => when(row.date, now),
+    };
     let sender = row.participants.clone();
     let unread = if row.unread {
         format!("Unread: {sender}")
     } else {
         sender.clone()
     };
-    let combined = kite.view.account_id.is_none() && kite.accounts.len() > 1;
+    let combined = kite.view.mailbox == Mailbox::Scheduled
+        || (kite.view.account_id.is_none() && kite.accounts.len() > 1);
     // Only a mixed inbox has to say where a row came from. It says it with the provider's mark,
     // because a full address beside every row is noise; the address is the mark's tooltip.
     let mark = combined.then_some(account).flatten().map(|account| {
@@ -626,11 +705,7 @@ fn row_element(
                 .bg(if selected { t.sel } else { t.bg3 })
                 .opacity(0.)
                 .group_hover("row", |s| s.opacity(1.))
-                .children(
-                    buttons
-                        .into_iter()
-                        .map(|button| row_action(&t, ix, row_id, button, cx)),
-                ),
+                .children(buttons),
         )
         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
             this.sel = ix;
@@ -653,6 +728,33 @@ fn row_element(
         .context_menu({
             let entity = cx.entity().downgrade();
             move |menu, window, cx| {
+                if entity
+                    .upgrade()
+                    .is_some_and(|kite| kite.read(cx).view.mailbox == Mailbox::Scheduled)
+                {
+                    let mut menu = menu;
+                    for (label, command) in [
+                        ("Send now", keys::cmd::SEND_NOW),
+                        ("Reschedule", keys::cmd::RESCHEDULE),
+                        ("Cancel schedule", keys::cmd::CANCEL_SCHEDULE),
+                    ] {
+                        let entity = entity.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(label).on_click(move |_, window, cx| {
+                                entity
+                                    .update(cx, |kite, cx| {
+                                        if let Some(index) =
+                                            kite.rows.iter().position(|r| r.id == row_id)
+                                        {
+                                            kite.sel = index;
+                                            kite.run(command, crate::app::Src::Click, window, cx);
+                                        }
+                                    })
+                                    .ok();
+                            }));
+                    }
+                    return menu;
+                }
                 let ids = entity
                     .upgrade()
                     .map(|kite| {
@@ -784,6 +886,44 @@ fn tag_pill(t: &Theme) -> Div {
         .bg(t.bg3)
         .text_size(t.px(11.))
         .text_color(t.fg2)
+}
+
+fn scheduled_time(ms: i64, now: DateTime<Local>) -> String {
+    let Some(at) = DateTime::from_timestamp_millis(ms).map(|t| t.with_timezone(&Local)) else {
+        return String::new();
+    };
+    if at.date_naive() == now.date_naive() {
+        format!("Today {}", at.format("%H:%M"))
+    } else {
+        at.format("%a %H:%M").to_string()
+    }
+}
+
+fn followup_button(
+    name: &'static str,
+    label: &'static str,
+    icon: IconName,
+    command: u8,
+    ix: usize,
+    cx: &mut Context<Kite>,
+) -> AnyElement {
+    div()
+        .id((name, ix))
+        .test_support()
+        .aria_label(label)
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .child(Icon::new(icon).with_size(px(14.)))
+        .tooltip(move |window, cx| Tooltip::new(label).build(window, cx))
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.sel = ix;
+            this.run(command, crate::app::Src::Click, window, cx);
+            cx.stop_propagation();
+        }))
+        .into_any_element()
 }
 
 /// One button in a row's hover action strip.

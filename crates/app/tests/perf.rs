@@ -24,7 +24,7 @@ fn first_frame_of_a_ten_thousand_thread_inbox_is_fast(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn j_repaints_within_four_milliseconds(cx: &mut TestAppContext) {
+fn j_and_k_repaint_within_four_milliseconds(cx: &mut TestAppContext) {
     let fixture = Fixture::new(THREADS);
     let (window, kite) = mount(cx, fixture);
     cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
@@ -45,6 +45,24 @@ fn j_repaints_within_four_milliseconds(cx: &mut TestAppContext) {
     assert!(
         times[10] <= Duration::from_millis(4),
         "median j frame {:?}, budget 4 ms",
+        times[10]
+    );
+    let mut times = Vec::with_capacity(20);
+    for _ in 0..20 {
+        let started = Instant::now();
+        cx.simulate_keystrokes(window.into(), "k");
+        cx.update_window(window.into(), |_, window, cx| window.render_frame(cx))
+            .unwrap();
+        times.push(started.elapsed());
+    }
+    update_content(window, &kite, cx, |kite, _, _| {
+        assert_eq!(kite.sel_index(), 0)
+    });
+    times.sort();
+    eprintln!("Median k repaint: {:?}", times[10]);
+    assert!(
+        times[10] <= Duration::from_millis(4),
+        "median k frame {:?}, budget 4 ms",
         times[10]
     );
 }

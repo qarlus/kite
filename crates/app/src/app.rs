@@ -166,6 +166,10 @@ pub struct Kite {
     pub(crate) open_draft: Option<kite_core::model::Draft>,
     /// The shared snooze picker is choosing a send time rather than a snooze time.
     pub(crate) send_later: bool,
+    pub(crate) reschedule: Option<Id>,
+    pub(crate) scheduled_busy: Option<Id>,
+    pub(crate) followup_counts: [usize; 2],
+    schedule_undo: Option<(kite_core::model::Draft, Option<Id>, u64)>,
     /// The outbox id of the mail just sent, so Undo can cancel it.
     pub(crate) sent: Option<Id>,
     pub(crate) sent_stamp: u64,
@@ -290,6 +294,10 @@ impl Kite {
             compose_open: false,
             open_draft: None,
             send_later: false,
+            reschedule: None,
+            scheduled_busy: None,
+            followup_counts: [0; 2],
+            schedule_undo: None,
             sent: None,
             sent_stamp: 0,
             undo_stamp: 0,
@@ -370,7 +378,25 @@ impl Kite {
     // ---- data -----------------------------------------------------------------
 
     pub(crate) fn reload(&mut self) {
+        for (ix, mailbox) in [Mailbox::Waiting, Mailbox::Scheduled]
+            .into_iter()
+            .enumerate()
+        {
+            let view = View {
+                mailbox,
+                split: None,
+                query: None,
+                folder: None,
+                account_id: self.view.account_id,
+            };
+            self.followup_counts[ix] = self.mail.view_count(&view).unwrap_or(0);
+        }
         self.rows = self.mail.threads(&self.view, 0, PAGE).unwrap_or_default();
+        if self.view.mailbox == Mailbox::Scheduled
+            && let Some(id) = self.scheduled_busy
+        {
+            self.rows.retain(|r| r.id != id);
+        }
         self.loaded_all = self.rows.len() < PAGE as usize;
         self.sel = self.sel.min(self.rows.len().saturating_sub(1));
         self.multi.clear();
@@ -605,6 +631,14 @@ impl Kite {
         let Some(row) = self.rows.get(self.sel).cloned() else {
             return;
         };
+        if self.view.mailbox == Mailbox::Scheduled {
+            if self.has_draft(cx) {
+                self.toast("Draft kept — close it before editing a schedule", cx);
+                return;
+            }
+            self.change_schedule(row.id, None, true, cx);
+            return;
+        }
         // A saved draft opens in compose, prefilled, instead of the reading view.
         let draft = if self.view.mailbox == Mailbox::Drafts {
             self.mail.draft(row.id).unwrap_or(None)
@@ -813,6 +847,7 @@ impl Kite {
     pub(crate) fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.send_later = false;
+        self.reschedule = None;
         cx.notify();
     }
 
@@ -926,7 +961,56 @@ impl Kite {
             }
             return;
         }
+        if self.view.mailbox == Mailbox::Scheduled
+            && matches!(
+                id,
+                cmd::DONE
+                    | cmd::INBOX
+                    | cmd::TRASH
+                    | cmd::STAR
+                    | cmd::TOGGLE_READ
+                    | cmd::MOVE
+                    | cmd::TAGS
+                    | cmd::REPLY
+                    | cmd::REPLY_ALL
+                    | cmd::FORWARD
+                    | cmd::SNOOZE
+                    | cmd::UNSUBSCRIBE
+                    | cmd::AI_SUMMARY
+            )
+        {
+            return;
+        }
         match id {
+            cmd::GO_WAITING => self.select_mailbox(Mailbox::Waiting, window, cx),
+            cmd::GO_SCHEDULED => self.select_mailbox(Mailbox::Scheduled, window, cx),
+            cmd::DONE_WAITING if self.view.mailbox == Mailbox::Waiting => {
+                self.act(MailAction::DoneWaiting, true, "Done waiting", cx)
+            }
+            cmd::CANCEL_SCHEDULE | cmd::SEND_NOW if self.view.mailbox == Mailbox::Scheduled => {
+                if let Some(row) = self.rows.get(self.sel) {
+                    self.change_schedule(
+                        row.id,
+                        if id == cmd::SEND_NOW {
+                            Some(None)
+                        } else {
+                            None
+                        },
+                        false,
+                        cx,
+                    );
+                }
+            }
+            cmd::RESCHEDULE
+                if self.view.mailbox == Mailbox::Scheduled && self.scheduled_busy.is_none() =>
+            {
+                if let Some(row) = self.rows.get(self.sel) {
+                    self.reschedule = Some(row.id);
+                    self.send_later = true;
+                    self.overlay = Overlay::Snooze(snooze::Snooze::new(chrono::Local::now()));
+                    cx.notify();
+                }
+            }
             cmd::UNSUBSCRIBE => {
                 if let Some(thread) = self.target_ids().first().copied() {
                     let mail = self.mail.clone();
@@ -973,7 +1057,9 @@ impl Kite {
                 }
             }
             cmd::COMPOSE => self.open_compose(window, cx),
-            cmd::REPLY => self.compose_reply(window, cx, false, false),
+            cmd::REPLY => {
+                self.compose_reply(window, cx, self.view.mailbox == Mailbox::Waiting, false)
+            }
             cmd::REPLY_ALL => self.compose_reply(window, cx, true, false),
             cmd::FORWARD => self.compose_reply(window, cx, false, true),
             cmd::COMPOSE_CLOSE => self.close_compose(window, cx),
@@ -1022,7 +1108,8 @@ impl Kite {
             cmd::SELECT => self.select(cx),
             cmd::SEARCH => self.search_focus(window, cx),
             cmd::PALETTE => {
-                self.overlay = Overlay::Palette(palette::Palette::new(&self.settings));
+                self.overlay =
+                    Overlay::Palette(palette::Palette::new(&self.settings, self.view.mailbox));
                 cx.notify();
             }
             cmd::HELP => {
@@ -1032,6 +1119,14 @@ impl Kite {
             cmd::NEXT_SPLIT => self.cycle_split(1, cx),
             cmd::PREV_SPLIT => self.cycle_split(-1, cx),
             cmd::UNDO => {
+                if self
+                    .schedule_undo
+                    .as_ref()
+                    .is_some_and(|(_, _, stamp)| *stamp > self.undo_stamp.max(self.sent_stamp))
+                {
+                    self.undo_schedule(cx);
+                    return;
+                }
                 let cancel_send = match (self.sent, self.undo) {
                     (Some(_), Some(_)) => self.sent_stamp > self.undo_stamp,
                     (Some(_), None) => true,
@@ -1081,6 +1176,133 @@ impl Kite {
             Src::Click => self.shortcut_hint(id, cx),
             Src::Key => self.note_key_use(id),
         }
+    }
+
+    /// Remove immediately; provider cancellation runs away from the UI thread. Errors re-query.
+    pub(crate) fn change_schedule(
+        &mut self,
+        id: Id,
+        replacement: Option<Option<i64>>,
+        edit: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if replacement
+            .flatten()
+            .is_some_and(|at| at <= chrono::Local::now().timestamp_millis())
+        {
+            self.toast("Choose a future send time", cx);
+            return;
+        }
+        if self.scheduled_busy.is_some() {
+            return;
+        }
+        let original_at = self.rows.iter().find(|r| r.id == id).map(|r| r.date);
+        self.scheduled_busy = Some(id);
+        self.rows.retain(|r| r.id != id);
+        self.sel = self.sel.min(self.rows.len().saturating_sub(1));
+        cx.notify();
+        let mail = self.mail.clone();
+        let task = cx.background_executor().spawn(async move {
+            let Some(mut draft) = mail.cancel_send(id)? else {
+                return Ok((None, None));
+            };
+            let mut original = draft.clone();
+            original.send_at = original_at;
+            let next = if let Some(at) = replacement {
+                draft.send_at = at;
+                Some(mail.send(draft.clone())?)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((next, Some((draft, original))))
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.scheduled_busy = None;
+                this.reload();
+                match result {
+                    Ok((next, Some((draft, original)))) => {
+                        if !edit {
+                            this.undo_gen += 1;
+                            this.schedule_undo = Some((original, next, this.undo_gen));
+                        }
+                        if let Some(id) = next {
+                            this.record_sent(id);
+                            // This undo restores the original time, taking precedence over undo send.
+                            if let Some((_, _, stamp)) = &mut this.schedule_undo {
+                                *stamp = this.undo_gen + 1;
+                                this.undo_gen += 1;
+                            }
+                            this.show_toast("Schedule updated · z to undo".into(), false, true, cx);
+                        } else {
+                            if edit && !this.has_draft(cx) {
+                                this.open_draft = Some(draft);
+                            }
+                            this.show_toast(
+                                "Schedule cancelled — restored to Drafts".into(),
+                                false,
+                                !edit,
+                                cx,
+                            );
+                        }
+                    }
+                    Ok(_) => this.toast("Already sent", cx),
+                    Err(error) => this.toast(format!("Could not change schedule: {error}"), cx),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn undo_schedule(&mut self, cx: &mut Context<Self>) {
+        if self.scheduled_busy.is_some() {
+            return;
+        }
+        let Some((original, replacement, stamp)) = self.schedule_undo.take() else {
+            return;
+        };
+        if original
+            .send_at
+            .is_none_or(|at| at <= chrono::Local::now().timestamp_millis())
+        {
+            self.toast("Original send time has passed", cx);
+            return;
+        }
+        self.scheduled_busy = Some(replacement.unwrap_or(-1));
+        let mail = self.mail.clone();
+        let retry = original.clone();
+        let task = cx.background_executor().spawn(async move {
+            if let Some(id) = replacement
+                && mail.cancel_send(id)?.is_none()
+            {
+                return Ok(None);
+            }
+            mail.send(original).map(Some)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.scheduled_busy = None;
+                this.reload();
+                match result {
+                    Ok(Some(id)) => {
+                        this.record_sent(id);
+                        this.toast("Original schedule restored", cx);
+                    }
+                    Ok(None) => this.toast("Already sent", cx),
+                    Err(error) => {
+                        this.schedule_undo = Some((retry, replacement, stamp));
+                        this.toast(format!("Could not undo schedule: {error}"), cx);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- get me to zero ----------------------------------------------------------

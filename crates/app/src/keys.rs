@@ -52,6 +52,12 @@ pub mod cmd {
     pub const ASK: u8 = 65;
     /// Not in the command table: reply suggestions are a click-only helper.
     pub const SUGGEST: u8 = 66;
+    pub const GO_WAITING: u8 = 67;
+    pub const GO_SCHEDULED: u8 = 68;
+    pub const DONE_WAITING: u8 = 69;
+    pub const CANCEL_SCHEDULE: u8 = 70;
+    pub const RESCHEDULE: u8 = 71;
+    pub const SEND_NOW: u8 = 72;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -118,6 +124,54 @@ const fn c(
 }
 
 pub static COMMANDS: &[Cmd] = &[
+    c(
+        "go_waiting",
+        "Go to Waiting on",
+        &["g w"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO_WAITING,
+    ),
+    c(
+        "go_scheduled",
+        "Go to Scheduled",
+        &["g l"],
+        "Kite",
+        Group::GoTo,
+        cmd::GO_SCHEDULED,
+    ),
+    c(
+        "done_waiting",
+        "Done waiting",
+        &[],
+        "Kite",
+        Group::Triage,
+        cmd::DONE_WAITING,
+    ),
+    c(
+        "cancel_schedule",
+        "Cancel schedule",
+        &[],
+        "Kite",
+        Group::Triage,
+        cmd::CANCEL_SCHEDULE,
+    ),
+    c(
+        "reschedule",
+        "Reschedule",
+        &[],
+        "Kite",
+        Group::Triage,
+        cmd::RESCHEDULE,
+    ),
+    c(
+        "send_now",
+        "Send now",
+        &[],
+        "Kite",
+        Group::Triage,
+        cmd::SEND_NOW,
+    ),
     c(
         "unsubscribe",
         "Unsubscribe",

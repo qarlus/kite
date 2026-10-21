@@ -55,6 +55,8 @@ pub enum Mailbox {
     Snoozed,
     Drafts,
     Sent,
+    Waiting,
+    Scheduled,
     Archive,
     Trash,
     Spam,
@@ -132,6 +134,7 @@ pub struct Message {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum Action {
+    DoneWaiting,
     Archive,
     Inbox,
     Trash,
@@ -237,6 +240,7 @@ pub struct Settings {
     pub font_size: u8,
     pub font_color: Option<String>,
     pub undo_send_secs: u32,
+    pub waiting_after_days: u32,
     pub auto_update_check: bool,
     pub load_remote_images: bool,
     pub ai_enabled: bool,
@@ -275,6 +279,7 @@ impl Default for Settings {
             font_size: 14,
             font_color: None,
             undo_send_secs: 5,
+            waiting_after_days: 2,
             auto_update_check: true,
             load_remote_images: false,
             ai_enabled: false,
