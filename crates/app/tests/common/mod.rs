@@ -12,8 +12,9 @@ use gpui_kit::{
 };
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action, Addr, AiModel, AiRequest, Attachment, CalEvent, Draft, Event, Folder, Id,
-    Mailbox, Message, Ms, ProtonAuth, Settings, Split, Tag, ThreadSummary, View,
+    Account, Action, Addr, AiModel, AiRequest, Attachment, CalEvent, ContactCard, ContactFile,
+    ContactThread, Draft, Event, Folder, Id, Mailbox, Message, Ms, ProtonAuth, Settings, Split,
+    Tag, ThreadSummary, View,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -1159,6 +1160,76 @@ impl Mail for Fixture {
 
     fn contacts(&self, _: &str) -> anyhow::Result<Vec<Addr>> {
         Ok(Vec::new())
+    }
+
+    /// The store's card, cut the same way the engine cuts it: every message the address
+    /// touches counts, the open conversation stays out of the recent list.
+    fn contact(&self, email: &str, exclude: Option<Id>) -> anyhow::Result<Option<ContactCard>> {
+        let threads = self.threads.lock().unwrap();
+        let messages = self.messages.lock().unwrap();
+        let (mut first, mut latest, mut conversations) = (None, None, 0u32);
+        let mut name = String::new();
+        let mut involved: Vec<Id> = Vec::new();
+        let mut files: Vec<ContactFile> = Vec::new();
+        for (thread, msgs) in messages.iter() {
+            let mut takes_part = false;
+            for m in msgs {
+                let them = m.from.email.eq_ignore_ascii_case(email)
+                    || m.to
+                        .iter()
+                        .chain(&m.cc)
+                        .any(|a| a.email.eq_ignore_ascii_case(email));
+                if !them {
+                    continue;
+                }
+                takes_part = true;
+                if m.from.email.eq_ignore_ascii_case(email) && !m.from.name.is_empty() {
+                    name = m.from.name.clone();
+                }
+                first = Some(first.map_or(m.date, |seen: Ms| seen.min(m.date)));
+                latest = Some(latest.map_or(m.date, |seen: Ms| seen.max(m.date)));
+                files.extend(m.attachments.iter().map(|a| ContactFile {
+                    thread: *thread,
+                    name: a.name.clone(),
+                    size: a.size,
+                    date: m.date,
+                }));
+            }
+            if takes_part {
+                conversations += 1;
+                involved.push(*thread);
+            }
+        }
+        let (Some(first), Some(latest)) = (first, latest) else {
+            return Ok(None);
+        };
+        let mut recent: Vec<ContactThread> = involved
+            .into_iter()
+            .filter(|id| Some(*id) != exclude)
+            .filter_map(|id| {
+                threads.iter().find(|t| t.id == id).map(|t| ContactThread {
+                    id,
+                    subject: t.subject.clone(),
+                    date: t.date,
+                })
+            })
+            .collect();
+        recent.sort_by_key(|t| std::cmp::Reverse(t.date));
+        recent.truncate(5);
+        files.sort_by_key(|f| std::cmp::Reverse(f.date));
+        files.truncate(5);
+        Ok(Some(ContactCard {
+            name,
+            email: email.to_string(),
+            domain: email.rsplit('@').next().unwrap_or_default().to_string(),
+            first,
+            latest,
+            conversations,
+            reply_median: None,
+            replies_back: None,
+            recent,
+            files,
+        }))
     }
 
     fn open_attachment(&self, id: Id) -> anyhow::Result<()> {

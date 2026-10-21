@@ -58,6 +58,7 @@ pub mod cmd {
     pub const CANCEL_SCHEDULE: u8 = 70;
     pub const RESCHEDULE: u8 = 71;
     pub const SEND_NOW: u8 = 72;
+    pub const CONTACT_PANEL: u8 = 73;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -614,6 +615,14 @@ pub static COMMANDS: &[Cmd] = &[
         "Kite",
         Group::App,
         cmd::ASK,
+    ),
+    c(
+        "contact_panel",
+        "Toggle contact panel",
+        &["i"],
+        "Kite",
+        Group::App,
+        cmd::CONTACT_PANEL,
     ),
     // Palette-only: there is no default key, so the cheat sheet never lists it.
     c(

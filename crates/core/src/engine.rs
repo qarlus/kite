@@ -1535,6 +1535,10 @@ impl Mail for Engine {
         self.inner.read(|s| s.contacts(query, 20))
     }
 
+    fn contact(&self, email: &str, exclude: Option<Id>) -> Result<Option<ContactCard>> {
+        self.inner.read(|s| s.contact(email, exclude))
+    }
+
     fn open_attachment(&self, id: Id) -> Result<()> {
         let (account_id, message, attachment, name) = self
             .inner

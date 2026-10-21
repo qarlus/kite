@@ -1389,7 +1389,7 @@ fn reply_button(
 
 /// Avatar.svelte: the same address is always the same mid-dark hue, so the initials read white
 /// in either appearance.
-fn avatar(sender: &str, ix: usize, size: f32) -> AnyElement {
+pub(crate) fn avatar(sender: &str, ix: usize, size: f32) -> AnyElement {
     let hue = sender.chars().fold(0u32, |hash, c| {
         (hash.wrapping_mul(31).wrapping_add(c as u32)) % 360
     });
@@ -1547,7 +1547,7 @@ fn url_parts(url: &str) -> (String, String, String) {
 }
 
 /// `178 KB`, `2.4 MB`: what an attachment chip shows.
-fn format_size(bytes: u64) -> String {
+pub(crate) fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes} B")
     } else if bytes < 1024 * 1024 {

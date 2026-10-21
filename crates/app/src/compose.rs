@@ -282,6 +282,47 @@ impl Kite {
         cx.notify();
     }
 
+    /// A fresh draft addressed to `addr`, docked like `c` — the contact card's
+    /// "Email" action uses it, keeping the open conversation readable.
+    pub(crate) fn compose_address(
+        &mut self,
+        addr: Addr,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.compose.is_none() {
+            let account_id = self
+                .open
+                .as_ref()
+                .map(|open| open.account_id)
+                .or(self.view.account_id)
+                .or_else(|| self.accounts.first().map(|account| account.id))
+                .unwrap_or(0);
+            let signature = signature_block(&self.settings, account_id);
+            self.compose = Some(Compose::new(
+                window,
+                cx,
+                Parts {
+                    account_id,
+                    id: None,
+                    title: "New message",
+                    to: vec![addr],
+                    cc: Vec::new(),
+                    bcc: Vec::new(),
+                    subject: String::new(),
+                    body: signature.clone(),
+                    signature,
+                    reply_to: None,
+                    send_at: None,
+                    remind_at: None,
+                },
+            ));
+        }
+        self.compose_open = true;
+        self.focus_compose(window, cx, true);
+        cx.notify();
+    }
+
     pub(crate) fn compose_reply(
         &mut self,
         window: &mut Window,

@@ -15,8 +15,8 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::api::Mail;
 use kite_core::model::{
-    Account, Action as MailAction, AiRequest, Event, Folder, Id, Mailbox, Message, Settings,
-    ThreadSummary, View,
+    Account, Action as MailAction, AiRequest, ContactCard, Event, Folder, Id, Mailbox, Message,
+    Settings, ThreadSummary, View,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
@@ -160,6 +160,10 @@ pub struct Kite {
     pub(crate) sel: usize,
     pub(crate) multi: Vec<Id>,
     pub(crate) open: Option<Open>,
+    /// The correspondent card beside the open conversation, from a background `Mail::contact`.
+    pub(crate) contact: Option<Arc<ContactCard>>,
+    /// The (open thread, email) a card was last asked for; dedupes the background loads.
+    pub(crate) contact_for: Option<(Id, String)>,
     pub(crate) compose: Option<compose::Compose>,
     pub(crate) compose_open: bool,
     /// A draft picked in the Drafts mailbox, opened on the next render when a window exists.
@@ -290,6 +294,8 @@ impl Kite {
             sel: 0,
             multi: Vec::new(),
             open: None,
+            contact: None,
+            contact_for: None,
             compose: None,
             compose_open: false,
             open_draft: None,
@@ -363,7 +369,7 @@ impl Kite {
         // rendered again: without this a body keeps the frame it was laid out for.
         this.subs
             .push(cx.observe_window_bounds(window, |this, window, cx| {
-                let width = body_column(window);
+                let width = body_column(window, this.contact_shown(window));
                 if (width - this.html_width).abs() >= 1. || window.scale_factor() != this.html_scale
                 {
                     this.html_width = width;
@@ -439,7 +445,7 @@ impl Kite {
         cx.notify();
     }
 
-    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+    pub(crate) fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         let mut view = self.view.clone();
         view.query = if query.trim().is_empty() {
             None
@@ -465,6 +471,7 @@ impl Kite {
                     }
                     self.msgs.clear();
                 }
+                self.refresh_contact(true, cx);
                 cx.notify();
             }
             Event::Error(message) => {
@@ -677,6 +684,7 @@ impl Kite {
             messages,
         });
         self.thread_scroll = ScrollHandle::new();
+        self.refresh_contact(false, cx);
         if row.unread {
             if let Some(r) = self.rows.iter_mut().find(|r| r.id == row.id) {
                 r.unread = false;
@@ -1170,6 +1178,12 @@ impl Kite {
                 }
             }
             cmd::ZERO => self.show_zero(cx),
+            cmd::CONTACT_PANEL => {
+                let mut settings = self.settings.clone();
+                settings.contact_panel = !settings.contact_panel;
+                self.save_preferences(settings, window, cx);
+                self.refresh_contact(false, cx);
+            }
             _ => {}
         }
         match src {
@@ -1483,6 +1497,7 @@ impl Kite {
         });
         self.thread_scroll = ScrollHandle::new();
         self.prefetch(cx);
+        self.refresh_contact(false, cx);
         cx.notify();
     }
 
@@ -1936,6 +1951,28 @@ impl Kite {
                     })
                     .on_double_click(|_, window, _| window.titlebar_double_click())
                     .test_support(),
+            )
+            .child(
+                strip_chip(&t, STRIP_CHIP)
+                    .id("toggle-contact-panel")
+                    .test_support()
+                    .aria_label(format!(
+                        "Toggle contact panel, {}",
+                        keys::hint_for(&self.settings, cmd::CONTACT_PANEL)
+                    ))
+                    .aria_selected(self.settings.contact_panel)
+                    .text_color(if self.settings.contact_panel {
+                        t.fg
+                    } else {
+                        t.fg2
+                    })
+                    .when(self.settings.contact_panel, |d| {
+                        d.bg(Theme::alpha(t.fg, CHIP_HOVER))
+                    })
+                    .child(Icon::new(IconName::CircleUser).with_size(px(16.)))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run(cmd::CONTACT_PANEL, Src::Click, window, cx)
+                    })),
             )
             .child(
                 strip_chip(&t, STRIP_CHIP)
@@ -2480,10 +2517,16 @@ const CHIP_HOVER: f32 = 0.06;
 /// column's left edge rather than against the rail.
 const STRIP_PAD: f32 = 4.;
 
-/// The width a message body is rendered at: the reading pane's column, inside its own padding.
-fn body_column(window: &Window) -> f32 {
-    ((window.viewport_size().width.as_f32() - crate::sidebar::width(window)).min(MAX_COL)
-        - 2. * crate::thread::PANE_PAD)
+/// The width a message body is rendered at: the reading pane's column — minus the contact
+/// card when it is on screen — inside its own padding.
+fn body_column(window: &Window, contact: bool) -> f32 {
+    let aside = crate::sidebar::width(window)
+        + if contact {
+            crate::contact::CONTACT_W
+        } else {
+            0.
+        };
+    ((window.viewport_size().width.as_f32() - aside).min(MAX_COL) - 2. * crate::thread::PANE_PAD)
         .max(120.)
 }
 
@@ -2597,9 +2640,10 @@ impl Render for Kite {
         crate::sidebar::set_pane(pane);
         // The thread is laid out in the reading pane, not under the list; `html_width` is its
         // column inside the pane's padding, so a body renders at the width it is shown at.
-        self.html_width = body_column(window);
+        self.html_width = body_column(window, self.contact_shown(window));
         self.html_scale = window.scale_factor();
         let open = self.open.is_some();
+        let contact_panel = self.contact_panel(window, cx);
         let preferences_open = self.preferences.is_some();
         // A focused text field owns the keyboard. The list and thread keys are scoped to their
         // pane, so typing in the search box (which sits in the list column) must leave both.
@@ -2654,7 +2698,8 @@ impl Render for Kite {
                         .key_context(context)
                         .track_focus(&self.focus)
                         .child(self.render_list_column(window, cx))
-                        .child(self.render_pane(window, cx)),
+                        .child(self.render_pane(window, cx))
+                        .when_some(contact_panel, |d, panel| d.child(panel)),
                 )
                 .into_any_element()
         } else if open {
@@ -2672,11 +2717,11 @@ impl Render for Kite {
                         .min_w_0()
                         .min_h_0()
                         .flex()
-                        .flex_col()
                         .overflow_hidden()
                         .key_context(context)
                         .track_focus(&self.focus)
-                        .child(self.render_thread(window, cx)),
+                        .child(self.render_thread(window, cx))
+                        .when_some(contact_panel, |d, panel| d.child(panel)),
                 )
                 .into_any_element()
         } else {

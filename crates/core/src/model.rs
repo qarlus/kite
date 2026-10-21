@@ -194,6 +194,47 @@ pub struct Tag {
     pub position: i64,
 }
 
+/// What the contact sidebar knows about one correspondent. Everything comes from the local
+/// store: no network, no AI. Nothing in it carries body text, so a Private conversation can
+/// only leak a subject or a file name, the same as the list already shows.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContactCard {
+    pub name: String,
+    pub email: String,
+    pub domain: String,
+    /// First and latest message dates they took part in.
+    pub first: Ms,
+    pub latest: Ms,
+    /// Conversations they take part in.
+    pub conversations: u32,
+    /// Median time I take to answer them. `None` under three exchanges.
+    pub reply_median: Option<Ms>,
+    /// Whether they usually answer me. `None` when I never wrote them first.
+    pub replies_back: Option<bool>,
+    /// Their latest conversations, newest first; the open one is left out.
+    pub recent: Vec<ContactThread>,
+    /// Recent attachments on mail they took part in, newest first.
+    pub files: Vec<ContactFile>,
+}
+
+/// One row of the card's "Recent conversations".
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContactThread {
+    pub id: Id,
+    pub subject: String,
+    pub date: Ms,
+}
+
+/// One row of the card's "Shared files".
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ContactFile {
+    /// The conversation that holds the attachment; clicking opens it.
+    pub thread: Id,
+    pub name: String,
+    pub size: u64,
+    pub date: Ms,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CalEvent {
     pub id: String,
@@ -257,6 +298,8 @@ pub struct Settings {
     /// `true`: list and reading pane side by side. `false`: an opened conversation takes the
     /// full width (Superhuman style).
     pub reading_pane: bool,
+    /// `true`: an open conversation shows the correspondent card on its right (`i` toggles).
+    pub contact_panel: bool,
     /// Per-account profile (signature), keyed by account id. Display name is `Account.name`.
     pub profiles: std::collections::BTreeMap<Id, AccountProfile>,
     /// Text snippets inserted in compose. Absent in settings written before they existed.
@@ -289,6 +332,7 @@ impl Default for Settings {
             input_mode: "keyboard".into(),
             shortcuts: Default::default(),
             reading_pane: true,
+            contact_panel: true,
             profiles: Default::default(),
             snippets: Default::default(),
             shortcut_tips: true,

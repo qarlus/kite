@@ -1,6 +1,7 @@
 pub mod app;
 pub mod ask;
 pub mod compose;
+pub mod contact;
 pub mod folders;
 pub mod html;
 pub mod keys;

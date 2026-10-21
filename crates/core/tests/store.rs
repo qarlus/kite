@@ -14,6 +14,7 @@ const JAN1: Ms = 1_704_067_200_000;
 const JAN2: Ms = 1_704_153_600_000;
 const JAN3: Ms = 1_704_240_000_000;
 const JAN4: Ms = 1_704_326_400_000;
+const JAN5: Ms = 1_704_412_800_000;
 
 fn msg(remote_id: &str, from: &str, subject: &str, date: Ms) -> RemoteMsg {
     RemoteMsg {
@@ -2155,7 +2156,23 @@ fn perf_budgets() {
         "Waiting on 50k messages took {waiting:?}"
     );
     eprintln!("Waiting on 50k messages: {waiting:?}");
-    println!("perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?}");
+
+    let mut times = Vec::new();
+    for _ in 0..5 {
+        let t = Instant::now();
+        let card = s.contact("person7@example.com", None).unwrap();
+        times.push(t.elapsed());
+        assert!(card.is_some());
+    }
+    let contact = median(times);
+    assert!(
+        contact <= Duration::from_millis(20),
+        "contact card took {contact:?}"
+    );
+
+    println!(
+        "perf: insert 50k={insert:?} list={list:?} fts={fts:?} from+fts={fts_from:?} contact={contact:?}"
+    );
 }
 
 // The queries the budget test measures, on a tiny fixture so debug runs stay fast.
@@ -2181,6 +2198,150 @@ fn budget_queries_still_return_rows_in_debug() {
         .unwrap()
         .is_empty()
     );
+    let card = s.contact("person7@example.com", None).unwrap().unwrap();
+    assert!(card.conversations > 0);
+    assert!(!card.recent.is_empty());
+}
+
+// ------------------------------------------------------------------ contacts
+
+fn sent(mut m: RemoteMsg, to: &str) -> RemoteMsg {
+    m.mailbox = Mailbox::Sent;
+    m.folder = "Sent".into();
+    m.to = vec![Addr {
+        name: String::new(),
+        email: to.into(),
+    }];
+    m
+}
+
+#[test]
+fn the_contact_card_counts_dates_reply_habits_recent_mail_and_files() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let hour = 3_600_000;
+    // The open conversation: two exchanges with Bob, and the newest mail of all.
+    let open = vec![
+        up(msg("b1", "bob@corp.com", "Open thread", JAN5)),
+        up(sent(
+            replying_to(msg("m1", "me@x.com", "Re: Open thread", JAN5 + hour), "b1"),
+            "bob@corp.com",
+        )),
+        up(replying_to(
+            msg("b2", "bob@corp.com", "Re: Open thread", JAN5 + 2 * hour),
+            "m1",
+        )),
+        up(sent(
+            replying_to(
+                msg("m2", "me@x.com", "Re: Open thread", JAN5 + 4 * hour),
+                "b2",
+            ),
+            "bob@corp.com",
+        )),
+        up(replying_to(
+            msg("b3", "bob@corp.com", "Re: Open thread", JAN5 + 6 * hour),
+            "m2",
+        )),
+    ];
+    // Bob's replies reference what they answer, so the five messages are one conversation
+    // and the reply stats see real exchanges.
+    s.apply_deltas(a.id, &open).unwrap();
+    // A second conversation adds the third exchange the reply median needs, and
+    // Bob answering my last message keeps "they usually reply" true.
+    let second = vec![
+        up(msg("b9", "bob@corp.com", "Second thread", JAN3)),
+        up(sent(
+            replying_to(
+                msg("m3", "me@x.com", "Re: Second thread", JAN3 + 3 * hour),
+                "b9",
+            ),
+            "bob@corp.com",
+        )),
+        up(replying_to(
+            msg("b10", "bob@corp.com", "Re: Second thread", JAN3 + 4 * hour),
+            "m3",
+        )),
+    ];
+    s.apply_deltas(a.id, &second).unwrap();
+    // Five more of Bob's conversations fill the recent list past the open one.
+    let mut rest = Vec::new();
+    for i in 0..5 {
+        let mut m = msg(
+            &format!("b2{i}"),
+            "bob@corp.com",
+            &format!("Other {i}"),
+            JAN4 + i as i64 * hour,
+        );
+        if i == 4 {
+            m = with_attachment(m, "contract.pdf");
+        }
+        rest.push(up(m));
+    }
+    s.apply_deltas(a.id, &rest).unwrap();
+    // An unrelated conversation never counts.
+    s.apply_deltas(a.id, &[up(msg("x1", "eve@else.io", "Elsewhere", JAN4))])
+        .unwrap();
+
+    let open_id = thread_id(&s, "Open thread");
+    let card = s.contact("bob@corp.com", Some(open_id)).unwrap().unwrap();
+    assert_eq!(card.email, "bob@corp.com");
+    assert_eq!(card.domain, "corp.com");
+    assert_eq!(card.name, "bob", "the contact name sync maintains");
+    assert_eq!(card.first, JAN3, "first mail they took part in");
+    assert_eq!(card.latest, JAN5 + 6 * hour);
+    assert_eq!(card.conversations, 7, "every thread Bob touches, once each");
+    // My three answers: 1 h, 2 h and 3 h after his -> the median is 2 h.
+    assert_eq!(card.reply_median, Some(2 * hour));
+    assert_eq!(
+        card.replies_back,
+        Some(true),
+        "he answered all three of mine"
+    );
+    // The open conversation is out; the five other Bob threads fill the list.
+    assert_eq!(card.recent.len(), 5);
+    assert!(!card.recent.iter().any(|t| t.id == open_id));
+    assert!(
+        card.recent.windows(2).all(|w| w[0].date >= w[1].date),
+        "recent stays newest-first: {:?}",
+        card.recent
+    );
+    assert_eq!(card.files.len(), 1);
+    assert_eq!(card.files[0].name, "contract.pdf");
+    assert_eq!(
+        thread_id(&s, "Other 4"),
+        card.files[0].thread,
+        "a file points at the conversation holding it"
+    );
+
+    // The same card without the exclusion lists the open one first: it is newest.
+    let all = s.contact("Bob@Corp.com", None).unwrap().unwrap();
+    assert_eq!(all.recent.len(), 5);
+    assert_eq!(all.recent[0].id, open_id);
+
+    // Two exchanges only: no median without a third data point.
+    let s2 = Store::memory().unwrap();
+    let a2 = s2.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    s2.apply_deltas(
+        a2.id,
+        &[
+            up(msg("c1", "cid@corp.com", "Hi", JAN1)),
+            up(sent(
+                replying_to(msg("c2", "me@x.com", "Re: Hi", JAN1 + hour), "c1"),
+                "cid@corp.com",
+            )),
+        ],
+    )
+    .unwrap();
+    let few = s2.contact("cid@corp.com", None).unwrap().unwrap();
+    assert_eq!(few.reply_median, None, "two data points stay silent");
+    assert_eq!(
+        few.replies_back,
+        Some(false),
+        "my message is still unanswered"
+    );
+
+    assert!(s.contact("nobody@nowhere.net", None).unwrap().is_none());
+    assert!(s.contact("", None).unwrap().is_none());
 }
 
 // ------------------------------------------------------------------- drafts
