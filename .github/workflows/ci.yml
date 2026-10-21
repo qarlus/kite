@@ -26,6 +26,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { shared-key: test }
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Tests turn on gpui-kit's test-support; this catches app code that only builds with it.
+      - run: cargo check -p kite
       - run: cargo test --workspace
   # No budgets job: timing budgets are noisy on shared runners, so they are checked locally before
   # merging (AGENTS.md › Commands), and release.yml refuses any exe over the 24 MiB size budget.

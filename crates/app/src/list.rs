@@ -426,7 +426,11 @@ impl Kite {
             .children(kinds.into_iter().map(|(kind, name)| {
                 let selected = self.att_kind == kind && self.att_from.is_none();
                 let all = kind == AttachmentKind::All;
-                att_chip(t, format!("att-chip-{}", slug(name)), name, selected).on_click(
+                att_chip(
+                    t,
+                    format!("att-chip-{}", slug(name)),
+                    name,
+                    selected,
                     cx.listener(move |this, _, _, cx| {
                         this.set_attachment_filter(kind, if all { None } else { this.att_from }, cx)
                     }),
@@ -437,7 +441,11 @@ impl Kite {
                     .into_iter()
                     .map(|(mine, name)| {
                         let selected = self.att_from == Some(mine);
-                        att_chip(t, format!("att-chip-{}", slug(name)), name, selected).on_click(
+                        att_chip(
+                            t,
+                            format!("att-chip-{}", slug(name)),
+                            name,
+                            selected,
                             cx.listener(move |this, _, _, cx| {
                                 this.set_attachment_filter(
                                     this.att_kind,
@@ -461,7 +469,8 @@ fn att_chip(
     id: String,
     name: &'static str,
     selected: bool,
-) -> gpui_kit::base::test_support::Observed<Stateful<Div>> {
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
     div()
         .id(ElementId::Name(id.into()))
         .test_support()
@@ -475,6 +484,7 @@ fn att_chip(
         .text_color(if selected { t.fg } else { t.fg2 })
         .bg(if selected { t.sel } else { t.bg2 })
         .hover(|s| s.bg(t.bg3))
+        .on_click(on_click)
         .child(name)
 }
 
