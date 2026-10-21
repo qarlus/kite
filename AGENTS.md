@@ -26,9 +26,11 @@ Kite is a keyboard-first, fully native desktop email client in the spirit of Sup
 5. **Stay in your lane.** Only edit the files your task owns (see `docs/ARCHITECTURE.md#ownership`). If a contract change is needed (`model.rs`, `api.rs`, `sync/mod.rs`), make the smallest change and call it out in your report.
 
 ## Budgets (enforced)
+Timing budgets are checked locally before every merge (shared CI runners are too noisy for them).
+
 | Budget | Limit | Where |
 |---|---|---|
-| Release binary (Windows exe) | ≤ 24 MB | `crates/app/tests/budget.rs` (CI, release) |
+| Release binary (Windows exe) | ≤ 24 MB | `crates/app/tests/budget.rs`, and `release.yml` on every release |
 | Inbox first frame, 10k threads | ≤ 50 ms | UI test, release |
 | `j`/`k` → selection repainted | ≤ 4 ms per frame | UI test, release |
 | Blitz render, typical email | ≤ 15 ms | `crates/app/tests/html.rs`, release |
