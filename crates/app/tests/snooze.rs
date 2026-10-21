@@ -90,3 +90,57 @@ fn arrow_keys_move_the_preset_selection(cx: &mut TestAppContext) {
         other => panic!("expected a snooze, got {other:?}"),
     }
 }
+
+#[gpui_kit::test]
+fn clicking_a_preset_snoozes(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "h");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click(("preset", 1usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("snooze").is_none(), "the picker closes");
+    })
+    .unwrap();
+    let tomorrow = parse_at("tomorrow 8am", Local::now())
+        .expect("parses")
+        .timestamp_millis();
+    match fixture.last_action() {
+        Some((ids, Action::Snooze { until })) => {
+            assert_eq!(ids, vec![1]);
+            assert!((until - tomorrow).abs() < 5_000);
+        }
+        other => panic!("expected a snooze, got {other:?}"),
+    }
+}
+
+#[gpui_kit::test]
+fn send_later_button_then_a_clicked_preset_schedules_the_send(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("compose-to", cx);
+        window.input("jane@example.com", cx);
+        window.click("compose-send-later", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("snooze").label(), Some("Send later"));
+        window.click(("preset", 0usize), cx);
+        window.render_frame(cx);
+        assert!(window.try_find("snooze").is_none(), "the picker closes");
+        assert!(
+            window.try_find("compose").is_none(),
+            "compose closes once scheduled"
+        );
+    })
+    .unwrap();
+    let sent = fixture.drafts();
+    assert_eq!(sent.len(), 1);
+    let delta = sent[0].send_at.expect("scheduled") - Local::now().timestamp_millis();
+    assert!(
+        (Duration::hours(3).num_milliseconds() - delta).abs() < 5_000,
+        "later today is about three hours away, got {delta} ms"
+    );
+}

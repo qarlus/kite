@@ -185,7 +185,7 @@ fn clock(text: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyElement {
+pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
     let Overlay::Snooze(snooze) = &kite.overlay else {
         return div().into_any_element();
@@ -195,10 +195,16 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
     } else {
         parse_at(&snooze.buf, snooze.now)
     };
+    // The same picker schedules a send when opened from compose.
+    let (title, verb) = if kite.send_later {
+        ("Send later", "Send")
+    } else {
+        ("Snooze", "Snooze until")
+    };
     let mut panel = div()
         .id("snooze")
         .test_support()
-        .aria_label("Snooze")
+        .aria_label(title)
         .w(px(340.))
         .rounded(px(RADIUS))
         .bg(t.bg2)
@@ -239,6 +245,17 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .px_3()
                 .rounded(px(RADIUS_SM))
                 .text_size(t.px(13.))
+                .cursor_pointer()
+                .hover(|d| d.bg(t.bg3))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let at = match &this.overlay {
+                        Overlay::Snooze(snooze) => snooze.confirm_preset(ix),
+                        _ => None,
+                    };
+                    if let Some(at) = at {
+                        this.confirm_snooze(at, window, cx);
+                    }
+                }))
                 .when(selected, |d| d.bg(t.sel))
                 .when(selected, |d| d.child(crate::list::selection_edge(&t)))
                 .child(*name)
@@ -257,7 +274,7 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .py_1()
                 .text_size(t.px(12.))
                 .text_color(t.fg3)
-                .child(format!("Snooze until {}", label(when.timestamp_millis()))),
+                .child(format!("{verb} {}", label(when.timestamp_millis()))),
         );
     }
     overlay(&t, window.viewport_size().height * 0.3, false, panel).into_any_element()
