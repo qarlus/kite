@@ -19,16 +19,17 @@ const MIN_PANE: f32 = 400.;
 
 impl Kite {
     /// The person the card is about: the sender of the latest message not from me, else
-    /// the first To recipient when the conversation is all mine.
+    /// the first To recipient when the conversation is all mine. "Me" is only the account
+    /// that holds the conversation: mail from my other accounts gets their card.
     pub(crate) fn correspondent(&self) -> Option<Addr> {
         let open = self.open.as_ref()?;
-        let mine = |a: &Addr| {
-            a.email.is_empty()
-                || self
-                    .accounts
-                    .iter()
-                    .any(|me| me.email.eq_ignore_ascii_case(&a.email))
-        };
+        let me = self
+            .accounts
+            .iter()
+            .find(|account| account.id == open.account_id)
+            .map(|account| account.email.as_str())
+            .unwrap_or_default();
+        let mine = |a: &Addr| a.email.is_empty() || a.email.eq_ignore_ascii_case(me);
         if let Some(addr) = open
             .messages
             .iter()
