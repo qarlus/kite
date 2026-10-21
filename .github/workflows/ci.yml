@@ -27,18 +27,5 @@ jobs:
         with: { shared-key: test }
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
-  # Budgets need optimised code. The shipped exe is built once with the real release profile for
-  # the size budget; the timing budgets run under `perf` (thin LTO, parallel codegen), which is
-  # several times faster to build than linking every test binary with fat LTO.
-  budgets:
-    # Release builds are slow (fat LTO); PRs get lint and tests, main gets the budgets.
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with: { shared-key: budgets }
-      - run: cargo build --release -p kite
-      - run: cargo test --profile perf -p kite --test perf --test html --test budget
-      - run: cargo test --profile perf -p kite-core --test store
+  # No budgets job: timing budgets are noisy on shared runners, so they are checked locally before
+  # merging (AGENTS.md › Commands), and release.yml refuses any exe over the 24 MiB size budget.
