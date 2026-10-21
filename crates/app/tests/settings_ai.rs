@@ -338,6 +338,64 @@ fn choosing_the_openrouter_preset_sets_the_url_and_refetches(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn the_ollama_preset_sets_the_url_and_marks_local_models(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("ai-provider-local", cx);
+        window.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        fixture.settings.lock().unwrap().ai_base_url,
+        "http://localhost:11434/v1",
+        "the preset writes Ollama's endpoint"
+    );
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("ai-provider-local").selected(), Some(true));
+        assert_eq!(
+            window.find("ai-key").label(),
+            Some("AI API key (optional)"),
+            "a local endpoint needs no key"
+        );
+        assert_eq!(window.find(("ai-model", 0usize)).label(), Some("Kite Test"));
+        assert!(
+            window.try_find(("ai-local-badge", 0usize)).is_some(),
+            "local models say they run on this computer"
+        );
+    })
+    .unwrap();
+    // A remote preset keeps the zero-retention badge instead.
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click("ai-provider-openrouter", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("ai-key").label(), Some("AI API key"));
+        assert!(window.try_find(("ai-local-badge", 0usize)).is_none());
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+fn the_triage_switch_saves_ai_triage(cx: &mut TestAppContext) {
+    let fixture = ai_on_with(models(), "kite-test");
+    let (window, _) = mount(cx, fixture.clone());
+    open_ai(window, cx);
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(window.find("ai-triage").checked(), Some(false));
+        window.click("ai-triage", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("ai-triage").checked(), Some(true));
+    })
+    .unwrap();
+    assert!(fixture.settings.lock().unwrap().ai_triage);
+}
+
+#[gpui_kit::test]
 fn a_failed_fetch_shows_the_reason_and_retry_asks_again(cx: &mut TestAppContext) {
     let fixture = ai_on_with(models(), "kite-test");
     *fixture.ai_models_error.lock().unwrap() = Some("endpoint refused".into());

@@ -14,7 +14,7 @@ use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
-use kite_core::model::{Addr, Id, Message};
+use kite_core::model::{Addr, Id, Message, PRIVATE_TAG};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -620,6 +620,102 @@ impl Kite {
             .into_any_element()
     }
 
+    /// Whether the open conversation carries the Private tag, which bars AI helpers.
+    fn open_is_private(&self) -> bool {
+        self.open.as_ref().is_some_and(|open| {
+            self.rows
+                .iter()
+                .find(|row| row.id == open.id)
+                .is_some_and(|row| {
+                    row.labels
+                        .iter()
+                        .any(|tag| tag.eq_ignore_ascii_case(PRIVATE_TAG))
+                })
+        })
+    }
+
+    /// "Suggest replies" or the three chips it streamed: numbered lines the engine
+    /// emits in the conversation's own words, each one a reply starter.
+    fn suggestions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let open_id = self.open.as_ref().map(|open| open.id).unwrap_or(0);
+        let in_flight = match &self.ai {
+            Some(ai) if matches!(ai.target, crate::app::AiFor::Replies(id) if id == open_id) => {
+                Some((suggested(&ai.text), ai.done))
+            }
+            _ => None,
+        };
+        match in_flight {
+            None => div()
+                .id("suggest-replies")
+                .test_support()
+                .aria_label("Suggest replies")
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .h(px(28.))
+                .px_3()
+                .rounded(px(RADIUS_SM))
+                .cursor_pointer()
+                .text_color(t.fg2)
+                .hover(|s| s.bg(t.bg3).text_color(t.fg))
+                .child(
+                    Icon::new(IconName::Sparkles)
+                        .with_size(px(13.))
+                        .text_color(t.fg2),
+                )
+                .child(div().text_size(t.px(12.)).child("Suggest replies"))
+                .on_click(cx.listener(|this, _, _, cx| this.suggest_replies(cx)))
+                .into_any_element(),
+            Some((items, done)) => {
+                let mut row = div()
+                    .id("suggestions")
+                    .test_support()
+                    .aria_label("Reply suggestions")
+                    .flex()
+                    .flex_wrap()
+                    .gap_2();
+                if items.is_empty() && !done {
+                    // Three quiet placeholders while the stream warms up.
+                    for ix in 0..3usize {
+                        row = row.child(
+                            div()
+                                .id(("suggestion-skeleton", ix))
+                                .test_support()
+                                .aria_label("Loading suggestion")
+                                .w(px(160.))
+                                .h(px(32.))
+                                .rounded(px(RADIUS_SM))
+                                .bg(t.bg3),
+                        );
+                    }
+                }
+                for (ix, text) in items.into_iter().enumerate() {
+                    row = row.child(
+                        div()
+                            .id(("suggestion", ix))
+                            .test_support()
+                            .aria_label(text.clone())
+                            .max_w(px(560.))
+                            .px_3()
+                            .py_1p5()
+                            .rounded(px(RADIUS_SM))
+                            .border_1()
+                            .border_color(t.line)
+                            .cursor_pointer()
+                            .text_size(t.px(13.))
+                            .hover(|s| s.bg(t.bg3))
+                            .child(text.clone())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.reply_with_suggestion(text.clone(), window, cx)
+                            })),
+                    );
+                }
+                row.into_any_element()
+            }
+        }
+    }
+
     /// "Remote images are blocked" plus the way to load them for this message only.
     fn image_notice(&self, id: Id, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
@@ -1052,6 +1148,11 @@ impl Kite {
                         cx,
                     )),
             );
+            // AI reply suggestions sit below the reply row, quiet until asked for.
+            // Private conversations never offer them.
+            if self.settings.ai_enabled && !self.open_is_private() {
+                tail = tail.child(self.suggestions(cx));
+            }
         }
         if holds_tail {
             column = column.child(tail);
@@ -1235,6 +1336,20 @@ impl Kite {
     }
 }
 
+/// The engine streams replies as numbered lines ("1. …"); the list is what the chips offer.
+fn suggested(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let (number, rest) = line.split_once(['.', ')'])?;
+            number.trim().parse::<u32>().ok()?;
+            let rest = rest.trim();
+            (!rest.is_empty()).then(|| rest.to_string())
+        })
+        .take(3)
+        .collect()
+}
+
 /// A reply-shaped outline button: the same verb the toolbar offers, where the reader is looking.
 fn reply_button(
     t: &Theme,
@@ -1264,7 +1379,11 @@ fn reply_button(
                 .font_weight(FontWeight(500.))
                 .child(label.to_string()),
         )
-        .on_click(cx.listener(move |this, _, window, cx| this.run(cmd, window, cx)))
+        .on_click(
+            cx.listener(move |this, _, window, cx| {
+                this.run(cmd, crate::app::Src::Click, window, cx)
+            }),
+        )
         .into_any_element()
 }
 

@@ -235,6 +235,7 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 pub(crate) struct Inner {
     reader: Mutex<Store>,
+    triaging: Mutex<HashMap<Id, Vec<Id>>>,
     send_gate: tokio::sync::Mutex<()>,
     writer: Mutex<Store>,
     senders: Mutex<Vec<Sender<Event>>>,
@@ -335,6 +336,7 @@ impl Engine {
         let (wake, wake_rx) = async_channel::unbounded();
         let inner = Arc::new(Inner {
             reader: Mutex::new(reader),
+            triaging: Mutex::new(HashMap::new()),
             send_gate: tokio::sync::Mutex::new(()),
             writer: Mutex::new(writer),
             senders: Mutex::new(Vec::new()),
@@ -449,7 +451,7 @@ async fn run(weak: Weak<Inner>, wake: Receiver<bool>) {
 }
 
 async fn tick(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     backends: &mut HashMap<Id, Backend>,
     backoff: &mut HashMap<Id, (u32, Ms, bool)>,
     next_sync: &mut HashMap<Id, Ms>,
@@ -524,7 +526,7 @@ async fn tick(
 /// Drains queued ops, then syncs until backfill is exhausted. Synced batches are announced as they
 /// land; the return value says whether drained ops changed the store (announced by the tick).
 async fn sync_account(
-    inner: &Inner,
+    inner: &Arc<Inner>,
     account: &Account,
     backends: &mut HashMap<Id, Backend>,
     sync: bool,
@@ -559,6 +561,7 @@ async fn sync_account(
     if !sync {
         return Ok(changed);
     }
+    let arrival = inner.read(Store::ai_arrival_watermark)?;
     let mut cursor = inner.write(|s| s.cursor(account.id))?;
     for _ in 0..SYNC_STEPS {
         let backend = backend_mut(backends, account.id)?;
@@ -593,6 +596,10 @@ async fn sync_account(
         }
     }
 
+    if let Err(error) = start_triage(inner, account.id, arrival) {
+        inner.log_error(&format!("AI triage: {error:#}"));
+    }
+
     // Proton's custom labels are folders and exist before Kite ever created one, so the
     // sidebar catalog is refreshed from the API (cached after the first call).
     let backend = backend_mut(backends, account.id)?;
@@ -605,6 +612,85 @@ async fn sync_account(
         changed |= fetch_photo(inner, account.id, client).await;
     }
     Ok(changed)
+}
+
+fn start_triage(inner: &Arc<Inner>, account: Id, after: Id) -> Result<()> {
+    let settings = inner.read(Store::settings)?;
+    if !settings.ai_enabled || !settings.ai_triage {
+        return Ok(());
+    }
+    let threads = inner.read(|s| s.ai_triage_candidates(account, after))?;
+    if threads.is_empty() {
+        return Ok(());
+    }
+    let mut running = lock(&inner.triaging);
+    if let Some(pending) = running.get_mut(&account) {
+        for thread in threads {
+            if !pending.contains(&thread) {
+                pending.push(thread);
+            }
+        }
+        return Ok(());
+    }
+    running.insert(account, threads);
+    let worker = inner.clone();
+    if let Err(error) = std::thread::Builder::new()
+        .name("kite-triage".into())
+        .spawn(move || {
+            loop {
+                let thread = {
+                    let mut pending = lock(&worker.triaging);
+                    let next = pending.get_mut(&account).and_then(|threads| {
+                        if threads.is_empty() {
+                            None
+                        } else {
+                            Some(threads.remove(0))
+                        }
+                    });
+                    let Some(thread) = next else {
+                        pending.remove(&account);
+                        break;
+                    };
+                    thread
+                };
+                let result = (|| -> Result<()> {
+                    let settings = worker.read(Store::settings)?;
+                    if !settings.ai_enabled || !settings.ai_triage {
+                        return Ok(());
+                    }
+                    crate::ai::validate(&settings, worker.opts.ai_provider_host.as_deref())?;
+                    let messages = worker.write(|s| {
+                        if !s.claim_ai_triage(thread)? {
+                            return Ok(None);
+                        }
+                        crate::ai::triage_prompt(s, thread).map(Some)
+                    })?;
+                    let Some(messages) = messages else {
+                        return Ok(());
+                    };
+                    let key = worker.secrets.get("ai_key")?.unwrap_or_default();
+                    let session = crate::ai::session(&AiRequest::Summary { thread });
+                    let label = run_async(crate::ai::classify(
+                        &settings,
+                        worker.opts.ai_provider_host.as_deref(),
+                        &key,
+                        &session,
+                        messages,
+                    ))?;
+                    worker.write(|s| s.apply_ai_triage(thread, label.trim()))?;
+                    worker.emit(Event::Changed(vec![account]));
+                    Ok(())
+                })();
+                if let Err(error) = result {
+                    worker.log_error(&format!("AI triage: {error:#}"));
+                }
+            }
+        })
+    {
+        running.remove(&account);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// `GET /me/photo/$value`, at most once a day per account (tracked in the store, so a
@@ -1344,6 +1430,11 @@ impl Mail for Engine {
         Ok(())
     }
 
+    fn archivable(&self, view: &View, before: Ms, include_starred: bool) -> Result<Vec<Id>> {
+        self.inner
+            .read(|s| s.archivable(view, before, include_starred))
+    }
+
     fn send(&self, draft: Draft) -> Result<Id> {
         anyhow::ensure!(
             draft
@@ -1566,11 +1657,8 @@ impl Mail for Engine {
         }
         self.inner
             .read(|store| crate::ai::prepare(store, &request).map(|_| ()))?;
-        let key = self
-            .inner
-            .secrets
-            .get("ai_key")?
-            .context("no AI key configured")?;
+        crate::ai::validate(&settings, self.inner.opts.ai_provider_host.as_deref())?;
+        let key = self.inner.secrets.get("ai_key")?.unwrap_or_default();
         let inner = self.inner.clone();
         let session = crate::ai::session(&request);
         std::thread::Builder::new()
@@ -1579,14 +1667,17 @@ impl Mail for Engine {
                 // Recheck after queueing: the user may have marked the source Private.
                 let result = inner
                     .read(|store| crate::ai::prepare(store, &request))
-                    .and_then(|messages| {
+                    .and_then(|mut prepared| {
+                        if let Some(threads) = prepared.sources.take() {
+                            inner.emit(Event::AiSources { req, threads });
+                        }
                         crate::ai::stream(
                             &settings,
                             inner.opts.ai_provider_host.as_deref(),
                             &key,
                             req,
                             &session,
-                            messages,
+                            prepared,
                             &inner,
                         )
                     });

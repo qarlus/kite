@@ -11,22 +11,31 @@ use kite_core::model::{AiModel, Settings};
 
 const OPENCODE_URL: &str = "https://opencode.ai/zen/go/v1";
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+/// Ollama's OpenAI-compatible endpoint; LM Studio listens on port 1234 instead.
+const LOCAL_URL: &str = "http://localhost:11434/v1";
 
 /// The AI endpoint presets. `Custom` keeps today's free-form base URL field.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Provider {
     Opencode,
     Openrouter,
+    Local,
     Custom,
 }
 
 impl Provider {
-    const ALL: [Provider; 3] = [Provider::Opencode, Provider::Openrouter, Provider::Custom];
+    const ALL: [Provider; 4] = [
+        Provider::Opencode,
+        Provider::Openrouter,
+        Provider::Local,
+        Provider::Custom,
+    ];
 
     fn url(self) -> Option<&'static str> {
         match self {
             Provider::Opencode => Some(OPENCODE_URL),
             Provider::Openrouter => Some(OPENROUTER_URL),
+            Provider::Local => Some(LOCAL_URL),
             Provider::Custom => None,
         }
     }
@@ -35,6 +44,7 @@ impl Provider {
         match self {
             Provider::Opencode => "OpenCode Go",
             Provider::Openrouter => "OpenRouter",
+            Provider::Local => "On this computer (Ollama)",
             Provider::Custom => "Custom",
         }
     }
@@ -43,6 +53,7 @@ impl Provider {
         match self {
             Provider::Opencode => "ai-provider-opencode",
             Provider::Openrouter => "ai-provider-openrouter",
+            Provider::Local => "ai-provider-local",
             Provider::Custom => "ai-provider-custom",
         }
     }
@@ -251,6 +262,7 @@ fn model_row(
     ix: usize,
     model: &AiModel,
     active: bool,
+    local: bool,
     weak: &WeakEntity<Kite>,
 ) -> AnyElement {
     let id = model.id.clone();
@@ -278,7 +290,15 @@ fn model_row(
                         .gap_2()
                         .child(div().text_size(t.px(13.)).child(name.clone()))
                         .when(model.free, |d| d.child(badge(t, "Free")))
-                        .when(model.zdr, |d| d.child(badge(t, "Zero retention"))),
+                        .when(model.zdr && local, |d| {
+                            d.child(
+                                badge(t, "Runs locally")
+                                    .id(("ai-local-badge", ix))
+                                    .test_support()
+                                    .aria_label("Runs locally"),
+                            )
+                        })
+                        .when(model.zdr && !local, |d| d.child(badge(t, "Zero retention"))),
                 )
                 .child(
                     div()
@@ -385,7 +405,12 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
             .flex()
             .flex_col()
             .gap_3()
-            .child(row(t, "Provider", "Free, zero-retention endpoints.", chips))
+            .child(row(
+                t,
+                "Provider",
+                "Free, zero-retention endpoints. “On this computer” expects Ollama, or LM Studio on port 1234.",
+                chips,
+            ))
             .into_any_element();
 
         let mut details = div().flex().flex_col().gap_3();
@@ -400,10 +425,19 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
         }
         details = details.child(field(
             t,
-            "API key",
+            // A local endpoint answers without one; remote presets still want a key.
+            if provider == Provider::Local {
+                "API key (optional)"
+            } else {
+                "API key"
+            },
             Input::new(&page.ai.key)
                 .id("ai-key")
-                .aria_label("AI API key"),
+                .aria_label(if provider == Provider::Local {
+                    "AI API key (optional)"
+                } else {
+                    "AI API key"
+                }),
         ));
 
         if provider == Provider::Custom {
@@ -496,7 +530,14 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                     }
                     for (ix, model) in models.iter().enumerate() {
                         let active = model.id == kite.settings.ai_model;
-                        details = details.child(model_row(t, ix, model, active, &cx.weak_entity()));
+                        details = details.child(model_row(
+                            t,
+                            ix,
+                            model,
+                            active,
+                            provider == Provider::Local,
+                            &cx.weak_entity(),
+                        ));
                     }
                 }
             }
@@ -533,6 +574,25 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
             )
             .into_any_element();
         rows.push(content);
+        let weak = cx.weak_entity();
+        let triage = Switch::new("ai-triage")
+            .checked(kite.settings.ai_triage)
+            .accessibility_label("Auto-triage new mail")
+            .on_click(move |checked, window, cx| {
+                let checked = *checked;
+                weak.update(cx, |kite, cx| {
+                    let mut settings = kite.settings.clone();
+                    settings.ai_triage = checked;
+                    kite.save_preferences(settings, window, cx);
+                })
+                .ok();
+            });
+        rows.push(row(
+            t,
+            "Auto-triage new mail",
+            "Tags newly arrived inbox mail as Needs reply, FYI, Receipts, Newsletters or Notifications. Private conversations are never sent.",
+            triage,
+        ));
     }
 
     div()

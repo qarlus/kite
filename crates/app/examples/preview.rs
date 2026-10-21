@@ -64,41 +64,41 @@ fn main() {
                     cx.new(|cx| {
                         let mut view = kite::app::Kite::new(mail, window, cx);
                         if settings {
-                            view.run(kite::keys::cmd::SETTINGS, window, cx);
+                            view.run(kite::keys::cmd::SETTINGS, kite::app::Src::Key, window, cx);
                         }
                         if accounts {
-                            view.run(kite::keys::cmd::MANAGE_ACCOUNTS, window, cx);
+                            view.run(kite::keys::cmd::MANAGE_ACCOUNTS, kite::app::Src::Key, window, cx);
                         }
                         if switcher {
-                            view.run(kite::keys::cmd::ACCOUNT_SWITCHER, window, cx);
+                            view.run(kite::keys::cmd::ACCOUNT_SWITCHER, kite::app::Src::Key, window, cx);
                         }
                         if spam {
-                            view.run(kite::keys::cmd::GO + 7, window, cx);
+                            view.run(kite::keys::cmd::GO + 7, kite::app::Src::Key, window, cx);
                         }
                         if thread {
-                            view.run(kite::keys::cmd::OPEN, window, cx);
+                            view.run(kite::keys::cmd::OPEN, kite::app::Src::Key, window, cx);
                         }
                         if create {
-                            view.run(kite::keys::cmd::CREATE_FOLDER, window, cx);
+                            view.run(kite::keys::cmd::CREATE_FOLDER, kite::app::Src::Key, window, cx);
                         }
                         if move_mail {
-                            view.run(kite::keys::cmd::MOVE, window, cx);
+                            view.run(kite::keys::cmd::MOVE, kite::app::Src::Key, window, cx);
                         }
                         if palette {
-                            view.run(kite::keys::cmd::PALETTE, window, cx);
+                            view.run(kite::keys::cmd::PALETTE, kite::app::Src::Key, window, cx);
                         }
                         if focus_search {
-                            view.run(kite::keys::cmd::SEARCH, window, cx);
+                            view.run(kite::keys::cmd::SEARCH, kite::app::Src::Key, window, cx);
                         }
                         if roundtrip {
-                            view.run(kite::keys::cmd::GO + 1, window, cx);
-                            view.run(kite::keys::cmd::GO, window, cx);
+                            view.run(kite::keys::cmd::GO + 1, kite::app::Src::Key, window, cx);
+                            view.run(kite::keys::cmd::GO, kite::app::Src::Key, window, cx);
                         }
                         for _ in 0..split.unwrap_or(0) {
-                            view.run(kite::keys::cmd::NEXT_SPLIT, window, cx);
+                            view.run(kite::keys::cmd::NEXT_SPLIT, kite::app::Src::Key, window, cx);
                         }
                         if done {
-                            view.run(kite::keys::cmd::DONE, window, cx);
+                            view.run(kite::keys::cmd::DONE, kite::app::Src::Key, window, cx);
                         }
                         view
                     })

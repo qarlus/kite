@@ -1,10 +1,11 @@
 //! Shortcuts: every command with the keys bound right now, and a way to change them.
-use super::{button, card_dense, heading};
+use super::{button, card, card_dense, heading, row as pref_row};
 use crate::app::Kite;
 use crate::keys::{self, Cmd, Group};
 use crate::list::keys_pills;
 use crate::theme::{RADIUS_SM, Theme};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 
@@ -18,6 +19,18 @@ pub struct State {
 
 pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
+    let weak = cx.weak_entity();
+    let tips = Switch::new("shortcut-tips")
+        .checked(kite.settings.shortcut_tips)
+        .accessibility_label("Show shortcut tips")
+        .on_click(move |checked, window, cx| {
+            let checked = *checked;
+            let _ = weak.update(cx, |this, cx| {
+                let mut settings = this.settings.clone();
+                settings.shortcut_tips = checked;
+                this.save_preferences(settings, window, cx);
+            });
+        });
     let mut blocks = vec![
         div()
             .flex()
@@ -44,6 +57,16 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                 )),
             )
             .into_any_element(),
+        card(
+            t,
+            vec![pref_row(
+                t,
+                "Show shortcut tips",
+                "Clicking an action that has a key names the key in a quiet toast.",
+                tips,
+            )],
+        )
+        .into_any_element(),
     ];
     if let Some(conflict) = kite
         .preferences
