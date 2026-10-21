@@ -1,7 +1,7 @@
 //! The AI request as an OpenAI-compatible endpoint receives it, against a local fake.
 #[path = "common/temp_dir.rs"]
 mod temp_dir;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::sync::Mutex;
@@ -121,14 +121,25 @@ type CapturedRequests = Vec<(Vec<String>, String)>;
 fn fake(
     responses: Vec<(&'static str, u16, String)>,
 ) -> (String, std::thread::JoinHandle<CapturedRequests>) {
+    fake_matching(
+        responses
+            .into_iter()
+            .map(|(path, status, response)| (path, None, status, response))
+            .collect(),
+    )
+}
+
+/// Consume each expected request once, routing completions by prompt when paths coincide.
+fn fake_matching(
+    mut responses: Vec<(&'static str, Option<&'static str>, u16, String)>,
+) -> (String, std::thread::JoinHandle<CapturedRequests>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let response_base = base.clone();
     let worker = std::thread::spawn(move || {
         let mut requests = Vec::new();
-        for (path, status, response) in responses {
-            let response = response.replace("__FAKE_BASE__", &response_base);
+        while !responses.is_empty() {
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
             let mut stream = loop {
                 match listener.accept() {
@@ -136,7 +147,7 @@ fn fake(
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         assert!(
                             std::time::Instant::now() < deadline,
-                            "no request for {path}"
+                            "missing requests: {responses:?}"
                         );
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -158,7 +169,6 @@ fn fake(
                 }
                 headers.push(line.trim_end().to_ascii_lowercase());
             }
-            assert_eq!(headers[0].split_whitespace().nth(1), Some(path));
             let length = headers
                 .iter()
                 .find_map(|h| h.strip_prefix("content-length: "))
@@ -166,7 +176,19 @@ fn fake(
                 .unwrap_or(0);
             let mut body = vec![0; length];
             reader.read_exact(&mut body).unwrap();
-            requests.push((headers, String::from_utf8(body).unwrap()));
+            let body = String::from_utf8(body).unwrap();
+            let path = headers[0].split_whitespace().nth(1).unwrap();
+            let index = responses
+                .iter()
+                .position(|(expected_path, prompt, _, _)| {
+                    path == *expected_path && prompt.is_none_or(|text| body.contains(text))
+                })
+                .unwrap_or_else(|| {
+                    panic!("unexpected request: {headers:?} {body}; remaining: {responses:?}")
+                });
+            let (_, _, status, response) = responses.remove(index);
+            let response = response.replace("__FAKE_BASE__", &response_base);
+            requests.push((headers, body));
             write!(stream, "HTTP/1.1 {status} Fake\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response}", response.len()).unwrap();
         }
         requests
@@ -716,7 +738,7 @@ fn triage_after_sync_tags_new_inbox_excludes_private_and_marked_and_ignores_inva
             "Fresh invalid mail",
             "Unclassifiable.",
             None,
-            "2026-10-21T11:00:00Z",
+            "2026-10-21T13:00:00Z",
         ),
         graph_message(
             "private-reply",
@@ -746,22 +768,27 @@ fn triage_after_sync_tags_new_inbox_excludes_private_and_marked_and_ignores_inva
         (path, 200, serde_json::json!({"value": if *folder == "inbox" { arrivals.clone() } else { vec![] }, "@odata.deltaLink":format!("__FAKE_BASE__/{folder}")}).to_string())
     }).chain(std::iter::once(("/me/photo/$value", 404, "{}".into()))).collect();
     let (graph, graph_worker) = fake(responses);
-    let mut cursor = serde_json::Map::new();
+    // Graph serializes a BTreeMap. Match that order even when the app enables
+    // serde_json/preserve_order, or a byte-different cursor triggers a second sync.
+    let mut cursor = BTreeMap::<String, String>::new();
     cursor.insert("__kite_schema".into(), "2".into());
     for folder in folders {
-        cursor.insert(folder.into(), format!("{graph}/{folder}").into());
+        cursor.insert(folder.into(), format!("{graph}/{folder}"));
     }
     store
-        .set_cursor(account.id, &serde_json::Value::Object(cursor).to_string())
+        .set_cursor(account.id, &serde_json::to_string(&cursor).unwrap())
         .unwrap();
-    let (base, worker) = fake(vec![
+    // The newer invalid mail is triaged first, opposite this response list.
+    let (base, worker) = fake_matching(vec![
         (
             "/chat/completions",
+            Some("Please confirm lunch"),
             200,
             serde_json::json!({"choices":[{"message":{"content":"Needs reply"}}]}).to_string(),
         ),
         (
             "/chat/completions",
+            Some("Unclassifiable"),
             200,
             serde_json::json!({"choices":[{"message":{"content":"Not a valid label"}}]})
                 .to_string(),
@@ -797,8 +824,16 @@ fn triage_after_sync_tags_new_inbox_excludes_private_and_marked_and_ignores_inva
     let requests = worker.join().unwrap();
     graph_worker.join().unwrap();
     assert_eq!(requests.len(), 2);
-    assert!(requests[0].1.contains("Please confirm lunch"));
-    assert!(requests[1].1.contains("Unclassifiable"));
+    assert!(
+        requests
+            .iter()
+            .any(|(_, body)| body.contains("Please confirm lunch"))
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|(_, body)| body.contains("Unclassifiable"))
+    );
     for (_, body) in &requests {
         assert!(!body.contains("PRIVATE TRIAGE"));
         assert!(!body.contains("ALREADY TRIAGED"));
