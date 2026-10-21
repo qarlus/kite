@@ -52,10 +52,12 @@ cargo test --workspace --release       # perf budgets are only asserted in relea
 cargo build --release -p kite          # target/release/kite(.exe)
 # Faster perf-budget loop (thin LTO); confirm with --release before merging:
 cargo test --profile perf -p kite --test perf --test html && cargo test --profile perf -p kite-core --test store
+pwsh scripts/staging.ps1               # Windows: run this checkout against a copy of your real Kite data
 ```
 The first build compiles GPUI and Stylo (~3–5 min). After that, builds are incremental. `.cargo/config.toml` uses `rust-lld` on Windows for fast links.
 
 ## Definition of done (every task)
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass with no new warnings.
 - No `unwrap()`/`expect()` on user or network data in non-test code (use `?` and `anyhow`).
+- Anything a user can see is tried in staging (`scripts/staging.ps1`) against real Proton and Outlook mail before the PR, including mail between your own accounts. Fixtures only cover what we thought of.
 - Commit on your branch with a clear message. Report: what you did, which files you touched, any contract changes, and any new dependency with its justification.

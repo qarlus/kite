@@ -155,3 +155,37 @@ async fn a_narrow_window_hides_the_panel(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+async fn mail_from_my_other_account_shows_that_account(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(3);
+    fixture
+        .accounts
+        .lock()
+        .unwrap()
+        .push(kite_core::model::Account {
+            id: 2,
+            provider: kite_core::model::Provider::Microsoft,
+            email: "karl@work.example".into(),
+            name: "Karl".into(),
+        });
+    fixture.set_message_from(
+        1,
+        Addr {
+            name: "Karl at work".into(),
+            email: "karl@work.example".into(),
+        },
+    );
+    let (window, _) = mount(cx, fixture);
+    cx.simulate_keystrokes(window.into(), "enter");
+    card_up(window, cx).await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert_eq!(
+            window.find("contact-name").label(),
+            Some("Karl at work"),
+            "only the account holding the conversation counts as me"
+        );
+    })
+    .unwrap();
+}
