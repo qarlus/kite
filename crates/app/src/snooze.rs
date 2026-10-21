@@ -1,8 +1,12 @@
-//! Snooze picker: four presets and a tiny natural-language parser.
+//! Snooze picker: presets, a tiny natural-language field and a calendar panel.
 use crate::app::{Kite, Overlay};
-use crate::list::overlay;
+use crate::list::overlay_dismissable;
 use crate::theme::{RADIUS, RADIUS_SM};
 use chrono::{DateTime, Datelike as _, Duration, Local, NaiveTime, TimeZone as _, Timelike as _};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::calendar::{Calendar, CalendarState, Matcher};
+use gpui_kit::component::time_field::{TimeField, TimeFieldState};
+use gpui_kit::component::{Icon, Sizable, Size};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
 use kite_core::model::Ms;
@@ -10,10 +14,19 @@ use kite_core::model::Ms;
 pub struct Snooze {
     /// What has been typed when it does not match a preset.
     pub buf: String,
+    /// Selection across the presets plus the trailing "Pick date & time" row.
     pub sel: usize,
     /// When the picker was opened. Presets and parsing are relative to this.
     pub now: DateTime<Local>,
     pub presets: Vec<(&'static str, Ms)>,
+    /// The calendar + time sub-panel; `Some` while it is open.
+    pub custom: Option<Custom>,
+}
+
+/// The calendar + time sub-panel's focusable states.
+pub struct Custom {
+    pub calendar: Entity<CalendarState>,
+    pub time: Entity<TimeFieldState>,
 }
 
 impl Snooze {
@@ -49,7 +62,54 @@ impl Snooze {
             sel: 0,
             now,
             presets,
+            custom: None,
         }
+    }
+
+    /// The trailing row's index: one past the last preset.
+    pub fn custom_row(&self) -> usize {
+        self.presets.len()
+    }
+
+    /// Opens the calendar sub-panel, defaulting to the next whole hour.
+    /// Past days are disabled in the calendar; past times fail `custom_check`.
+    pub fn open_custom(&mut self, window: &mut Window, cx: &mut App) {
+        let today = self.now.date_naive();
+        let next = self.now + Duration::hours(1);
+        let calendar = cx.new(|cx| {
+            CalendarState::new(window, cx)
+                .disabled_matcher(Matcher::custom(move |date| *date < today))
+        });
+        calendar.update(cx, |state, cx| {
+            state.set_date(next.date_naive(), window, cx)
+        });
+        let time = cx.new(|cx| TimeFieldState::new(window, cx));
+        time.update(cx, |state, cx| {
+            state.set_time(
+                NaiveTime::from_hms_opt(next.hour(), 0, 0).unwrap_or_default(),
+                window,
+                cx,
+            )
+        });
+        let focus = time.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+        self.custom = Some(Custom { calendar, time });
+    }
+
+    /// `Ok(ms)` when the sub-panel holds a complete future time, else why not.
+    pub fn custom_check(&self, cx: &App) -> Result<Ms, &'static str> {
+        let Some(custom) = &self.custom else {
+            return Err("Pick a day and a time");
+        };
+        let Some(date) = custom.calendar.read(cx).date().start() else {
+            return Err("Pick a day");
+        };
+        let time = custom.time.read(cx).time();
+        let when = at(date, time.hour(), time.minute());
+        if when <= Local::now() {
+            return Err("That time has already passed");
+        }
+        Ok(when.timestamp_millis())
     }
 
     /// The time Enter confirms: the typed expression, else the selected preset.
@@ -77,10 +137,7 @@ impl Snooze {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        if self.presets.is_empty() {
-            return;
-        }
-        let last = self.presets.len() - 1;
+        let last = self.custom_row();
         self.sel = (self.sel as isize + delta).clamp(0, last as isize) as usize;
     }
 }
@@ -185,7 +242,7 @@ fn clock(text: &str) -> Option<(u32, u32)> {
     Some((hour, minute))
 }
 
-pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyElement {
+pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElement {
     let t = kite.theme;
     let Overlay::Snooze(snooze) = &kite.overlay else {
         return div().into_any_element();
@@ -195,10 +252,16 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
     } else {
         parse_at(&snooze.buf, snooze.now)
     };
+    // The same picker schedules a send when opened from compose.
+    let (title, verb) = if kite.send_later {
+        ("Send later", "Send")
+    } else {
+        ("Snooze", "Snooze until")
+    };
     let mut panel = div()
         .id("snooze")
         .test_support()
-        .aria_label("Snooze")
+        .aria_label(title)
         .w(px(340.))
         .rounded(px(RADIUS))
         .bg(t.bg2)
@@ -210,26 +273,76 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
         .gap_1()
         .child(
             div()
+                .id("snooze-input")
+                .test_support()
+                .aria_label("Type a time")
                 .flex()
                 .items_center()
                 .gap_2()
                 .h(px(36.))
                 .px_3()
+                .rounded(px(RADIUS_SM))
+                .border_1()
+                .border_color(t.line)
                 .text_size(t.px(14.))
+                .child(
+                    // The caret marks this as a text field even before typing.
+                    div().flex_none().w(px(1.)).h(px(16.)).bg(t.accent),
+                )
                 .text_color(if snooze.buf.is_empty() { t.fg3 } else { t.fg })
                 .child(if snooze.buf.is_empty() {
-                    "Later today, tomorrow 9am, fri 14:00…".to_string()
+                    "Type a time: 30m, 2h, tomorrow 9am, fri 14:00".to_string()
                 } else {
                     snooze.buf.clone()
                 }),
         );
-    for (ix, (name, ms)) in snooze.presets.iter().enumerate() {
-        let selected = snooze.buf.trim().is_empty() && ix == snooze.sel;
+    if snooze.custom.is_some() {
+        panel = panel.child(custom_panel(kite, snooze, cx));
+    } else {
+        for (ix, (name, ms)) in snooze.presets.iter().enumerate() {
+            let selected = snooze.buf.trim().is_empty() && ix == snooze.sel;
+            panel = panel.child(
+                div()
+                    .id(("preset", ix))
+                    .test_support()
+                    .aria_label(name.to_string())
+                    .aria_selected(selected)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .relative()
+                    .h(px(32.))
+                    .px_3()
+                    .rounded(px(RADIUS_SM))
+                    .text_size(t.px(13.))
+                    .cursor_pointer()
+                    .hover(|d| d.bg(t.bg3))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        let at = match &this.overlay {
+                            Overlay::Snooze(snooze) => snooze.confirm_preset(ix),
+                            _ => None,
+                        };
+                        if let Some(at) = at {
+                            this.confirm_snooze(at, window, cx);
+                        }
+                    }))
+                    .when(selected, |d| d.bg(t.sel))
+                    .when(selected, |d| d.child(crate::list::selection_edge(&t)))
+                    .child(*name)
+                    .child(
+                        div()
+                            .text_size(t.px(12.))
+                            .text_color(t.fg3)
+                            .child(label(*ms)),
+                    ),
+            );
+        }
+        let selected = snooze.buf.trim().is_empty() && snooze.sel == snooze.custom_row();
         panel = panel.child(
             div()
-                .id(("preset", ix))
+                .id("snooze-custom")
                 .test_support()
-                .aria_label(name.to_string())
+                .aria_label("Pick date and time")
                 .aria_selected(selected)
                 .flex()
                 .items_center()
@@ -239,28 +352,140 @@ pub fn render(kite: &Kite, window: &Window, _cx: &mut Context<Kite>) -> AnyEleme
                 .px_3()
                 .rounded(px(RADIUS_SM))
                 .text_size(t.px(13.))
+                .cursor_pointer()
+                .hover(|d| d.bg(t.bg3))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Overlay::Snooze(snooze) = &mut this.overlay {
+                        snooze.open_custom(window, cx);
+                    }
+                    cx.notify();
+                }))
                 .when(selected, |d| d.bg(t.sel))
                 .when(selected, |d| d.child(crate::list::selection_edge(&t)))
-                .child(*name)
+                .child("Pick date & time…")
                 .child(
-                    div()
-                        .text_size(t.px(12.))
-                        .text_color(t.fg3)
-                        .child(label(*ms)),
+                    Icon::new(IconName::Calendar)
+                        .with_size(px(14.))
+                        .text_color(t.fg3),
                 ),
         );
+        if !snooze.buf.trim().is_empty() {
+            panel = panel.child(match parsed {
+                Some(when) => {
+                    let ms = when.timestamp_millis();
+                    div()
+                        .id("snooze-parsed")
+                        .test_support()
+                        .aria_label(format!("{verb} {}", label(ms)))
+                        .flex()
+                        .items_center()
+                        .h(px(28.))
+                        .px_3()
+                        .rounded(px(RADIUS_SM))
+                        .text_size(t.px(12.))
+                        .text_color(t.fg3)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(t.bg3))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.confirm_snooze(ms, window, cx);
+                        }))
+                        .child(format!("{verb} {}", label(ms)))
+                }
+                None => div()
+                    .id("snooze-hint")
+                    .test_support()
+                    .flex()
+                    .items_center()
+                    .h(px(28.))
+                    .px_3()
+                    .text_size(t.px(12.))
+                    .text_color(t.fg3)
+                    .child("Couldn't read that time".to_string()),
+            });
+        }
     }
-    if let Some(when) = parsed {
-        panel = panel.child(
+    overlay_dismissable(
+        &t,
+        window.viewport_size().height * 0.3,
+        false,
+        panel,
+        cx.listener(|this, _, _, cx| this.close_overlay(cx)),
+    )
+    .into_any_element()
+}
+
+/// The calendar + time sub-panel. Confirming needs a complete future time;
+/// the button stays disabled with the reason next to it.
+fn custom_panel(kite: &Kite, snooze: &Snooze, cx: &mut Context<Kite>) -> impl IntoElement {
+    let t = kite.theme;
+    let Some(custom) = &snooze.custom else {
+        return div().into_any_element();
+    };
+    let check = snooze.custom_check(cx);
+    let confirm = check.ok();
+    let action = if kite.send_later {
+        "Schedule send"
+    } else {
+        "Snooze"
+    };
+    let mut confirm_row = div()
+        .id("snooze-confirm")
+        .test_support()
+        .aria_label(action)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(px(30.))
+        .px_3()
+        .rounded(px(RADIUS_SM))
+        .text_size(t.px(13.));
+    if let Some(at) = confirm {
+        confirm_row = confirm_row
+            .bg(t.accent)
+            .text_color(rgb(0xffffff))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.confirm_snooze(at, window, cx);
+            }));
+    } else {
+        confirm_row = confirm_row.bg(t.bg3).text_color(t.fg3);
+    }
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
             div()
-                .px_3()
-                .py_1()
-                .text_size(t.px(12.))
-                .text_color(t.fg3)
-                .child(format!("Snooze until {}", label(when.timestamp_millis()))),
-        );
-    }
-    overlay(&t, window.viewport_size().height * 0.3, false, panel).into_any_element()
+                .id("snooze-calendar")
+                .test_support()
+                .aria_label("Calendar")
+                .child(
+                    Calendar::new(&custom.calendar)
+                        .with_size(Size::Small)
+                        .w_full(),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .px_1()
+                .child(TimeField::new(&custom.time).with_size(Size::Small))
+                .when_some(check.err(), |d, reason| {
+                    d.child(
+                        div()
+                            .id("snooze-custom-error")
+                            .test_support()
+                            .text_size(t.px(12.))
+                            .text_color(t.fg3)
+                            .child(reason),
+                    )
+                }),
+        )
+        .child(div().flex().justify_end().pt_1().child(confirm_row))
+        .into_any_element()
 }
 
 fn label(ms: Ms) -> String {

@@ -903,6 +903,30 @@ pub fn overlay(
     centered: bool,
     panel: impl IntoElement,
 ) -> impl IntoElement {
+    overlay_impl(t, offset, centered, panel, None)
+}
+
+/// Like [`overlay`], but a click on the dimmed backdrop runs `on_backdrop`
+/// (clicks inside the panel never reach it).
+pub fn overlay_dismissable(
+    t: &Theme,
+    offset: Pixels,
+    centered: bool,
+    panel: impl IntoElement,
+    on_backdrop: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    overlay_impl(t, offset, centered, panel, Some(Box::new(on_backdrop)))
+}
+
+type BackdropClick = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
+
+fn overlay_impl(
+    t: &Theme,
+    offset: Pixels,
+    centered: bool,
+    panel: impl IntoElement,
+    on_backdrop: Option<BackdropClick>,
+) -> impl IntoElement {
     // DESIGN › Motion: overlays fade in and rise 4px over 100 ms (skipped under reduced motion).
     let panel = div()
         .with_animation(
@@ -911,7 +935,7 @@ pub fn overlay(
             |panel, delta| panel.relative().top(px(4. * (1. - delta))).opacity(delta),
         )
         .child(panel);
-    div()
+    let mut backdrop = div()
         .id("overlay")
         .occlude()
         .test_support()
@@ -922,8 +946,25 @@ pub fn overlay(
         .items_center()
         .when(centered, |d| d.justify_center())
         .when(!centered, |d| d.pt(offset))
-        .bg(Theme::alpha(t.bg, 0.72))
-        .child(panel)
+        .bg(Theme::alpha(t.bg, 0.72));
+    if on_backdrop.is_some() {
+        // Swallow clicks landing on the panel so only backdrop clicks dismiss.
+        backdrop = backdrop
+            .child(
+                div()
+                    .id("overlay-panel")
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(panel),
+            )
+            .on_click(move |event, window, cx| {
+                if let Some(on_backdrop) = &on_backdrop {
+                    on_backdrop(event, window, cx);
+                }
+            });
+    } else {
+        backdrop = backdrop.child(panel);
+    }
+    backdrop
 }
 
 /// The accent edge that marks the selected row, wherever rows are selected.
