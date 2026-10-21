@@ -52,6 +52,7 @@ pub mod cmd {
     pub const ASK: u8 = 65;
     /// Not in the command table: reply suggestions are a click-only helper.
     pub const SUGGEST: u8 = 66;
+    pub const CONTACT_PANEL: u8 = 67;
 }
 
 /// The section a command is listed under in the palette, the cheat sheet and Settings.
@@ -560,6 +561,14 @@ pub static COMMANDS: &[Cmd] = &[
         "Kite",
         Group::App,
         cmd::ASK,
+    ),
+    c(
+        "contact_panel",
+        "Toggle contact panel",
+        &["i"],
+        "Kite",
+        Group::App,
+        cmd::CONTACT_PANEL,
     ),
     // Palette-only: there is no default key, so the cheat sheet never lists it.
     c(

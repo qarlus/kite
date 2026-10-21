@@ -3102,6 +3102,176 @@ impl Store {
         })?;
         Ok(it.collect::<rusqlite::Result<Vec<_>>>()?)
     }
+
+    /// Everything the contact sidebar shows about `email`, from local mail only. `exclude`
+    /// keeps the open conversation out of the recent list. `None` when no message involves
+    /// them. Every lookup here rides the `people_email`/`people_msg` indexes and primary
+    /// keys, so the card stays cheap even over a large mailbox.
+    pub fn contact(&self, email: &str, exclude: Option<Id>) -> Result<Option<ContactCard>> {
+        let email = email.trim().to_ascii_lowercase();
+        if email.is_empty() {
+            return Ok(None);
+        }
+        let stats = self.conn.query_row(
+            "SELECT MIN(m.date), MAX(m.date), COUNT(DISTINCT m.thread_id)
+             FROM messages m JOIN message_people p ON p.message_id=m.id WHERE p.email=?1",
+            [&email],
+            |r| {
+                Ok((
+                    r.get::<_, Option<Ms>>(0)?,
+                    r.get::<_, Option<Ms>>(1)?,
+                    r.get::<_, u32>(2)?,
+                ))
+            },
+        )?;
+        let (Some(first), Some(latest)) = (stats.0, stats.1) else {
+            return Ok(None);
+        };
+        // Identity: the contacts row sync maintains, else the newest name mail carried.
+        let identity = self
+            .conn
+            .query_row(
+                "SELECT name, domain FROM contacts WHERE email=?1",
+                [&email],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        let (name, domain) = match identity {
+            Some((name, domain)) if !name.is_empty() => (name, domain),
+            _ => (
+                self.conn
+                    .query_row(
+                        "SELECT name FROM message_people WHERE email=?1 AND name<>''
+                         ORDER BY message_id DESC LIMIT 1",
+                        [&email],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| display_name("", &email)),
+                email_domain(&email),
+            ),
+        };
+        let mut card = ContactCard {
+            name,
+            email: email.clone(),
+            domain,
+            first,
+            latest,
+            conversations: stats.2,
+            reply_median: None,
+            replies_back: None,
+            recent: Vec::new(),
+            files: Vec::new(),
+        };
+        // The timeline of every conversation they take part in: each row is one message,
+        // `theirs` = from them, `mine` = from any of my accounts.
+        let rows: Vec<(Id, Ms, bool, bool)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT m.thread_id, m.date, m.from_self,
+                    EXISTS(SELECT 1 FROM message_people q
+                           WHERE q.message_id=m.id AND q.email=?1 AND q.kind='from')
+                 FROM messages m
+                 WHERE m.thread_id IN (
+                    SELECT DISTINCT m2.thread_id FROM messages m2
+                    JOIN message_people p ON p.message_id=m2.id WHERE p.email=?1)
+                 ORDER BY m.thread_id, m.date",
+            )?;
+            statement
+                .query_map([&email], |r| {
+                    Ok((
+                        r.get::<_, Id>(0)?,
+                        r.get::<_, Ms>(1)?,
+                        r.get::<_, bool>(2)?,
+                        r.get::<_, bool>(3)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let mut deltas: Vec<Ms> = Vec::new();
+        let mut asked = 0usize;
+        let mut answered = 0usize;
+        let mut start = 0;
+        while start < rows.len() {
+            let mut end = start;
+            while end < rows.len() && rows[end].0 == rows[start].0 {
+                end += 1;
+            }
+            let thread = &rows[start..end];
+            // My reply time: the gap from their message to my next one.
+            let mut theirs_at: Option<Ms> = None;
+            for &(_, date, mine, theirs) in thread {
+                if theirs {
+                    theirs_at = Some(date);
+                } else if mine && let Some(at) = theirs_at.take() {
+                    deltas.push((date - at).max(0));
+                }
+            }
+            // Their reply rate: each of my messages counts as answered when one of
+            // theirs lands after it in the same conversation.
+            for (ix, &(_, _, mine, _)) in thread.iter().enumerate() {
+                if !mine {
+                    continue;
+                }
+                asked += 1;
+                if thread[ix + 1..].iter().any(|m| m.3) {
+                    answered += 1;
+                }
+            }
+            start = end;
+        }
+        if deltas.len() >= 3 {
+            deltas.sort();
+            card.reply_median = Some(deltas[deltas.len() / 2]);
+        }
+        if asked > 0 {
+            card.replies_back = Some(answered * 2 >= asked);
+        }
+        // Recent conversations: the newest threads they take part in, minus the open one.
+        {
+            let mut statement = self.conn.prepare(
+                "SELECT m.thread_id, MAX(m.date) AS d FROM messages m
+                 JOIN message_people p ON p.message_id=m.id WHERE p.email=?1
+                 GROUP BY m.thread_id ORDER BY d DESC LIMIT 6",
+            )?;
+            let ids = statement
+                .query_map([&email], |r| r.get::<_, Id>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut lookup = self
+                .conn
+                .prepare("SELECT subject, date FROM threads WHERE id=?1")?;
+            for id in ids {
+                if Some(id) == exclude || card.recent.len() == 5 {
+                    continue;
+                }
+                if let Some((subject, date)) = lookup
+                    .query_row([id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Ms>(1)?)))
+                    .optional()?
+                {
+                    card.recent.push(ContactThread { id, subject, date });
+                }
+            }
+        }
+        card.files = {
+            let mut statement = self.conn.prepare(
+                "SELECT a.name, a.size, m.date, m.thread_id FROM attachments a
+                 JOIN messages m ON a.message_id=m.id
+                 WHERE EXISTS(SELECT 1 FROM message_people p
+                              WHERE p.message_id=m.id AND p.email=?1)
+                 ORDER BY m.date DESC LIMIT 5",
+            )?;
+            statement
+                .query_map([&email], |r| {
+                    Ok(ContactFile {
+                        thread: r.get(3)?,
+                        name: r.get(0)?,
+                        size: r.get::<_, i64>(1)? as u64,
+                        date: r.get(2)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok(Some(card))
+    }
 }
 
 // ----------------------------------------------------------------- searching

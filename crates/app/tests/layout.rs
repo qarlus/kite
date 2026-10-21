@@ -274,12 +274,20 @@ fn the_strip_icon_buttons_are_chips_on_one_flat_strip(cx: &mut TestAppContext) {
         assert_eq!(cog.center().y, strip.center().y);
         assert_eq!(toggle.center().y, strip.center().y);
         // The strip's segments meet edge to edge, so one fill shows behind every control.
+        let contact = window.find("toggle-contact-panel").bounds();
+        assert_eq!(contact.size, cog.size, "the contact toggle shares the chip");
+        assert_eq!(contact.center().y, strip.center().y);
         let drag = window.find("window-drag").bounds();
         assert_eq!(drag.size.height, strip.size.height);
         assert_eq!(
             drag.right(),
+            contact.origin.x,
+            "the drag area hands over to the contact toggle"
+        );
+        assert_eq!(
+            contact.right(),
             cog.origin.x,
-            "the drag area hands over to the cog"
+            "and the contact toggle hands over to the cog"
         );
         if cfg!(target_os = "windows") {
             let controls = window.find("window-controls").bounds();

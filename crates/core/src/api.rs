@@ -89,6 +89,12 @@ pub trait Mail: Send + Sync + 'static {
         anyhow::bail!("Drafts are not available")
     }
     fn contacts(&self, query: &str) -> Result<Vec<Addr>>;
+    /// The contact sidebar's card about one correspondent. Local reads only, a few ms;
+    /// `exclude` keeps the open conversation out of the recent list. `None` when the
+    /// address is unknown.
+    fn contact(&self, _email: &str, _exclude: Option<Id>) -> Result<Option<ContactCard>> {
+        Ok(None)
+    }
     fn open_attachment(&self, id: Id) -> Result<()>;
     /// One remote image for HTML mail, fetched only when the reader allowed remote images for
     /// that message. Blocking; call it on the background executor.
