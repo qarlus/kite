@@ -767,7 +767,7 @@ impl Kite {
         self.set_query(String::new(), cx);
     }
 
-    fn close_overlay(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn close_overlay(&mut self, cx: &mut Context<Self>) {
         self.overlay = Overlay::None;
         self.send_later = false;
         cx.notify();
@@ -1220,47 +1220,70 @@ impl Kite {
                 }
             }
             Overlay::Snooze(snooze) => {
-                let handled = match key {
-                    "escape" => {
-                        self.close_overlay(cx);
-                        true
-                    }
-                    "enter" => {
-                        if let Some(at) = snooze.pick() {
-                            self.confirm_snooze(at, window, cx);
+                // While the calendar sub-panel is open, keys belong to its
+                // focused inputs; only Escape and Enter stay with the picker.
+                let handled = if snooze.custom.is_some() {
+                    match key {
+                        "escape" => {
+                            snooze.custom = None;
+                            window.focus(&self.focus, cx);
+                            true
                         }
-                        true
-                    }
-                    "up" => {
-                        snooze.move_selection(-1);
-                        true
-                    }
-                    "down" => {
-                        snooze.move_selection(1);
-                        true
-                    }
-                    "backspace" => {
-                        snooze.backspace();
-                        true
-                    }
-                    "space" => {
-                        snooze.push(' ');
-                        true
-                    }
-                    _ => match typed {
-                        Some(c @ '1'..='4') if snooze.buf.is_empty() => {
-                            let ix = c as usize - '1' as usize;
-                            if let Some(at) = snooze.confirm_preset(ix) {
+                        "enter" => {
+                            if let Ok(at) = snooze.custom_check(cx) {
                                 self.confirm_snooze(at, window, cx);
                             }
                             true
                         }
-                        Some(c) => {
-                            snooze.push(c);
+                        _ => false,
+                    }
+                } else {
+                    match key {
+                        "escape" => {
+                            self.close_overlay(cx);
                             true
                         }
-                        None => false,
-                    },
+                        "enter" => {
+                            if snooze.buf.trim().is_empty() && snooze.sel == snooze.custom_row() {
+                                snooze.open_custom(window, cx);
+                            } else if let Some(at) = snooze.pick() {
+                                self.confirm_snooze(at, window, cx);
+                            }
+                            true
+                        }
+                        "up" => {
+                            snooze.move_selection(-1);
+                            true
+                        }
+                        "down" => {
+                            snooze.move_selection(1);
+                            true
+                        }
+                        "backspace" => {
+                            snooze.backspace();
+                            true
+                        }
+                        "space" => {
+                            snooze.push(' ');
+                            true
+                        }
+                        _ => match typed {
+                            Some(c @ '1'..='5') if snooze.buf.is_empty() => {
+                                let ix = c as usize - '1' as usize;
+                                if ix == snooze.custom_row() {
+                                    snooze.open_custom(window, cx);
+                                } else if let Some(at) = snooze.confirm_preset(ix) {
+                                    self.confirm_snooze(at, window, cx);
+                                }
+                                true
+                            }
+                            Some(c) => {
+                                snooze.push(c);
+                                true
+                            }
+                            None => false,
+                        },
+                    }
                 };
                 if handled {
                     cx.notify();
