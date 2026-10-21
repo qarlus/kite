@@ -560,23 +560,25 @@ fn drafts_and_sent_mail_land_in_their_mailboxes() {
     let account = sign_in(&engine, &login);
     engine.sync_now();
 
-    let sent_threads = eventually(|| {
+    // All mail (including Sent) lands before the separate Drafts backfill batch.
+    let (sent_threads, drafts) = eventually(|| {
         engine.sync_now();
-        let threads = engine
+        let sent_threads = engine
             .threads(&mailbox(account.id, Mailbox::Sent), 0, 10)
             .ok()?;
-        (!threads.is_empty()).then_some(threads)
+        let drafts = engine
+            .threads(&mailbox(account.id, Mailbox::Drafts), 0, 10)
+            .ok()?;
+        (!sent_threads.is_empty() && !drafts.is_empty()).then_some((sent_threads, drafts))
     });
     assert_eq!(sent_threads[0].subject, "Already sent");
-    let drafts = engine
-        .threads(&mailbox(account.id, Mailbox::Drafts), 0, 10)
-        .expect("drafts");
     assert_eq!(
         drafts.len(),
         1,
         "a Proton draft is shown in Drafts: {:?}",
         drafts.iter().map(|t| &t.subject).collect::<Vec<_>>()
     );
+    assert_eq!(drafts[0].subject, "Half written");
 }
 
 #[test]
