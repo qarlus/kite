@@ -385,7 +385,14 @@ impl Render for Sidebar {
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.parent
-                                .update(cx, |kite, cx| kite.run(crate::keys::cmd::HELP, window, cx))
+                                .update(cx, |kite, cx| {
+                                    kite.run(
+                                        crate::keys::cmd::HELP,
+                                        crate::app::Src::Click,
+                                        window,
+                                        cx,
+                                    )
+                                })
                                 .ok();
                         })),
                     )

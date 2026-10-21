@@ -2689,7 +2689,7 @@ fn v6_loose_conversations_are_rethreaded_once_without_losing_local_data() {
         connection
             .query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
             .unwrap(),
-        9
+        10
     );
     assert!(
         !connection
@@ -2780,4 +2780,63 @@ fn the_private_tag_cannot_be_deleted_or_renamed_but_leaves_a_thread() {
     )
     .unwrap();
     assert!(labels_of(&s, tid).is_empty());
+}
+
+#[test]
+fn triage_tags_are_searchable_removable_and_split_renames_follow_tag_alias() {
+    let s = Store::memory().unwrap();
+    let account = s
+        .add_account(Provider::Proton, "me@example.com", "Me")
+        .unwrap();
+    s.apply_deltas(
+        account.id,
+        &[up(msg("triage", "alice@example.com", "Lunch", JAN1))],
+    )
+    .unwrap();
+    let thread = s.threads(&view(Mailbox::Inbox), 0, 10).unwrap()[0].id;
+    assert!(s.claim_ai_triage(thread).unwrap());
+    s.apply_ai_triage(thread, "Needs reply").unwrap();
+    assert_eq!(
+        s.threads(&search(Mailbox::Inbox, "tag:\"needs REPLY\""), 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(
+        s.threads(&search(Mailbox::Inbox, "-tag:\"Needs reply\""), 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    s.set_splits(vec![Split {
+        id: 0,
+        name: "Reply queue".into(),
+        query: "tag:\"Needs reply\"".into(),
+    }])
+    .unwrap();
+    let mut tags = s.tags().unwrap();
+    tags.iter_mut()
+        .find(|t| t.name == "Needs reply")
+        .unwrap()
+        .name = "To answer".into();
+    s.set_tags(tags).unwrap();
+    assert_eq!(s.splits().unwrap()[0].query, "tag:\"To answer\"");
+    assert_eq!(
+        s.threads(&search(Mailbox::Inbox, "tag:\"To answer\""), 0, 10)
+            .unwrap()
+            .len(),
+        1
+    );
+    s.act(
+        &[thread],
+        &Action::Unlabel {
+            tag: "To answer".into(),
+        },
+    )
+    .unwrap();
+    assert!(
+        s.threads(&search(Mailbox::Inbox, "tag:\"To answer\""), 0, 10)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!s.claim_ai_triage(thread).unwrap());
 }

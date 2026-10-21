@@ -165,6 +165,7 @@ impl Kite {
     pub(crate) fn activate_tag_item(
         &mut self,
         index: usize,
+        src: crate::app::Src,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -194,7 +195,7 @@ impl Kite {
                 let cmd = *cmd;
                 let ids = menu.ids.clone();
                 self.overlay = Overlay::None;
-                self.run_tag_action(ids, cmd, window, cx);
+                self.run_tag_action(ids, cmd, src, window, cx);
             }
         }
     }
@@ -204,6 +205,7 @@ impl Kite {
         &mut self,
         ids: Vec<Id>,
         cmd: u8,
+        src: crate::app::Src,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -219,10 +221,10 @@ impl Kite {
             // Folder discovery uses the open preview's account. Hide it only while building
             // the picker so the captured selection supplies its account; retain the preview.
             let preview = self.open.take();
-            self.run(cmd, window, cx);
+            self.run(cmd, src, window, cx);
             self.open = preview;
         } else {
-            self.run(cmd, window, cx);
+            self.run(cmd, src, window, cx);
         }
     }
 
@@ -336,7 +338,7 @@ pub fn popup_with(
         menu = menu.item(PopupMenuItem::new(*label).icon(Icon::new(*icon)).on_click(
             move |_, window, cx| {
                 let _ = entity.update(cx, |kite, cx| {
-                    kite.run_tag_action(ids.clone(), cmd, window, cx);
+                    kite.run_tag_action(ids.clone(), cmd, crate::app::Src::Click, window, cx);
                     window.focus(&kite.focus, cx);
                 });
             },
@@ -413,7 +415,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                             )
                         })
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.activate_tag_item(index, window, cx)
+                            this.activate_tag_item(index, crate::app::Src::Click, window, cx)
                         }))
                 }))
                 .child(

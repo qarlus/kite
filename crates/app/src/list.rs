@@ -327,7 +327,12 @@ impl Kite {
                         .child(
                             crate::preferences::button("help-close", "Close", t).on_click(
                                 cx.listener(|this, _, window, cx| {
-                                    this.run(crate::keys::cmd::BACK, window, cx)
+                                    this.run(
+                                        crate::keys::cmd::BACK,
+                                        crate::app::Src::Click,
+                                        window,
+                                        cx,
+                                    )
                                 }),
                             ),
                         ),
@@ -787,6 +792,8 @@ struct RowAction {
     icon: IconName,
     label: &'static str,
     action: MailAction,
+    /// The command the click pretends to be, so it can teach its key.
+    hint: u8,
     /// Whether the action removes the row from the list.
     remove: bool,
     text: &'static str,
@@ -800,6 +807,7 @@ fn row_actions(row: &ThreadSummary) -> [RowAction; 4] {
             icon: IconName::Archive,
             label: "Archive",
             action: MailAction::Archive,
+            hint: keys::cmd::DONE,
             remove: true,
             text: "Marked done",
         },
@@ -808,6 +816,7 @@ fn row_actions(row: &ThreadSummary) -> [RowAction; 4] {
             icon: IconName::Trash,
             label: "Trash",
             action: MailAction::Trash,
+            hint: keys::cmd::TRASH,
             remove: true,
             text: "Trashed",
         },
@@ -820,6 +829,7 @@ fn row_actions(row: &ThreadSummary) -> [RowAction; 4] {
             } else {
                 MailAction::Star
             },
+            hint: keys::cmd::STAR,
             remove: false,
             text: if row.starred { "Unstarred" } else { "Starred" },
         },
@@ -836,6 +846,7 @@ fn row_actions(row: &ThreadSummary) -> [RowAction; 4] {
             } else {
                 MailAction::Unread
             },
+            hint: keys::cmd::TOGGLE_READ,
             remove: false,
             text: if row.unread {
                 "Marked read"
@@ -859,6 +870,7 @@ fn row_action(
         icon,
         label,
         action,
+        hint,
         remove,
         text,
     } = button;
@@ -876,6 +888,7 @@ fn row_action(
         .child(Icon::new(icon).with_size(px(14.)).text_color(t.fg2))
         .on_click(cx.listener(move |this, _, window, cx| {
             this.act_on(vec![row_id], action.clone(), remove, text, cx);
+            this.shortcut_hint(hint, cx);
             window.focus(&this.focus, cx);
             cx.stop_propagation();
         }))

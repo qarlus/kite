@@ -352,6 +352,34 @@ impl Kite {
         cx.notify();
     }
 
+    /// A suggestion chip opens a reply with its text on top, above the signature and
+    /// the quote, editable like anything typed. A kept draft is never clobbered.
+    pub(crate) fn reply_with_suggestion(
+        &mut self,
+        text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.has_draft(cx) {
+            self.compose_open = true;
+            self.focus_compose(window, cx, false);
+            self.toast("Draft kept", cx);
+            return;
+        }
+        self.compose_reply(window, cx, false, false);
+        let Some(compose) = &self.compose else {
+            return;
+        };
+        let existing = compose.body.read(cx).value().to_string();
+        let text = format!("{}\n\n{}", text.trim_end(), existing);
+        compose.body.update(cx, |body, cx| {
+            body.set_value(text, window, cx);
+        });
+        self.compose_changed(cx);
+        self.ai = None;
+        cx.notify();
+    }
+
     pub(crate) fn close_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.flush_compose(cx);
         self.compose_open = false;

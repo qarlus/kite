@@ -8,9 +8,27 @@ pub const PRIVATE_TAG: &str = "Private";
 /// The engine builds AI prompts from identified sources, enforcing privacy before reading them.
 #[derive(Clone, Debug)]
 pub enum AiRequest {
-    Summary { thread: Id },
-    Compose { draft: Draft },
+    Summary {
+        thread: Id,
+    },
+    Compose {
+        draft: Draft,
+    },
+    Ask {
+        question: String,
+        account: Option<Id>,
+    },
+    Replies {
+        thread: Id,
+    },
 }
+pub const AI_TRIAGE_LABELS: [&str; 5] = [
+    "Needs reply",
+    "FYI",
+    "Receipts",
+    "Newsletters",
+    "Notifications",
+];
 /// Unix epoch milliseconds.
 pub type Ms = i64;
 
@@ -222,6 +240,8 @@ pub struct Settings {
     pub auto_update_check: bool,
     pub load_remote_images: bool,
     pub ai_enabled: bool,
+    /// Optional background classification of new inbox conversations.
+    pub ai_triage: bool,
     pub ai_base_url: String,
     pub ai_model: String,
     /// `"keyboard"`: single-key shortcuts (Superhuman style). `"classic"`: click-first, where only
@@ -238,6 +258,12 @@ pub struct Settings {
     /// Text snippets inserted in compose. Absent in settings written before they existed.
     #[serde(default)]
     pub snippets: Vec<Snippet>,
+    /// "Show shortcut tips": clicking an action in keyboard mode names its key in a toast.
+    pub shortcut_tips: bool,
+    /// Per-command shortcut-tip memory, keyed by command slug: the day the tip last showed and
+    /// how often the key ran the command. Absent in settings written before it existed.
+    #[serde(default)]
+    pub shortcut_hints: std::collections::BTreeMap<String, HintStat>,
 }
 
 impl Default for Settings {
@@ -252,6 +278,7 @@ impl Default for Settings {
             auto_update_check: true,
             load_remote_images: false,
             ai_enabled: false,
+            ai_triage: false,
             ai_base_url: "https://opencode.ai/zen/go/v1".into(),
             ai_model: "minimax-m3.1-flash-free".into(),
             input_mode: "keyboard".into(),
@@ -259,8 +286,21 @@ impl Default for Settings {
             reading_pane: true,
             profiles: Default::default(),
             snippets: Default::default(),
+            shortcut_tips: true,
+            shortcut_hints: Default::default(),
         }
     }
+}
+
+/// What the shortcut tips remember about one command.
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct HintStat {
+    /// `NaiveDate::num_days_from_ce` for the day the tip last showed; one tip per day.
+    #[serde(default)]
+    pub shown_day: i64,
+    /// How often the command's key ran it; the tip retires once the key is learned.
+    #[serde(default)]
+    pub uses: u32,
 }
 
 /// The next step of a native Proton sign-in (Proton's API directly, no Bridge; works on free plans).
@@ -300,6 +340,8 @@ pub struct ChatMsg {
 pub enum Event {
     /// The store changed for these accounts, so visible views should re-query.
     Changed(Vec<Id>),
+    /// Ask citation order, emitted before the first answer chunk.
+    AiSources { req: u32, threads: Vec<Id> },
     /// A streamed AI completion chunk for request `req`.
     Ai { req: u32, delta: String, done: bool },
     /// A user-visible background failure (auth expired, send failed, ...).

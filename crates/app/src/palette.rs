@@ -2,8 +2,9 @@
 use crate::app::{Kite, Overlay};
 use crate::keys::{self, Cmd};
 use crate::list::{keys_pills, overlay};
-use crate::theme::{RADIUS, RADIUS_SM};
+use crate::theme::{self, RADIUS, RADIUS_SM};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -77,6 +78,151 @@ impl Palette {
     }
 }
 
+/// "Get me to zero": archive everything in the current view older than a picked age.
+/// `sel` indexes [`AGES`]; the count behind the confirm button comes from `Mail::archivable`.
+#[derive(Default)]
+pub struct Zero {
+    pub sel: usize,
+    /// Starred conversations are kept unless this is on. Snoozed ones always keep waiting.
+    pub include_starred: bool,
+    pub count: usize,
+}
+
+/// The age presets the dialog offers, as (label, cutoff span in milliseconds).
+pub const AGES: [(&str, i64); 5] = [
+    ("1 day", 86_400_000),
+    ("3 days", 3 * 86_400_000),
+    ("1 week", 7 * 86_400_000),
+    ("2 weeks", 14 * 86_400_000),
+    ("1 month", 30 * 86_400_000),
+];
+
+/// The bulk-archive dialog: a small centred panel — preset pills, a starred toggle and a
+/// confirm button that carries the live count.
+pub fn render_zero(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyElement {
+    let t = kite.theme;
+    let Overlay::Zero(zero) = &kite.overlay else {
+        return div().into_any_element();
+    };
+    let view = kite.view_name().to_string();
+    let pills = div()
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children(AGES.iter().enumerate().map(|(ix, (label, _))| {
+            let selected = ix == zero.sel;
+            div()
+                .id(("zero-preset", ix))
+                .test_support()
+                .aria_label(*label)
+                .aria_selected(selected)
+                .px_3()
+                .py_1p5()
+                .rounded(px(RADIUS_SM))
+                .border_1()
+                .border_color(if selected { t.accent } else { t.line })
+                .bg(if selected { t.sel } else { t.bg2 })
+                .text_size(t.px(12.))
+                .cursor_pointer()
+                .hover(|s| s.bg(t.bg3))
+                .child(*label)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Overlay::Zero(zero) = &mut this.overlay {
+                        zero.sel = ix;
+                    }
+                    this.recount_zero(cx);
+                }))
+                .into_any_element()
+        }));
+    let starred = Switch::new("zero-starred")
+        .checked(zero.include_starred)
+        .accessibility_label("Include starred")
+        .on_click(cx.listener(|this, checked: &bool, _, cx| {
+            if let Overlay::Zero(zero) = &mut this.overlay {
+                zero.include_starred = *checked;
+            }
+            this.recount_zero(cx);
+        }));
+    let confirm = format!("Archive {} conversations", zero.count);
+    overlay(
+        &t,
+        px(0.),
+        true,
+        div()
+            .id("zero-dialog")
+            .test_support()
+            .aria_label("Archive older mail")
+            .w(px(420.))
+            .rounded(px(RADIUS))
+            .bg(t.bg2)
+            .border_1()
+            .border_color(t.line)
+            .shadow_lg()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(t.px(15.))
+                            .font_weight(FontWeight(650.))
+                            .child("Archive everything older than"),
+                    )
+                    .child(
+                        div()
+                            .text_size(t.px(12.))
+                            .text_color(t.fg2)
+                            .child(format!("in {view}")),
+                    ),
+            )
+            .child(pills)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(t.px(12.))
+                            .text_color(t.fg2)
+                            .child("Include starred"),
+                    )
+                    .child(starred),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        crate::preferences::button("zero-cancel", "Cancel", t).on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.close_overlay(cx);
+                                window.focus(&this.focus, cx);
+                            }),
+                        ),
+                    )
+                    .child(
+                        crate::preferences::button("zero-confirm", &confirm, t)
+                            .bg(theme::accent_glow(&t))
+                            .text_color(gpui_kit::white())
+                            .border_color(gpui_kit::transparent_black())
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.confirm_zero(window, cx)),
+                            ),
+                    ),
+            ),
+    )
+    .into_any_element()
+}
+
 /// Subsequence match with bonuses for consecutive runs and word starts.
 pub(crate) fn fuzzy(query: &str, text: &str) -> Option<i32> {
     let hay: Vec<char> = text.to_lowercase().chars().collect();
@@ -131,7 +277,7 @@ pub fn render(kite: &Kite, window: &Window, cx: &mut Context<Kite>) -> AnyElemen
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.overlay = Overlay::None;
                         window.focus(&this.focus, cx);
-                        this.run(command_id, window, cx);
+                        this.run(command_id, crate::app::Src::Click, window, cx);
                     }))
                     .relative()
                     .flex()
