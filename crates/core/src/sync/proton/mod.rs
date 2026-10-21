@@ -1087,7 +1087,11 @@ fn system_label(mailbox: Mailbox) -> &'static str {
         Mailbox::Archive => ARCHIVE,
         Mailbox::Trash => TRASH,
         Mailbox::Spam => SPAM,
-        Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => ALL_MAIL,
+        Mailbox::Waiting
+        | Mailbox::Scheduled
+        | Mailbox::Starred
+        | Mailbox::Snoozed
+        | Mailbox::All => ALL_MAIL,
     }
 }
 
@@ -1099,7 +1103,12 @@ fn mailbox_label(mailbox: Mailbox) -> Option<&'static str> {
         Mailbox::Trash => Some(TRASH),
         Mailbox::Spam => Some(SPAM),
         Mailbox::Drafts => Some(DRAFTS),
-        Mailbox::Sent | Mailbox::Starred | Mailbox::Snoozed | Mailbox::All => None,
+        Mailbox::Sent
+        | Mailbox::Waiting
+        | Mailbox::Scheduled
+        | Mailbox::Starred
+        | Mailbox::Snoozed
+        | Mailbox::All => None,
     }
 }
 

@@ -746,6 +746,7 @@ async fn send_due(
     changed: &mut Vec<Id>,
 ) -> Result<()> {
     let _sending = inner.send_gate.lock().await;
+    changed.extend(inner.write(Store::expire_scheduled)?);
     let due = inner.write(|s| s.outbox_due(auth::now_ms()))?;
     let mut queued = false;
     for (outbox_id, draft) in due {
@@ -933,14 +934,6 @@ fn failed_send(
     let (stopped, first) =
         inner.write(|s| s.outbox_failed(id, auth::now_ms(), permanent, proton::retry_at(error)))?;
     if stopped {
-        if draft.id.is_none() {
-            let account = inner
-                .read(Store::accounts)?
-                .into_iter()
-                .find(|a| a.id == draft.account_id)
-                .context("account was removed")?;
-            inner.write(|s| s.save_draft(draft, &message_id(&account.email)))?;
-        }
         inner.write(|s| s.outbox_cancel(id))?;
         changed.push(draft.account_id);
         inner.emit(Event::Error(format!(
@@ -1323,6 +1316,10 @@ impl Mail for Engine {
         Ok(folder)
     }
 
+    fn view_count(&self, view: &View) -> Result<usize> {
+        self.inner.read(|s| s.view_count(view))
+    }
+
     fn threads(&self, view: &View, offset: u32, limit: u32) -> Result<Vec<ThreadSummary>> {
         self.inner.read(|s| s.threads(view, offset, limit))
     }
@@ -1459,7 +1456,7 @@ impl Mail for Engine {
         let account = draft.account_id;
         let id = self.inner.write(|s| s.outbox_add(&draft, due))?;
         self.wake();
-        if saved.is_some() {
+        if saved.is_some() || draft.send_at.is_some() {
             // It left the Drafts mailbox; tell the list right away.
             self.inner.emit(Event::Changed(vec![account]));
         }
@@ -1482,12 +1479,14 @@ impl Mail for Engine {
             }
             self.inner.write(|s| s.outbox_cancel(id))
         })?;
-        if let Some(draft) = &draft
-            && draft.id.is_some()
-        {
-            // The cancelled draft is back in the Drafts mailbox.
-            self.inner.emit(Event::Changed(vec![draft.account_id]));
-        }
+        let draft = if let Some(mut draft) = draft {
+            draft.send_at = None;
+            // Cancellation must leave a recoverable draft even when compose never autosaved.
+            draft.id = Some(self.save_draft(draft.clone())?);
+            Some(draft)
+        } else {
+            None
+        };
         Ok(draft)
     }
 

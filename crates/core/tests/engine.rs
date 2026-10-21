@@ -409,7 +409,7 @@ fn scheduled_and_undo_send_can_be_cancelled_back_to_editable_drafts() {
         let returned = engine.cancel_send(queued).unwrap().unwrap();
         assert_eq!(returned.id, Some(id));
         assert_eq!(returned.subject, "Keep editing");
-        assert_eq!(returned.send_at, send_at);
+        assert_eq!(returned.send_at, None);
         let row = engine
             .threads(&drafts(account.id), 0, 10)
             .unwrap()
@@ -689,4 +689,66 @@ fn one_click_unsubscribe_posts_rfc8058_body_over_https() {
         "one-click never sends an email"
     );
     assert!(engine.threads(&inbox, 0, 10).unwrap().is_empty());
+}
+
+#[test]
+fn proton_schedule_reschedule_send_now_and_cancel_keep_a_recoverable_draft() {
+    let dir = temp_dir();
+    let account = local_account(&dir);
+    let engine = engine(&dir);
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 30,
+            ..Default::default()
+        })
+        .unwrap();
+    let scheduled = |mailbox| kite_core::model::View {
+        account_id: None,
+        mailbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let id = engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![addr("Bob", "bob@example.org")],
+            subject: "Scheduled locally".into(),
+            body: "Keep me".into(),
+            send_at: Some(now_ms() + 3_600_000),
+            ..Default::default()
+        })
+        .unwrap();
+    assert_eq!(
+        engine
+            .threads(&scheduled(Mailbox::Scheduled), 0, 20)
+            .unwrap()
+            .len(),
+        1
+    );
+    let at = now_ms() + 7_200_000;
+    let next = engine.reschedule_send(id, Some(at)).unwrap().unwrap();
+    let rows = engine
+        .threads(&scheduled(Mailbox::Scheduled), 0, 20)
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].date, at);
+    let immediate = engine.reschedule_send(next, None).unwrap().unwrap();
+    assert!(
+        engine
+            .threads(&scheduled(Mailbox::Scheduled), 0, 20)
+            .unwrap()
+            .is_empty()
+    );
+    let draft = engine.cancel_send(immediate).unwrap().unwrap();
+    assert!(draft.id.is_some());
+    assert_eq!(draft.send_at, None);
+    assert_eq!(draft.body, "Keep me");
+    assert_eq!(
+        engine
+            .threads(&scheduled(Mailbox::Drafts), 0, 20)
+            .unwrap()
+            .len(),
+        1
+    );
 }

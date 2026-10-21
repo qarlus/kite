@@ -2241,7 +2241,7 @@ async fn deferred_send_survives_restart_cancel_deletes_provider_item_and_short_d
             .iter()
             .any(|c| c.method == "DELETE")
     );
-    let before = fake.path("/me/messages").len();
+    let before = fake.path("/me/messages/scheduled-immutable/send").len();
     let short = reopened
         .send(Draft {
             send_at: Some(auth::now_ms() + 60_000),
@@ -2250,9 +2250,13 @@ async fn deferred_send_survives_restart_cancel_deletes_provider_item_and_short_d
         .unwrap();
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(
-        fake.path("/me/messages").len(),
+        fake.path("/me/messages/scheduled-immutable/send").len(),
         before,
         "short schedules stay local"
+    );
+    assert!(
+        store.outbox_remote(short).unwrap().is_none(),
+        "a short schedule has no prepared provider send"
     );
     let cancel = reopened.clone();
     assert!(
@@ -2261,5 +2265,207 @@ async fn deferred_send_survives_restart_cancel_deletes_provider_item_and_short_d
             .unwrap()
             .unwrap()
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn scheduled_view_reschedule_and_send_now_delete_handed_over_graph_item_first() {
+    use kite_core::{
+        api::Mail,
+        engine::{Engine, Options, Secrets},
+        model::{Draft, Provider, Settings, View},
+        store::Store,
+    };
+    use std::time::{Duration, Instant};
+    let seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seq2 = seq.clone();
+    let fake=Fake::start(move |c,base|{
+        if c.method=="POST" && c.path=="/me/messages" {
+            let n=seq2.fetch_add(1,std::sync::atomic::Ordering::SeqCst);
+            return Reply::json(201,json!({"id":format!("deferred-{n}"),"internetMessageId":format!("<deferred-{n}@example.com>")}));
+        }
+        if c.method=="PATCH" {return Reply::json(200,json!({"id":c.path.rsplit('/').next().unwrap()}));}
+        if c.method=="POST" && c.path.ends_with("/send") {return Reply::empty(202);}
+        if c.method=="DELETE" {return Reply::empty(204);}
+        Reply::json(200,json!({"value":[],"@odata.deltaLink":format!("{base}{}",c.path)}))
+    }).await;
+    let dir = temp_dir::TempDir::new("schedule-actions");
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    let account = store
+        .add_account(Provider::Microsoft, "me@example.com", "Me")
+        .unwrap();
+    let tokens = serde_json::to_string(&Tokens {
+        access: "token".into(),
+        refresh: "refresh".into(),
+        expires_at: auth::now_ms() + 3_600_000,
+    })
+    .unwrap();
+    let engine = Engine::open_with(
+        &dir,
+        Secrets::Memory(Mutex::new(HashMap::from([(
+            format!("ms:{}", account.id),
+            tokens,
+        )]))),
+        Options {
+            graph_base_url: Some(fake.base.clone()),
+            poll: Duration::from_millis(20),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    engine
+        .set_settings(Settings {
+            undo_send_secs: 30,
+            ..Default::default()
+        })
+        .unwrap();
+    let view = View {
+        account_id: None,
+        mailbox: Mailbox::Scheduled,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let old = engine
+        .send(Draft {
+            account_id: account.id,
+            to: vec![Addr {
+                name: String::new(),
+                email: "bob@example.com".into(),
+            }],
+            subject: "Deferred".into(),
+            body: "Body".into(),
+            send_at: Some(auth::now_ms() + 600_000),
+            ..Default::default()
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.outbox_remote(old).unwrap().is_none()
+        || store
+            .outbox_due(i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == old)
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(engine.threads(&view, 0, 10).unwrap().len(), 1);
+    let old_remote = store.outbox_remote(old).unwrap().unwrap().1;
+    let change = engine.clone();
+    let at = auth::now_ms() + 1_200_000;
+    let next = tokio::task::spawn_blocking(move || change.reschedule_send(old, Some(at)))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while store.outbox_remote(next).unwrap().is_none()
+        || store
+            .outbox_due(i64::MAX)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| *id == next)
+    {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let rows = engine.threads(&view, 0, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].date, at);
+    assert!(
+        fake.path(&format!("/me/messages/{old_remote}"))
+            .iter()
+            .any(|c| c.method == "DELETE")
+    );
+    {
+        let calls = fake.calls.lock().unwrap();
+        let deleted = calls
+            .iter()
+            .position(|c| c.method == "DELETE" && c.path == format!("/me/messages/{old_remote}"))
+            .unwrap();
+        let sent = calls
+            .iter()
+            .rposition(|c| c.method == "POST" && c.path.ends_with("/send"))
+            .unwrap();
+        assert!(
+            deleted < sent,
+            "the old deferred item is removed before its replacement is submitted"
+        );
+    }
+    let next_remote = store.outbox_remote(next).unwrap().unwrap().1;
+    let change = engine.clone();
+    let immediate = tokio::task::spawn_blocking(move || change.reschedule_send(next, None))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(engine.threads(&view, 0, 10).unwrap().is_empty());
+    assert!(
+        fake.path(&format!("/me/messages/{next_remote}"))
+            .iter()
+            .any(|c| c.method == "DELETE")
+    );
+    let change = engine.clone();
+    let recovered = tokio::task::spawn_blocking(move || change.cancel_send(immediate))
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.subject, "Deferred");
+    assert_eq!(recovered.send_at, None);
+    assert_eq!(
+        engine
+            .threads(
+                &View {
+                    mailbox: Mailbox::Drafts,
+                    ..view
+                },
+                0,
+                10
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+    let expired = store
+        .outbox_add(
+            &Draft {
+                account_id: account.id,
+                send_at: Some(auth::now_ms() - 1),
+                ..Default::default()
+            },
+            auth::now_ms() - 1,
+        )
+        .unwrap();
+    store.outbox_prepared(expired, "expired-sent").unwrap();
+    store.outbox_handed_over(expired).unwrap();
+    assert!(
+        engine
+            .threads(
+                &View {
+                    account_id: None,
+                    mailbox: Mailbox::Scheduled,
+                    split: None,
+                    query: None,
+                    folder: None
+                },
+                0,
+                10
+            )
+            .unwrap()
+            .is_empty()
+    );
+    let change = engine.clone();
+    assert!(
+        tokio::task::spawn_blocking(move || change.cancel_send(expired))
+            .await
+            .unwrap()
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        fake.path("/me/messages/expired-sent").is_empty(),
+        "expired mail is not cancelled or resent"
     );
 }

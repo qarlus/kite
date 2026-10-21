@@ -74,7 +74,23 @@ pub trait Mail: Send + Sync + 'static {
 
     /// Queues to the outbox (due after the undo window or at `send_at`). Returns the outbox id.
     fn send(&self, draft: Draft) -> Result<Id>;
+    /// May contact Exchange; call off the UI thread. Restores an editable, unscheduled draft.
     fn cancel_send(&self, id: Id) -> Result<Option<Draft>>;
+    /// Cancel the provider schedule before queuing the replacement. None sends after undo delay.
+    fn reschedule_send(&self, id: Id, at: Option<Ms>) -> Result<Option<Id>> {
+        anyhow::ensure!(
+            at.is_none_or(|at| at > crate::auth::now_ms()),
+            "Choose a future send time"
+        );
+        let Some(mut draft) = self.cancel_send(id)? else {
+            return Ok(None);
+        };
+        draft.send_at = at;
+        self.send(draft).map(Some)
+    }
+    fn view_count(&self, view: &View) -> Result<usize> {
+        Ok(self.threads(view, 0, u32::MAX)?.len())
+    }
     /// Saves a draft locally at once (it shows in the Drafts mailbox) and queues the provider copy.
     /// `draft.id: None` creates; `Some` replaces that draft. Returns the draft id.
     fn save_draft(&self, _draft: Draft) -> Result<Id> {

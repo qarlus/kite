@@ -271,6 +271,22 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                     this.save_preferences(settings, window, cx);
                 }))
         }));
+    let waiting = div()
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children([0, 1, 2, 3, 7, 14].into_iter().map(|days| {
+            let selected = kite.settings.waiting_after_days == days;
+            button(format!("waiting-days-{days}"), &format!("{days} days"), t)
+                .aria_selected(selected)
+                .when(selected, |d| d.bg(t.sel).border_color(t.accent))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let mut settings = this.settings.clone();
+                    settings.waiting_after_days = days;
+                    this.save_preferences(settings, window, cx);
+                    this.reload();
+                }))
+        }));
     // One tile per input mode. Switching applies to the next keystroke, with no restart.
     let mode = |value: &'static str, label: &'static str, description: &'static str| {
         let selected = kite.settings.input_mode == value;
@@ -378,6 +394,11 @@ pub fn render(kite: &Kite, _window: &Window, cx: &mut Context<Kite>) -> AnyEleme
                             .into_any_element(),
                     ],
                 )),
+        )
+        .child(
+            div().flex().flex_col()
+                .child(heading(t, "Waiting on", "Show sent conversations awaiting a reply. Zero shows them immediately."))
+                .child(card(t, vec![waiting.into_any_element()]))
         )
         .child(updates(kite, cx))
         .into_any_element()

@@ -18,6 +18,8 @@ gpui_kit::assets::icon_assets!(
     [
         Archive,
         Clock,
+        Hourglass,
+        CalendarClock,
         Inbox,
         FileText,
         Send,
