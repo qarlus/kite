@@ -191,3 +191,49 @@ async fn signed_executables_cannot_be_relabelled_as_another_version() {
     assert!(error.to_string().contains("version and platform"));
     assert_eq!(std::fs::read_dir(dir.join("updates")).unwrap().count(), 0);
 }
+
+#[test]
+fn install_refuses_relabelled_and_older_releases() {
+    let signed = release("https://example.invalid/kite.exe", BYTES);
+    assert!(update::check_install(&signed, "0.2.2").is_ok());
+    // A signature made for 0.10.0 must never be accepted for another version.
+    let mut relabelled = signed.clone();
+    relabelled.version = "9.0.0".into();
+    let error = update::check_install(&relabelled, "0.2.2").unwrap_err();
+    assert!(error.to_string().contains("version and platform"));
+    // A replayed, still-valid manifest must not install over a build that is already as new.
+    for current in ["0.10.0", "0.11.0"] {
+        let error = update::check_install(&signed, current).unwrap_err();
+        assert!(error.to_string().contains("is not newer"), "{current}");
+    }
+}
+
+// The installer must refuse a release before it touches a single file, so the checks come first.
+#[cfg(windows)]
+#[test]
+fn install_stops_before_touching_any_file_when_the_release_is_refused() {
+    let mut relabelled = release("https://example.invalid/kite.exe", BYTES);
+    relabelled.version = "9.0.0".into();
+    let missing = std::env::temp_dir().join("kite-does-not-exist-update.exe");
+    let error = update::install(&missing, &relabelled).unwrap_err();
+    assert!(error.to_string().contains("version and platform"));
+    assert!(!missing.exists());
+}
+
+#[test]
+fn a_half_applied_update_restores_the_backup_executable() {
+    let dir = temp_dir::TempDir::new("restore-old");
+    let current = dir.join("kite.exe");
+    let old = dir.join("kite.exe.old");
+    // Nothing to restore: no backup, or a healthy executable already in place.
+    assert!(!update::restore_at(&current).unwrap());
+    std::fs::write(&current, b"running").unwrap();
+    std::fs::write(&old, b"previous").unwrap();
+    assert!(!update::restore_at(&current).unwrap());
+    assert_eq!(std::fs::read(&current).unwrap(), b"running");
+    // An install that died between its two renames left only the backup.
+    std::fs::remove_file(&current).unwrap();
+    assert!(update::restore_at(&current).unwrap());
+    assert_eq!(std::fs::read(&current).unwrap(), b"previous");
+    assert!(!old.exists());
+}

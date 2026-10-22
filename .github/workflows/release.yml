@@ -2,33 +2,84 @@ name: release
 on:
   push:
     tags: ['v*']
+# The workflow as a whole is read-only; only the publishing job may write a release.
 permissions:
-  contents: write
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
 jobs:
-  windows:
+  # Building needs no secrets and no write access: it only proves the tag is releasable.
+  build:
     runs-on: windows-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     env:
       CARGO_TARGET_DIR: target
     defaults:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # A pushed tag is attacker-controlled: only build commits that reached main.
+      - name: Require the tag to point at a commit on main
+        run: |
+          git fetch --no-tags origin main
+          if ($LASTEXITCODE -ne 0) { throw 'Could not fetch main' }
+          git merge-base --is-ancestor $env:GITHUB_SHA origin/main
+          if ($LASTEXITCODE -ne 0) { throw "Tag $env:GITHUB_REF_NAME does not point at a commit on main" }
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Validate tag against workspace version
+        id: version
         run: |
           $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
           if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
           $version = ($metadata.packages | Where-Object name -eq 'kite').version
           if ($env:GITHUB_REF_NAME -cne "v$version") { throw "Tag must be v$version" }
-          "KITE_VERSION=$version" >> $env:GITHUB_ENV
+          "version=$version" >> $env:GITHUB_OUTPUT
       - run: cargo build --locked --release -p kite
       - name: Enforce release size budget
         run: |
           if ((Get-Item target/release/kite.exe).Length -gt 24MB) { throw 'Kite exceeds the 24 MiB release budget' }
+      - name: Prepare the release executable and its checksum
+        run: |
+          Copy-Item target/release/kite.exe kite-windows-x86_64.exe
+          (Get-FileHash kite-windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant() |
+            Set-Content kite-windows-x86_64.exe.sha256 -Encoding utf8NoBOM
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kite-windows-x86_64
+          path: |
+            kite-windows-x86_64.exe
+            kite-windows-x86_64.exe.sha256
+          if-no-files-found: error
+          retention-days: 1
+  # Only this job sees the signing key, and it runs behind the Release environment's reviewers.
+  sign-and-publish:
+    needs: build
+    runs-on: windows-latest
+    environment: release
+    permissions:
+      contents: write
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kite-windows-x86_64
+      - name: Re-check the downloaded executable against the built checksum
+        run: |
+          $expected = (Get-Content kite-windows-x86_64.exe.sha256 -Raw).Trim()
+          $actual = (Get-FileHash kite-windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if (!$expected -or $actual -ne $expected) { throw 'Release executable checksum mismatch' }
       - name: Install minisign
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'minisign-0.12-win64.zip'
@@ -38,50 +89,56 @@ jobs:
           }
           $directory = Join-Path $env:RUNNER_TEMP 'minisign'
           Expand-Archive -LiteralPath $archive -DestinationPath $directory
-          (Join-Path $directory 'minisign-win64/x86_64') >> $env:GITHUB_PATH
+          $exe = Join-Path $directory 'minisign-win64/x86_64/minisign.exe'
+          if (!(Test-Path -LiteralPath $exe)) { throw 'minisign executable is missing' }
+          "MINISIGN=$exe" >> $env:GITHUB_ENV
       - name: Sign and prepare release assets
         env:
           KITE_UPDATE_KEY: ${{ secrets.KITE_UPDATE_KEY }}
+          KITE_VERSION: ${{ needs.build.outputs.version }}
           GH_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          $version = $env:KITE_VERSION
           $key = Join-Path $env:RUNNER_TEMP 'kite-update.key'
           try {
             if (!$env:KITE_UPDATE_KEY) { throw 'KITE_UPDATE_KEY is missing' }
             [IO.File]::WriteAllText($key, $env:KITE_UPDATE_KEY, [Text.UTF8Encoding]::new($false))
-            Copy-Item target/release/kite.exe kite-windows-x86_64.exe
-            minisign -S -s $key -m kite-windows-x86_64.exe -t "Kite $env:KITE_VERSION windows-x86_64"
+            & $env:MINISIGN -S -s $key -m kite-windows-x86_64.exe -t "Kite $version windows-x86_64"
             if ($LASTEXITCODE -ne 0) { throw 'Signing failed' }
-            minisign -V -P 'RWTrUFYM7XdOexraXpGBhlznET7jGSdhpDpBEliTHjKLFnjr/Ha6FzTq' -m kite-windows-x86_64.exe
+            & $env:MINISIGN -V -P 'RWTrUFYM7XdOexraXpGBhlznET7jGSdhpDpBEliTHjKLFnjr/Ha6FzTq' -m kite-windows-x86_64.exe
             if ($LASTEXITCODE -ne 0) { throw 'Signing key does not match the embedded update key' }
           } finally {
             if (Test-Path -LiteralPath $key) { Remove-Item -LiteralPath $key -Force -ErrorAction Stop }
             Remove-Item Env:KITE_UPDATE_KEY
           }
-          $type = git cat-file -t "refs/tags/$env:GITHUB_REF_NAME"
-          if ($type -eq 'tag') {
-            $notes = (git for-each-ref --format='%(contents)' "refs/tags/$env:GITHUB_REF_NAME") -join "`n"
-          } else {
-            $notes = (gh api repos/qarlus/kite/releases/generate-notes -f "tag_name=$env:GITHUB_REF_NAME" --jq .body) -join "`n"
-            if ($LASTEXITCODE -ne 0) { throw 'Release notes generation failed' }
-          }
           $manifest = @{
-            version = $env:KITE_VERSION
-            notes = $notes
+            version = $version
+            notes = ''
             'windows-x86_64' = @{
               url = "https://github.com/qarlus/kite/releases/download/$env:GITHUB_REF_NAME/kite-windows-x86_64.exe"
               sha256 = (Get-FileHash kite-windows-x86_64.exe -Algorithm SHA256).Hash.ToLowerInvariant()
               signature = [IO.File]::ReadAllText((Join-Path $pwd 'kite-windows-x86_64.exe.minisig'))
             }
           }
+          # The tag object's message is the release notes; a lightweight tag has none.
+          if ((git cat-file -t "refs/tags/$env:GITHUB_REF_NAME") -eq 'tag') {
+            $notes = (git for-each-ref --format='%(contents)' "refs/tags/$env:GITHUB_REF_NAME") -join "`n"
+          } else {
+            $notes = (gh api repos/qarlus/kite/releases/generate-notes -f "tag_name=$env:GITHUB_REF_NAME" --jq .body) -join "`n"
+            if ($LASTEXITCODE -ne 0) { throw 'Release notes generation failed' }
+          }
+          $manifest.notes = $notes
           $manifest | ConvertTo-Json -Depth 4 | Set-Content latest.json -Encoding utf8NoBOM
           Set-Content release-notes.md -Value $notes -Encoding utf8NoBOM
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
+          KITE_VERSION: ${{ needs.build.outputs.version }}
         run: |
-          $arguments = @('release', 'create', $env:GITHUB_REF_NAME, '--verify-tag', '--title', "Kite $env:KITE_VERSION", '--notes-file', 'release-notes.md')
-          if ($env:KITE_VERSION.Contains('-')) { $arguments += '--prerelease' }
+          $version = $env:KITE_VERSION
+          $arguments = @('release', 'create', $env:GITHUB_REF_NAME, '--verify-tag', '--title', "Kite $version", '--notes-file', 'release-notes.md')
+          if ($version.Contains('-')) { $arguments += '--prerelease' }
           $arguments += @('kite-windows-x86_64.exe', 'kite-windows-x86_64.exe.minisig', 'latest.json')
           & gh @arguments
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }

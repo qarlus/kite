@@ -4,11 +4,11 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::*;
 
 fn main() {
-    std::thread::spawn(|| {
-        if let Err(error) = kite_core::update::cleanup_old() {
-            eprintln!("{error:#}");
-        }
-    });
+    // Undo a half-applied update before anything else, then keep the last backup until the new
+    // build has proven it can open the local database.
+    if let Err(error) = kite_core::update::restore_old() {
+        eprintln!("{error:#}");
+    }
     let directory = kite_core::engine::data_dir();
     let engine = match kite_core::engine::Engine::open(&directory) {
         Ok(engine) => engine,
@@ -20,6 +20,11 @@ fn main() {
             std::process::exit(1);
         }
     };
+    std::thread::spawn(|| {
+        if let Err(error) = kite_core::update::cleanup_old() {
+            eprintln!("{error:#}");
+        }
+    });
     gpui_kit::application()
         .with_assets(kite::Assets)
         .run(move |cx| {
