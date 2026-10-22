@@ -23,6 +23,7 @@ blitz-traits.workspace = true
 anyrender.workspace = true
 anyrender_vello_cpu.workspace = true
 image.workspace = true
+reqwest.workspace = true
 async-channel = { workspace = true }
 chrono = { workspace = true }
 

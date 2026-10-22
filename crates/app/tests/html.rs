@@ -323,15 +323,65 @@ fn typical_email_renders_within_budget() {
 }
 
 #[test]
+fn a_body_taller_than_a_frame_can_hold_is_clamped_instead_of_crashing() {
+    // `<div style="height:100000px">` is a mail-builder accident that used to kill the app:
+    // anyrender stores the frame size in u16s and the image build panicked on the wrapped
+    // height, which in release (panic = abort) took the whole client down.
+    let r = render(
+        r##"<div style="height:100000px;background:#ff0000"><a href="https://example.com/top">top</a></div>"##,
+        600.,
+        2.,
+        true,
+    );
+    let (width, height) = size(&r);
+    assert_eq!(width, 1200, "the width is the column at the window's DPI");
+    assert_eq!(
+        height, 16384,
+        "the frame is cut at what the renderer can hold, not wrapped"
+    );
+    assert_eq!(
+        r.height, 8192.,
+        "the pane still believes the frame's real height"
+    );
+    assert!(
+        is_red(pixel(&r, 10, 10)),
+        "the top of the body is what paints"
+    );
+    let hit = (0..40)
+        .flat_map(|y| (0..400).map(move |x| (x as f32, y as f32)))
+        .find(|&(x, y)| r.link_at(x, y).is_some());
+    assert!(
+        hit.is_some(),
+        "a link at the top of the clamped body still hit-tests"
+    );
+}
+
+#[test]
+fn a_style_sheet_full_of_unmatched_braces_renders() {
+    // A broken `<style>` arrives as thousands of `a{`: the old rule walker recursed per brace
+    // and overflowed the stack on the background render thread.
+    let mut html = String::with_capacity(64 * 1024);
+    html.push_str("<style>a{color:#ffffff}");
+    html.push_str(&"a{".repeat(25_000));
+    html.push_str("</style><p>Hi</p>");
+    let start = std::time::Instant::now();
+    let r = render(&html, 600., 2., true);
+    let took = start.elapsed();
+    assert!(r.height > 8., "the body still lays out: {}", r.height);
+    assert!(
+        took.as_secs() < 5,
+        "the sheet is walked once, not quadratically: {took:?}"
+    );
+}
+
+#[test]
 fn a_blocked_body_keeps_its_links_and_loses_its_remote_images() {
     use std::collections::HashMap;
     let source = r##"<a href="https://example.com/doc">the doc</a><img src="https://cdn.example.com/a.png"><p style="background: url('https://cdn.example.com/b.png')">x</p>"##;
     assert_eq!(
         kite::html::remote_images(source),
-        vec![
-            "https://cdn.example.com/a.png".to_string(),
-            "https://cdn.example.com/b.png".to_string()
-        ]
+        vec!["https://cdn.example.com/a.png".to_string()],
+        "only an <img src> is fetched: a CSS url() is a beacon channel, not an image"
     );
     let blocked = kite::html::inline_images(source, &HashMap::new());
     assert!(

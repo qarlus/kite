@@ -429,13 +429,33 @@ impl Kite {
             );
         }
         let url = crate::html::clean_url(&hover.href);
-        let (pre, host, rest) = url_parts(&url);
+        let (pre, userinfo, host, rest) = url_parts(&url);
+        // The host reads in `fg` and everything else is dimmed, so the part a browser will
+        // actually connect to is the part the eye lands on; `link-pill-host` names it for tests.
+        let mut pill = pill
+            .aria_label(url.clone())
+            .child(div().flex_shrink_0().text_color(t.fg3).child(pre));
+        if !userinfo.is_empty() {
+            pill = pill.child(
+                div()
+                    .id("link-pill-userinfo")
+                    .test_support()
+                    .flex_shrink_0()
+                    .text_color(t.fg3)
+                    .child(userinfo),
+            );
+        }
         Some(
-            pill.aria_label(url.clone())
-                .child(div().flex_shrink_0().text_color(t.fg3).child(pre))
-                .child(div().flex_shrink_0().child(host))
-                .child(div().min_w_0().truncate().text_color(t.fg3).child(rest))
-                .into_any_element(),
+            pill.child(
+                div()
+                    .id("link-pill-host")
+                    .test_support()
+                    .aria_label(host.clone())
+                    .flex_shrink_0()
+                    .child(host),
+            )
+            .child(div().min_w_0().truncate().text_color(t.fg3).child(rest))
+            .into_any_element(),
         )
     }
 
@@ -1524,24 +1544,33 @@ fn text_links(text: &str) -> (Vec<Range<usize>>, Vec<String>) {
     (ranges, hrefs)
 }
 
-/// `(scheme, host, rest)` of a URL for the status pill, so the host reads in `fg` and the
-/// rest in `fg3`. `mailto:` counts as a scheme; anything else is all "rest".
-fn url_parts(url: &str) -> (String, String, String) {
-    let after = match url.find("://") {
-        Some(at) => at + 3,
+/// `(scheme, userinfo, host, rest)` of a URL for the status pill, so the host reads in `fg` and
+/// everything else in `fg3`. `mailto:` counts as a scheme; anything else is all "rest". A `\`
+/// ends the authority, as it does for a browser — so `https://evil.example\@paypal.com/` shows
+/// `evil.example` as the host, not `paypal.com`; and in `https://user@host/` the `user@` part is
+/// split off to be dimmed rather than read as the host.
+fn url_parts(url: &str) -> (String, String, String, String) {
+    let (after, web) = match url.find("://") {
+        Some(at) => (at + 3, true),
         None if url
             .get(..7)
             .is_some_and(|s| s.eq_ignore_ascii_case("mailto:")) =>
         {
-            7
+            (7, false)
         }
-        None => return (String::new(), String::new(), url.to_string()),
+        None => return (String::new(), String::new(), String::new(), url.to_string()),
     };
     let rest = &url[after..];
-    let host_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host_end = rest.find(['/', '\\', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..host_end];
+    let (userinfo, host) = match web.then(|| authority.rfind('@')).flatten() {
+        Some(at) => (&authority[..at + 1], &authority[at + 1..]),
+        None => ("", authority),
+    };
     (
         url[..after].to_string(),
-        rest[..host_end].to_string(),
+        userinfo.to_string(),
+        host.to_string(),
         rest[host_end..].to_string(),
     )
 }
