@@ -100,8 +100,14 @@ pub fn render_styled(html: &str, width: f32, scale: f32, theme: Theme, font: &st
         doc.resolve(0.0);
     }
     let paint = scale * fit;
-    let pw = ((laid * paint).ceil() as u32).max(1);
-    let ph = ((doc.root_element().final_layout().size.height.max(1.) * paint).ceil() as u32).max(1);
+    // anyrender_vello_cpu stores the frame size in u16s, so an unclamped body
+    // (`height:40000px` at scale 2) wrapped to a wrong size and `from_raw` below
+    // panicked — with release's panic=abort, one email killed the app. The
+    // reader sees the top of the body; the rest is cut at this generous cap.
+    const MAX_DIM: u32 = 16384;
+    let pw = ((laid * paint).ceil() as u32).clamp(1, MAX_DIM);
+    let ph = ((doc.root_element().final_layout().size.height.max(1.) * paint).ceil() as u32)
+        .clamp(1, MAX_DIM);
     let links = doc
         .tree()
         .iter()
@@ -114,7 +120,7 @@ pub fn render_styled(html: &str, width: f32, scale: f32, theme: Theme, font: &st
             });
             Some(Link {
                 href,
-                text: node.text_content().trim().to_string(),
+                text: visible_text(node).trim().to_string(),
                 x: x * fit,
                 y: y * fit,
                 w: w * fit,
@@ -133,12 +139,16 @@ pub fn render_styled(html: &str, width: f32, scale: f32, theme: Theme, font: &st
     for px in buf.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
     }
-    let image = image::RgbaImage::from_raw(pw, ph, buf).expect("renderer returns w*h*4 bytes");
+    // Fallible, never `expect`: a renderer that returns the wrong byte count
+    // yields a 1x1 frame, not an abort.
+    let image = image::RgbaImage::from_raw(pw, ph, buf)
+        .unwrap_or_else(|| image::RgbaImage::from_pixel(1, 1, image::Rgba([0, 0, 0, 0])));
+    let (w, h) = (image.width(), image.height());
     Rendered {
         image: Arc::new(RenderImage::new([image::Frame::new(image)])),
         // Snapped to whole device pixels, so the image is shown at its own resolution.
-        width: pw as f32 / scale,
-        height: ph as f32 / scale,
+        width: w as f32 / scale,
+        height: h as f32 / scale,
         links,
     }
 }
@@ -324,42 +334,58 @@ fn attributes(tag: &str, theme: &Theme) -> String {
 
 /// A style sheet with the colours in every rule body adapted. Selectors and at-rule preludes are
 /// copied untouched, so an id such as `#dad` is never mistaken for a colour.
+///
+/// One pass with an explicit stack: nesting deeper than `MAX_DEPTH` is copied raw, so a mail with
+/// thousands of unmatched `{` cannot overflow the call stack.
 fn rules(css: &str, out: &mut String, theme: &Theme) {
-    let mut rest = css;
-    while let Some(open) = rest.find('{') {
-        let body = &rest[open + 1..];
-        let close = matching_brace(body);
-        out.push_str(&rest[..=open]);
-        let inner = &body[..close];
-        if inner.contains('{') {
-            rules(inner, out, theme);
-        } else {
-            out.push_str(&declarations(inner, theme));
-        }
-        if close < body.len() {
-            out.push('}');
-        }
-        rest = &body[(close + 1).min(body.len())..];
-    }
-    out.push_str(rest);
-}
-
-/// The index of the `}` matching a `{` just before `text`.
-fn matching_brace(text: &str) -> usize {
-    let mut depth = 1;
-    for (i, c) in text.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i;
+    const MAX_DEPTH: usize = 64;
+    // One entry per unmatched `{`: its offset in `css`, the offset in `out` where its body began,
+    // whether a nested `{` was seen inside it (making the body rules, not declarations), and
+    // whether it sits inside the depth cap.
+    let mut opens: Vec<(usize, usize, bool, bool)> = Vec::new();
+    let mut at = 0;
+    let mut i = 0;
+    let bytes = css.as_bytes();
+    while i < css.len() {
+        match bytes[i] {
+            b'{' => {
+                out.push_str(&css[at..=i]);
+                if let Some(parent) = opens.last_mut() {
+                    parent.2 = true;
                 }
+                opens.push((i, out.len(), false, opens.len() < MAX_DEPTH));
+                i += 1;
+                at = i;
             }
-            _ => {}
+            b'}' if !opens.is_empty() => {
+                let Some((open, body_at, nested, adaptable)) = opens.pop() else {
+                    i += 1;
+                    continue;
+                };
+                out.push_str(&css[at..i]);
+                if !nested && adaptable {
+                    // The raw copy just emitted is exactly `css[open + 1..i]`: swap it for the
+                    // adapted declarations.
+                    out.truncate(body_at);
+                    out.push_str(&declarations(&css[open + 1..i], theme));
+                }
+                out.push('}');
+                i += 1;
+                at = i;
+            }
+            _ => i += 1,
         }
     }
-    text.len()
+    out.push_str(&css[at..]);
+    // A `{` still open at the end swallows the rest of the sheet, as before; only the innermost
+    // unmatched brace can be a leaf, since every deeper one already marked its parent nested.
+    if let Some(&(open, body_at, nested, adaptable)) = opens.last()
+        && !nested
+        && adaptable
+    {
+        out.truncate(body_at);
+        out.push_str(&declarations(&css[open + 1..], theme));
+    }
 }
 
 /// A declaration list (`prop: value; …`) with its colour values adapted. The property decides
@@ -671,6 +697,53 @@ fn union(a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> (f32, f32, f32, f3
     (left, top, right - left, bottom - top)
 }
 
+/// The text a link actually shows. `text_content` counts `display:none`
+/// descendants, which let a phishing link hide its real domain inside a
+/// visible-looking one (`paypal.com<span display:none>.evil.example</span>`).
+fn visible_text(node: &blitz_dom::Node) -> String {
+    let mut out = String::new();
+    let mut stack = vec![node];
+    while let Some(node) = stack.pop() {
+        if let blitz_dom::NodeData::Text(data) = &node.data {
+            out.push_str(&data.content);
+        } else if paints(node) && !invisible_style(node) {
+            stack.extend(node.children.iter().rev().map(|id| node.with(*id)));
+        }
+    }
+    out
+}
+
+/// Whether an element generates a box at all: a `display:none` subtree is not laid out and
+/// not painted, so its text must not count as the link's text.
+fn paints(node: &blitz_dom::Node) -> bool {
+    node.primary_styles()
+        .is_none_or(|style| !style.clone_display().is_none())
+}
+
+/// Inline styling that hides a box's text without removing the box. A link can hide its real
+/// domain with `visibility:hidden`, `opacity:0` or `font-size:0` exactly as it would with
+/// `display:none`, and the text still reaches `text_content`.
+fn invisible_style(node: &blitz_dom::Node) -> bool {
+    let Some(raw) = node.attr(local_name!("style")) else {
+        return false;
+    };
+    let style: String = raw
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if style_value(&style, "visibility").is_some_and(|v| matches!(v, "hidden" | "collapse")) {
+        return true;
+    }
+    if style_value(&style, "opacity").and_then(|v| v.parse::<f32>().ok()) == Some(0.) {
+        return true;
+    }
+    matches!(
+        style_value(&style, "font-size").map(str::trim),
+        Some("0" | "0px" | "0em" | "0rem" | "0%")
+    )
+}
+
 impl Rendered {
     /// The link under logical point (x, y), if any.
     pub fn hit(&self, x: f32, y: f32) -> Option<&Link> {
@@ -741,18 +814,24 @@ pub fn data_url(bytes: &[u8]) -> String {
     )
 }
 
-/// A remote `http(s)` reference the body would load, with the spans it occupies.
-/// `href` is skipped: a link must stay clickable, whatever its scheme. Tracking
-/// pixels never appear here either — they are stripped before rendering, not fetched.
+/// The remote `http(s)` images the body would load. Only `<img src>` is
+/// fetched: CSS `url()`s and `background=` attributes are the other classic
+/// beacon channels, so they are never fetched — `inline_images` still swaps
+/// them for the transparent placeholder. `href` is skipped: a link must stay
+/// clickable, whatever its scheme. Tracking pixels never appear here either —
+/// they are stripped before rendering, not fetched.
 pub fn remote_images(source: &str) -> Vec<String> {
-    let tracked = tracker_srcs(source);
     let mut urls = Vec::new();
-    for (_, url) in references(source) {
+    for (start, end) in img_tags(source) {
+        let tag = &source[start..end];
+        if is_tracker(tag) {
+            continue;
+        }
+        let url = tag_attr(tag, "src").unwrap_or_default().trim();
         if (url.starts_with("http://") || url.starts_with("https://"))
-            && !tracked.contains(&url)
-            && !urls.contains(&url)
+            && !urls.iter().any(|seen| seen == url)
         {
-            urls.push(url);
+            urls.push(url.to_string());
         }
     }
     urls
@@ -886,7 +965,9 @@ fn img_tags(source: &str) -> Vec<(usize, usize)> {
     tags
 }
 
-/// The value of an attribute inside a start tag, quoted or bare.
+/// The value of an attribute inside a start tag, quoted or bare. A `/` only
+/// ends the tag directly before `>` (`<img/>`); anywhere else a browser drops
+/// it, so `<img/src=x width=1>` still reads `src` and `width`.
 fn tag_attr<'a>(tag: &'a str, want: &str) -> Option<&'a str> {
     let bytes = tag.as_bytes();
     let mut i = 0;
@@ -894,8 +975,15 @@ fn tag_attr<'a>(tag: &'a str, want: &str) -> Option<&'a str> {
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
-        if i >= bytes.len() || matches!(bytes[i], b'>' | b'/') {
+        if i >= bytes.len() || bytes[i] == b'>' {
             break;
+        }
+        if bytes[i] == b'/' {
+            if tag[i + 1..].trim_start().starts_with('>') || i + 1 >= bytes.len() {
+                break;
+            }
+            i += 1;
+            continue;
         }
         let name_at = i;
         while i < bytes.len()
@@ -936,19 +1024,20 @@ fn small_dim(value: Option<&str>) -> Option<f32> {
     value?.trim().trim_end_matches("px").parse().ok()
 }
 
-/// A `width:`/`height:` declaration inside a style attribute, in px. Declarations are
-/// matched whole, so `border-width` is not `width`.
-fn style_dim(style: &str, dim: &str) -> Option<f32> {
-    for decl in style.split(';') {
-        if let Some(value) = decl
-            .trim()
-            .strip_prefix(dim)
+/// The value of a `prop:` declaration in a whitespace-normalised style string,
+/// with any `!important` suffix stripped. Declarations are matched whole, so
+/// `border-width` is not `width`.
+fn style_value<'a>(style: &'a str, prop: &str) -> Option<&'a str> {
+    style.split(';').find_map(|decl| {
+        decl.strip_prefix(prop)
             .and_then(|v| v.strip_prefix(':'))
-        {
-            return small_dim(Some(value.trim()));
-        }
-    }
-    None
+            .map(|v| v.split('!').next().unwrap_or(v))
+    })
+}
+
+/// A `width:`/`height:` declaration inside a style attribute, in px.
+fn style_dim(style: &str, dim: &str) -> Option<f32> {
+    small_dim(style_value(style, dim))
 }
 
 /// Whether an `<img>` tag is a tracking pixel: hidden, tiny, or hosted on a beacon domain.
@@ -959,15 +1048,19 @@ fn is_tracker(tag: &str) -> bool {
     {
         return true;
     }
-    let style = tag_attr(tag, "style")
+    // Whitespace around `:` and a trailing `!important` are how real trackers
+    // hide in a style attribute, so compare on a normalised form:
+    // "display : none" is still display:none.
+    let style: String = tag_attr(tag, "style")
         .unwrap_or_default()
-        .to_ascii_lowercase();
-    if style.contains("display:none")
-        || style.contains("display: none")
-        || style.contains("visibility:hidden")
-        || style.contains("visibility: hidden")
-        || style.contains("opacity:0")
-        || style.contains("max-height:0")
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    if style_value(&style, "display") == Some("none")
+        || style_value(&style, "visibility") == Some("hidden")
+        || style_value(&style, "opacity").and_then(|v| v.parse::<f32>().ok()) == Some(0.)
+        || style_value(&style, "max-height").and_then(|v| small_dim(Some(v))) == Some(0.)
     {
         return true;
     }
@@ -978,15 +1071,6 @@ fn is_tracker(tag: &str) -> bool {
         small_dim(tag_attr(tag, "height")).or_else(|| style_dim(&style, "height")),
     ];
     dims.iter().any(Option::is_some) && dims.iter().flatten().all(|d| *d <= 2.)
-}
-
-/// The `src`s the tracker's tags carry, so fetch-time filtering agrees with strip-time.
-fn tracker_srcs(source: &str) -> std::collections::HashSet<String> {
-    img_tags(source)
-        .into_iter()
-        .filter(|(start, end)| is_tracker(&source[*start..*end]))
-        .filter_map(|(start, end)| tag_attr(&source[start..end], "src").map(str::to_string))
-        .collect()
 }
 
 /// The body with tracking pixels removed outright, before Blitz ever sees them.
@@ -1033,17 +1117,32 @@ pub fn trackers(source: &str) -> Vec<String> {
 
 // ---- Links ----------------------------------------------------------------------------
 
-/// The host a URL points at: userinfo, port and `www.` dropped; lowercased.
+/// The host a URL points at, parsed the way a browser parses it on click:
+/// `https://evil.example\@paypal.com/` goes to `evil.example`, because WHATWG
+/// treats `\` as `/` for the web schemes — a naive `rsplit('@')` read it as
+/// `paypal.com`. Userinfo, port and `www.` dropped; lowercased.
 fn url_host(url: &str) -> Option<String> {
-    let rest = url.get(url.find("://")? + 3..)?;
-    let host = rest
-        .split(['/', '?', '#'])
-        .next()?
+    let host = reqwest::Url::parse(url).ok()?.host_str()?.to_string();
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    Some(host.strip_prefix("www.").unwrap_or(&host).to_string())
+}
+
+/// The host part of a URL-shaped string that `Url::parse` rejects (no scheme,
+/// or a broken one). Same rules: userinfo and `\` delimiters handled, port and
+/// `www.` dropped.
+fn authority_host(text: &str) -> Option<String> {
+    let at = text.find("://").map_or(0, |at| at + 3);
+    let authority = text.get(at..)?.split(['/', '\\', '?', '#']).next()?;
+    let host = authority
         .rsplit('@')
         .next()?
         .split(':')
-        .next()?;
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+        .next()?
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if host.is_empty() {
         return None;
     }
@@ -1070,24 +1169,28 @@ fn registrable(host: &str) -> &str {
     &host[host.len() - labels[labels.len().saturating_sub(take)..].join(".").len()..]
 }
 
+/// Characters a link can carry that a reader never sees but a URL parser
+/// respects — zero-width spaces and joiners, word joiner, BOM, soft hyphen and
+/// the bidi controls — stripped from link text before the phishing check
+/// compares it to the destination.
+const INVISIBLE: [char; 15] = [
+    '\u{200B}', '\u{200C}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{202A}', '\u{202B}',
+    '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+];
+
 /// `text` when it reads like a URL or a bare domain (`paypal.com`, `https://x.example/a`),
 /// else `None`. The host is extracted the same way `url_host` does it.
 fn text_host(text: &str) -> Option<String> {
-    let mut text = text.trim();
+    let clean: String = text
+        .trim()
+        .chars()
+        .filter(|c| !INVISIBLE.contains(c))
+        .collect();
+    let text = clean.trim();
     if text.contains(char::is_whitespace) {
         return None;
     }
-    if let Some(at) = text.find("://") {
-        text = &text[at + 3..];
-    }
-    let host = text
-        .split(['/', '?', '#'])
-        .next()?
-        .split(':')
-        .next()?
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
-    let host = host.strip_prefix("www.").unwrap_or(&host).to_string();
+    let host = url_host(text).or_else(|| authority_host(text))?;
     // A domain has a dot and an alphabetic last label of two or more letters.
     let mut labels = host.rsplitn(2, '.');
     let tld = labels.next()?;

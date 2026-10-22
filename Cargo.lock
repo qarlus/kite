@@ -4715,6 +4715,7 @@ dependencies = [
  "gpui-kit",
  "image",
  "kite-core",
+ "reqwest",
  "serde_json",
 ]
 
