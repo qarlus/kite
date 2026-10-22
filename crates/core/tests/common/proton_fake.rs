@@ -202,6 +202,26 @@ fn encrypt_to(key: &SignedPublicKey, plaintext: &str) -> String {
         .expect("armor")
 }
 
+/// Encrypts `plaintext` ZLIB-compressed to the key's subkey — the shape a
+/// decompression bomb arrives in.
+pub fn encrypt_compressed(key: &SignedPublicKey, plaintext: &[u8]) -> String {
+    let mut rng = rand::thread_rng();
+    let mut builder = MessageBuilder::from_bytes("", plaintext.to_vec())
+        .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    let subkey = key
+        .public_subkeys
+        .iter()
+        .find(|k| k.algorithm().can_encrypt())
+        .expect("encryption subkey");
+    builder
+        .compression(pgp::types::CompressionAlgorithm::ZLIB)
+        .encrypt_to_key(&mut rng, subkey)
+        .expect("encrypt");
+    builder
+        .to_armored_string(&mut rng, Default::default())
+        .expect("armor")
+}
+
 /// Decrypts with a secret key directly, so the test does not depend on the backend's own
 /// crypto code being right.
 pub fn decrypt(key: &TestKey, armored: &str) -> Vec<u8> {
@@ -317,6 +337,8 @@ pub struct World {
     /// Require a human-verification token on the first sign-in attempt.
     pub human_verification: bool,
     pub hv_challenge: String,
+    /// The WebUrl the 9001 carries; `None` serves Proton's real verify page.
+    pub hv_web_url: Option<String>,
     /// The user solved the puzzle on verify.proton.me, which marks `hv_challenge` as verified.
     pub hv_solved: bool,
     pub user_keys: Vec<TestKey>,
@@ -364,6 +386,7 @@ impl World {
             totp: None,
             human_verification: false,
             hv_challenge: "hv-challenge-token".into(),
+            hv_web_url: None,
             hv_solved: false,
             sign_external: true,
             user_keys: vec![cached_key("user-key")],
@@ -748,7 +771,7 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                             "Details": {
                                 "HumanVerificationMethods": ["captcha"],
                                 "HumanVerificationToken": world.hv_challenge,
-                                "WebUrl": "https://verify.proton.me/?methods=captcha&token=challenge",
+                                "WebUrl": world.hv_web_url.clone().unwrap_or_else(|| "https://verify.proton.me/?methods=captcha&token=challenge".into()),
                             },
                         })
                         .to_string()

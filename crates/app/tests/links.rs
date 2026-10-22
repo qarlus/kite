@@ -162,6 +162,38 @@ async fn a_mailto_link_opens_compose_to_the_address(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+async fn a_mailto_link_keeps_an_existing_draft(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(2);
+    fixture.set_message_html(
+        2,
+        r##"<div style="padding:40px 0;text-align:center"><a href="mailto:sam@example.com">write to Sam</a></div>"##,
+    );
+    let (window, kite) = mount(cx, fixture);
+    // A draft with a recipient is worth keeping; the panel is just hidden.
+    cx.simulate_keystrokes(window.into(), "c");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.input("keep@me.com", cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "escape");
+    open_html_thread(window, cx).await;
+    cx.update_window(window.into(), |_, window, cx| {
+        window.click("html-22", cx);
+        window.render_frame(cx);
+        assert_eq!(window.find("toast").label(), Some("Draft kept"));
+    })
+    .unwrap();
+    common::update_content(window, &kite, cx, |kite, _, cx| {
+        assert_eq!(
+            kite.compose_to(cx),
+            "keep@me.com",
+            "the mailto never clobbers a draft in progress"
+        );
+    });
+}
+
+#[gpui_kit::test]
 async fn tracking_pixels_are_reported_and_never_fetched(cx: &mut TestAppContext) {
     let fixture = Fixture::new(2);
     fixture.set_message_html(

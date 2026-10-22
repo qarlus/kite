@@ -367,11 +367,20 @@ impl Kite {
     ) {
         let href = href.trim();
         if let Some(addr) = crate::html::mailto(href) {
-            self.open_compose(window, cx);
-            if let Some(compose) = &self.compose {
-                compose.to.update(cx, |state, cx| {
-                    state.set_value(addr, window, cx);
-                });
+            // Like a reply: a draft already being written is never clobbered.
+            if self.has_draft(cx) {
+                self.open_compose(window, cx);
+                self.toast("Draft kept", cx);
+            } else {
+                self.compose = None;
+                self.compose_address(
+                    Addr {
+                        name: String::new(),
+                        email: addr,
+                    },
+                    window,
+                    cx,
+                );
             }
             return;
         }
@@ -388,7 +397,7 @@ impl Kite {
             cx.notify();
             return;
         }
-        cx.open_url(&crate::html::clean_url(href));
+        crate::html::open_url(cx, &crate::html::clean_url(href));
     }
 
     /// The browser-style status pill at the reading pane's bottom-left, shown while a link
@@ -486,7 +495,7 @@ impl Kite {
                             crate::preferences::button("link-confirm-open", "Open anyway", t)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.html_cache.confirm = None;
-                                    cx.open_url(&url);
+                                    crate::html::open_url(cx, &url);
                                 })),
                         )
                         .child(
@@ -507,7 +516,7 @@ impl Kite {
     /// list column it acts on.
     fn thread_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        const GROUPS: [&[(u8, IconName, &str)]; 5] = [
+        const GROUPS: [&[(u8, IconName, &str)]; 6] = [
             &[
                 (keys::cmd::DONE, IconName::Archive, "Mark done"),
                 (keys::cmd::TRASH, IconName::Trash, "Trash"),
@@ -521,6 +530,8 @@ impl Kite {
                 (keys::cmd::REPLY_ALL, IconName::ReplyAll, "Reply all"),
                 (keys::cmd::FORWARD, IconName::Forward, "Forward"),
             ],
+            // Ctrl+U was the only way to unsubscribe, so click-first readers never found it.
+            &[(keys::cmd::UNSUBSCRIBE, IconName::MailOpen, "Unsubscribe")],
             // Shift+S is a single key, so click-first mode has no other way to summarize. It
             // goes away when AI is off, the rule the palette and the cheat sheet keep.
             &[(keys::cmd::AI_SUMMARY, IconName::Sparkles, "Summarize")],

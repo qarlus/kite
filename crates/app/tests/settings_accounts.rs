@@ -191,6 +191,45 @@ async fn human_verification_finishes_without_asking_for_a_token(cx: &mut TestApp
 // ---- per-account profile -----------------------------------------------------
 
 #[gpui_kit::test]
+async fn verification_browser_actions_only_open_http_schemes(cx: &mut TestAppContext) {
+    for url in [
+        "javascript:alert(1)",
+        "data:text/html,hello",
+        "file:///C:/Windows/win.ini",
+        "ms-settings:privacy",
+        "https://verify.proton.me/?token=ok",
+        "http://example.com/",
+    ] {
+        let fixture = Fixture::showcase();
+        *fixture.proton_step.lock().unwrap() =
+            Some(ProtonAuth::HumanVerification { url: url.into() });
+        let (window, _) = mount(cx, fixture);
+        cx.simulate_keystrokes(window.into(), "secondary-,");
+        cx.update_window(window.into(), |_, window, cx| {
+            window.render_frame(cx);
+            window.click(("settings-tab", 2usize), cx);
+            window.render_frame(cx);
+            window.click("proton-address", cx);
+            window.input("kite@proton.me", cx);
+            window.click("proton-secret", cx);
+            window.input("password", cx);
+            window.click("proton-sign-in", cx);
+        })
+        .unwrap();
+        cx.wait_for(window.into(), Duration::from_secs(5), |window, _| {
+            window.try_find("proton-verify").is_some()
+        })
+        .await;
+        cx.update_window(window.into(), |_, window, cx| {
+            window.click("proton-verify", cx);
+        })
+        .unwrap();
+        let expected = url.starts_with("http").then_some(url);
+        assert_eq!(cx.opened_url().as_deref(), expected, "{url}");
+    }
+}
+
+#[gpui_kit::test]
 fn the_accounts_page_shows_profile_fields_per_account(cx: &mut TestAppContext) {
     let fixture = Fixture::showcase();
     let (window, _) = mount(cx, fixture);

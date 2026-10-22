@@ -10,7 +10,22 @@ pub struct Unsubscribed {
     pub sender: String,
     pub archived: usize,
     pub undo: i64,
-    pub url: Option<String>,
+    /// What the header offered to do next. Nothing has been sent, posted or opened:
+    /// every kind waits on the reader before it reaches the network or a draft.
+    pub action: Option<Unsubscribe>,
+}
+
+/// What a List-Unsubscribe header offered, returned for the reader to approve.
+#[derive(Debug)]
+pub enum Unsubscribe {
+    /// An RFC 8058 one-click POST. `unsubscribe_post` runs it once the reader confirms.
+    Post { url: String, host: String },
+    /// An https page to open in the browser once the reader confirms.
+    Open { url: String, host: String },
+    /// A `mailto:` target. The UI opens compose prefilled (To + a fixed "unsubscribe"
+    /// subject — header-supplied subject and body are never trusted) for the reader
+    /// to send; Kite never sends it on its own.
+    Compose { account: Id, to: Vec<Addr> },
 }
 
 pub trait Mail: Send + Sync + 'static {
@@ -67,8 +82,14 @@ pub trait Mail: Send + Sync + 'static {
     fn archivable(&self, _view: &View, _before: Ms, _include_starred: bool) -> Result<Vec<Id>> {
         Ok(Vec::new())
     }
-    /// May contact an unsubscribe service. Call off the UI thread.
+    /// Archives the sender and reports what the header offered, without touching the
+    /// network. Call off the UI thread.
     fn unsubscribe(&self, _thread: Id) -> Result<Unsubscribed> {
+        anyhow::bail!("Unsubscribe is not available")
+    }
+    /// The RFC 8058 one-click POST the reader confirmed for `url`. Blocking; call off
+    /// the UI thread.
+    fn unsubscribe_post(&self, _url: &str) -> Result<()> {
         anyhow::bail!("Unsubscribe is not available")
     }
 

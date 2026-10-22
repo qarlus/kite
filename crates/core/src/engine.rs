@@ -1355,58 +1355,45 @@ impl Mail for Engine {
         let one_click = post
             .trim()
             .eq_ignore_ascii_case("List-Unsubscribe=One-Click");
-        let mut browser = None;
-        if let Some(url) = https.filter(|_| one_click) {
-            run_async(async {
-                let client = guarded_client(url, self.inner.opts.local_images).await?;
-                let response = client
-                    .post(url.clone())
-                    .header("Content-Type", "application/x-www-form-urlencoded")
-                    .body("List-Unsubscribe=One-Click")
-                    .send()
-                    .await?;
-                anyhow::ensure!(
-                    response.status().is_success(),
-                    "Unsubscribe request failed ({})",
-                    response.status()
-                );
-                Ok(())
-            })?;
+        let host = |url: &reqwest::Url| url.host_str().unwrap_or_default().to_string();
+        // Nothing here may reach the network or the outbox: each action is handed
+        // back for the reader to approve (see api::Unsubscribe).
+        let action = if let Some(url) = https.filter(|_| one_click) {
+            crate::api::Unsubscribe::Post {
+                url: url.to_string(),
+                host: host(url),
+            }
         } else if let Some(url) = urls.iter().find(|u| u.scheme() == "mailto") {
-            let mut draft = Draft {
-                account_id: account,
-                subject: "unsubscribe".into(),
-                body: "unsubscribe".into(),
-                ..Draft::default()
-            };
             // URL form decoding also decodes percent-escaped mailbox characters.
-            let address =
-                reqwest::Url::parse(&format!("https://unused.invalid/?address={}", url.path()))?
-                    .query_pairs()
-                    .next()
-                    .map(|(_, v)| v.into_owned())
-                    .context("unsubscribe address missing")?;
-            draft.to = address
+            let address = reqwest::Url::parse(&format!(
+                "https://unused.invalid/?address={}",
+                url.path()
+                    .replace('+', "%2B")
+                    .replace('&', "%26")
+                    .replace('#', "%23")
+            ))?
+            .query_pairs()
+            .next()
+            .map(|(_, v)| v.into_owned())
+            .context("unsubscribe address missing")?;
+            let to: Vec<Addr> = address
                 .split(',')
                 .map(|email| Addr {
                     name: String::new(),
                     email: email.trim().into(),
                 })
+                .filter(|a| !a.email.is_empty())
                 .collect();
-            for (key, value) in url.query_pairs() {
-                if key.eq_ignore_ascii_case("subject") {
-                    draft.subject = value.into_owned();
-                } else if key.eq_ignore_ascii_case("body") {
-                    draft.body = value.into_owned();
-                }
-            }
-            self.send(draft)?;
+            anyhow::ensure!(!to.is_empty(), "unsubscribe address missing");
+            crate::api::Unsubscribe::Compose { account, to }
         } else if let Some(url) = https {
-            run_async(guarded_client(url, false))?;
-            browser = Some(url.to_string());
+            crate::api::Unsubscribe::Open {
+                url: url.to_string(),
+                host: host(url),
+            }
         } else {
             bail!("No supported unsubscribe address");
-        }
+        };
         let (undo, archived) = self
             .inner
             .write(|s| s.unsubscribe_archive(account, &sender))?;
@@ -1416,7 +1403,27 @@ impl Mail for Engine {
             sender,
             archived,
             undo,
-            url: browser,
+            action: Some(action),
+        })
+    }
+
+    fn unsubscribe_post(&self, url: &str) -> Result<()> {
+        let url = reqwest::Url::parse(url).context("unsubscribe URL")?;
+        anyhow::ensure!(url.scheme() == "https", "Unsubscribe must be https");
+        run_async(async {
+            let client = guarded_client(&url, self.inner.opts.local_images).await?;
+            let response = client
+                .post(url)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body("List-Unsubscribe=One-Click")
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status().is_success(),
+                "Unsubscribe request failed ({})",
+                response.status()
+            );
+            Ok(())
         })
     }
 

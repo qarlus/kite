@@ -266,6 +266,44 @@ fn human_verification_finishes_once_the_puzzle_is_solved_in_the_browser() {
 }
 
 #[test]
+fn a_hostile_verification_url_is_replaced_with_the_proton_one() {
+    for web_url in [
+        "https://evil.example.net/steal",
+        "http://verify.proton.me/",
+        "https://verify.proton.me.evil.example/",
+        "https://verify.proton.me@evil.example/",
+        "javascript:alert(1)",
+        "",
+        "https://verify.proton.me/?token=trusted",
+        "https://account.proton.me/?token=trusted",
+    ] {
+        let rt = runtime();
+        let mut world = World::new();
+        world.human_verification = true;
+        world.hv_challenge = "tok en&=x".into();
+        world.hv_web_url = Some(web_url.into());
+        let server = rt.block_on(fake::serve(world));
+        let dir = temp_dir();
+        let engine = open_engine(&dir, &server.url);
+
+        let login = server.login();
+        let step = engine
+            .proton_sign_in(&login.email, &login.password)
+            .expect("start");
+        let ProtonAuth::HumanVerification { url } = step else {
+            panic!("expected a verification challenge, got {step:?}");
+        };
+        if web_url.ends_with("token=trusted") {
+            assert_eq!(url, web_url);
+            continue;
+        }
+        assert!(url.starts_with("https://verify.proton.me/"), "{url}");
+        // The token is carried percent-encoded inside the query.
+        assert!(url.contains("token=tok+en%26%3Dx"), "{url}");
+    }
+}
+
+#[test]
 fn threading_uses_the_references_chain() {
     let rt = runtime();
     let mut world = World::new();
@@ -1113,6 +1151,48 @@ fn missing_signed_and_undecryptable_bodies_do_not_wedge_the_event_cursor() {
         .world()
         .add_message("Next batch", ("E", "e@x"), "also delivered", &["0", "5"]);
     eventually(|| (engine.threads(&inbox(account.id), 0, 20).unwrap().len() == 4).then_some(()));
+}
+
+#[test]
+fn a_compressed_body_past_the_cap_is_stored_as_too_large_and_sync_continues() {
+    let (dir, _rt, server, engine, account) =
+        native_engine(World::new(), Duration::from_millis(20));
+    wait_live(&dir, account.id);
+    let (bomb, last) = {
+        let mut world = server.world();
+        let bomb = world.add_message("Zip bomb", ("Bad", "bad@x.com"), "x", &["0", "5"]);
+        let public = world.public_key();
+        world.message(&bomb).body = fake::encrypt_compressed(&public, &vec![b'x'; 33 << 20]);
+        let ordinary = world.add_message("Ordinary", ("A", "a@x.com"), "fine", &["0", "5"]);
+        (bomb, world.push_event(&ordinary, 2))
+    };
+    eventually(|| (stored_cursor(&dir, account.id)["event"] == last).then_some(()));
+
+    let rows = engine.threads(&inbox(account.id), 0, 20).unwrap();
+    let bomb_row = rows
+        .iter()
+        .find(|r| r.subject == "Zip bomb")
+        .expect("bomb row");
+    assert_eq!(
+        engine.thread(bomb_row.id).unwrap()[0].text,
+        "too large to decrypt"
+    );
+    assert!(
+        rows.iter().any(|r| r.subject == "Ordinary"),
+        "mail after the bomb still lands"
+    );
+    eventually(|| {
+        std::fs::read_to_string(dir.join("errors.log"))
+            .unwrap_or_default()
+            .contains(&format!(
+                "Proton message {bomb}: message is too large to decrypt"
+            ))
+            .then_some(())
+    });
+    server
+        .world()
+        .add_message("Next batch", ("B", "b@x.com"), "still fine", &["0", "5"]);
+    eventually(|| (engine.threads(&inbox(account.id), 0, 20).unwrap().len() == 3).then_some(()));
 }
 
 #[test]

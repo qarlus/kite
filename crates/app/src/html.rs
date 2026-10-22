@@ -1033,6 +1033,22 @@ pub fn trackers(source: &str) -> Vec<String> {
 
 // ---- Links ----------------------------------------------------------------------------
 
+/// The single door to the system browser: every URL the app opens goes through here,
+/// and only http(s) leaves — `javascript:`, `data:`, `file:` and anything unprefixed
+/// are dropped.
+pub fn open_url(cx: &mut gpui_kit::App, url: &str) {
+    let url = url.trim();
+    let scheme = url
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .strip_suffix(':')
+        .unwrap_or_default();
+    if scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https") {
+        cx.open_url(url);
+    }
+}
+
 /// The host a URL points at: userinfo, port and `www.` dropped; lowercased.
 fn url_host(url: &str) -> Option<String> {
     let rest = url.get(url.find("://")? + 3..)?;

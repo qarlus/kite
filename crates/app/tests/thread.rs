@@ -370,6 +370,13 @@ fn the_thread_toolbar_replies_by_click(cx: &mut TestAppContext) {
             Some("Reply (r)"),
             "a toolbar button names the key that runs it"
         );
+        assert!(
+            window
+                .find(("action", kite::keys::cmd::UNSUBSCRIBE as usize))
+                .label()
+                .is_some_and(|label| label.starts_with("Unsubscribe")),
+            "unsubscribe is a button too, not only a shortcut"
+        );
         window.click(("action", kite::keys::cmd::REPLY as usize), cx);
         window.render_frame(cx);
         assert!(
