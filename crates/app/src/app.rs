@@ -10,6 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable, WindowExt as _};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
@@ -121,6 +122,17 @@ pub enum Overlay {
     Zero(palette::Zero),
     /// "Ask your inbox": a question over local mail with a streamed, cited answer.
     Ask(ask::Ask),
+    /// The unsubscribe target the reader still has to approve before anything
+    /// leaves the app.
+    Unsubscribe(UnsubConfirm),
+}
+
+/// The unsubscribe confirm: `post` sends the RFC 8058 one-click body through the
+/// engine, otherwise the browser opens `url`. The dialog always names `host`.
+pub struct UnsubConfirm {
+    pub url: String,
+    pub host: String,
+    pub post: bool,
 }
 
 /// Which pane the keyboard is working in: the list, or the open conversation beside it.
@@ -859,6 +871,35 @@ impl Kite {
         cx.notify();
     }
 
+    /// The reader approved the unsubscribe target: POST runs through the engine,
+    /// anything else opens in the browser (still http(s) only).
+    fn confirm_unsubscribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Overlay::Unsubscribe(confirm) = std::mem::replace(&mut self.overlay, Overlay::None)
+        else {
+            return;
+        };
+        window.focus(&self.focus, cx);
+        if confirm.post {
+            let mail = self.mail.clone();
+            let url = confirm.url;
+            let task = cx
+                .background_executor()
+                .spawn(async move { mail.unsubscribe_post(&url) });
+            cx.spawn(async move |this, cx| {
+                let result = task.await;
+                this.update(cx, |this, cx| match result {
+                    Ok(()) => this.toast("Unsubscribe request sent".to_string(), cx),
+                    Err(error) => this.toast(format!("Could not unsubscribe: {error}"), cx),
+                })
+                .ok();
+            })
+            .detach();
+        } else {
+            crate::html::open_url(cx, &confirm.url);
+        }
+        cx.notify();
+    }
+
     /// A clicked action's quiet "the keyboard does this too" toast. Keyboard mode and the
     /// Settings › Shortcuts switch gate it; a command shows at most one tip a day, retires
     /// once its key ran the command three times, and tips stay ~30 s apart.
@@ -1029,11 +1070,33 @@ impl Kite {
                         let result = task.await;
                         this.update(cx, |this, cx| match result {
                             Ok(result) => {
-                                if let Some(url) = result.url { cx.open_url(&url); }
                                 this.record_undo(result.undo);
                                 this.reload();
                                 if this.open.as_ref().is_some_and(|open| open.id == thread) { this.open=None; }
                                 this.show_toast(format!("Unsubscribed from {} · archived {} · undo restores mail only", result.sender, result.archived), false, true, cx);
+                                match result.action {
+                                    Some(kite_core::api::Unsubscribe::Post { url, host }) => {
+                                        this.overlay = Overlay::Unsubscribe(UnsubConfirm { url, host, post: true });
+                                    }
+                                    Some(kite_core::api::Unsubscribe::Open { url, host }) => {
+                                        this.overlay = Overlay::Unsubscribe(UnsubConfirm { url, host, post: false });
+                                    }
+                                    Some(kite_core::api::Unsubscribe::Compose { account, to }) => {
+                                        if this.has_draft(cx) {
+                                            this.compose_open = true;
+                                            this.toast("Draft kept", cx);
+                                        } else {
+                                            this.open_draft = Some(kite_core::model::Draft {
+                                                account_id: account,
+                                                to,
+                                                subject: "unsubscribe".into(),
+                                                body: "unsubscribe".into(),
+                                                ..Default::default()
+                                            });
+                                        }
+                                    }
+                                    None => {}
+                                }
                             }
                             Err(error) => this.toast(format!("Could not unsubscribe: {error}"), cx),
                         }).ok();
@@ -1683,6 +1746,17 @@ impl Kite {
                 }
                 "enter" => {
                     self.create_folder(cx);
+                    cx.stop_propagation();
+                }
+                _ => {}
+            },
+            Overlay::Unsubscribe(_) => match key {
+                "escape" => {
+                    self.close_overlay(cx);
+                    cx.stop_propagation();
+                }
+                "enter" => {
+                    self.confirm_unsubscribe(window, cx);
                     cx.stop_propagation();
                 }
                 _ => {}
@@ -2776,6 +2850,99 @@ impl Render for Kite {
 }
 
 impl Kite {
+    /// The small confirm naming the host an unsubscribe POST or browser open would reach.
+    fn render_unsubscribe(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        let Overlay::Unsubscribe(confirm) = &self.overlay else {
+            return div().into_any_element();
+        };
+        let (label, tip, icon) = if confirm.post {
+            (
+                format!(
+                    "Kite will send a one-click unsubscribe request to {}.",
+                    confirm.host
+                ),
+                format!("Unsubscribe via {}", confirm.host),
+                IconName::Send,
+            )
+        } else {
+            (
+                format!(
+                    "Open {} in your browser to finish unsubscribing.",
+                    confirm.host
+                ),
+                format!("Open {}", confirm.host),
+                IconName::ExternalLink,
+            )
+        };
+        let ink = if theme::contrast(t.fg, t.accent) > theme::contrast(t.bg, t.accent) {
+            t.fg
+        } else {
+            t.bg
+        };
+        crate::list::overlay_dismissable(
+            &t,
+            px(0.),
+            true,
+            div()
+                .id("unsub-confirm")
+                .test_support()
+                .aria_label(label.clone())
+                .w(px(360.))
+                .rounded(px(theme::RADIUS))
+                .bg(t.bg2)
+                .border_1()
+                .border_color(t.line)
+                .shadow_lg()
+                .p_5()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .text_size(t.px(15.))
+                        .font_weight(FontWeight(650.))
+                        .child("Unsubscribe"),
+                )
+                .child(
+                    div()
+                        .id("unsub-confirm-host")
+                        .test_support()
+                        .aria_label(confirm.host.clone())
+                        .text_size(t.px(12.))
+                        .text_color(t.fg2)
+                        .child(label),
+                )
+                .child(
+                    div().flex().items_center().justify_end().child(
+                        div()
+                            .id("unsub-confirm-go")
+                            .test_support()
+                            .aria_label(tip.clone())
+                            .size(px(32.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(theme::RADIUS_SM))
+                            .bg(t.accent)
+                            .text_color(ink)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+                            .child(Icon::new(icon).with_size(px(16.)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.confirm_unsubscribe(window, cx)
+                            })),
+                    ),
+                ),
+            cx.listener(|this, _, window, cx| {
+                this.close_overlay(cx);
+                window.focus(&this.focus, cx);
+            }),
+        )
+        .into_any_element()
+    }
+
     fn render_overlay(
         &mut self,
         window: &mut Window,
@@ -2792,6 +2959,7 @@ impl Kite {
             Overlay::Tags(_) | Overlay::NewTag(_) => Some(tags::render(self, window, cx)),
             Overlay::Zero(_) => Some(palette::render_zero(self, window, cx)),
             Overlay::Ask(_) => Some(ask::render(self, window, cx)),
+            Overlay::Unsubscribe(_) => Some(self.render_unsubscribe(window, cx)),
         }
     }
 }

@@ -121,6 +121,10 @@ impl Keyring {
                 .and_then(|message| secret.decrypt_message(message));
             match result {
                 Ok(plain) => return Ok(plain),
+                // Oversized plaintext is the same under every key; stop at the first hit.
+                Err(error) if error.is::<TooLarge>() => {
+                    return Err(error.context(format!("key {}", secret.id)));
+                }
                 Err(error) => last = Some(error.context(format!("key {}", secret.id))),
             }
         }
@@ -136,6 +140,9 @@ impl Keyring {
                 .and_then(|message| secret.decrypt_message(message));
             match result {
                 Ok(plain) => return Ok(plain),
+                Err(error) if error.is::<TooLarge>() => {
+                    return Err(error.context(format!("key {}", secret.id)));
+                }
                 Err(error) => last = Some(error.context(format!("key {}", secret.id))),
             }
         }
@@ -305,16 +312,34 @@ pub fn session_key_packet(public_key: &SignedPublicKey, session_key: &str) -> Re
     Ok(b64(&out))
 }
 
-/// Reads the whole plaintext out of a decrypted message, decompressing first when the
-/// sender wrapped it.
+/// The largest plaintext a decrypted message may expand to. A compressed bomb stops
+/// here instead of exhausting memory; the body is stored as "too large to decrypt".
+pub const PLAINTEXT_CAP: u64 = 32 << 20;
+
+/// The decrypted message expanded past [`PLAINTEXT_CAP`].
+#[derive(Debug)]
+pub struct TooLarge;
+
+impl std::fmt::Display for TooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("message is too large to decrypt")
+    }
+}
+
+impl std::error::Error for TooLarge {}
+
+/// Reads the plaintext out of a decrypted message, decompressing first when the sender
+/// wrapped it, and refusing to expand past [`PLAINTEXT_CAP`].
 fn plaintext(mut message: Message<'_>) -> Result<Vec<u8>> {
     if message.is_compressed() {
         message = message.decompress().context("decompress Proton message")?;
     }
     let mut out = Vec::new();
     message
+        .take(PLAINTEXT_CAP + 1)
         .read_to_end(&mut out)
         .context("read Proton message")?;
+    anyhow::ensure!(out.len() as u64 <= PLAINTEXT_CAP, TooLarge);
     Ok(out)
 }
 

@@ -910,12 +910,29 @@ fn bare_msg_id(raw: &str) -> String {
         .to_string()
 }
 
+/// The most text or HTML one message may store, so a hostile body cannot grow the
+/// database without bound (a PGP bomb already stops at the Proton plaintext cap).
+const BODY_CAP: usize = 2 << 20;
+
+fn cap_body(text: &str) -> &str {
+    if text.len() <= BODY_CAP {
+        return text;
+    }
+    let mut end = BODY_CAP;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn upsert_message(
     tx: &Transaction,
     account_id: Id,
     account_email: &str,
     m: &RemoteMsg,
 ) -> Result<Id> {
+    let text = cap_body(&m.text);
+    let html = m.html.as_deref().map(cap_body);
     let from_email = m.from.email.trim().to_ascii_lowercase();
     let from_name = display_name(&m.from.name, &from_email);
     let from_self = !account_email.is_empty() && from_email == account_email;
@@ -957,7 +974,7 @@ fn upsert_message(
                    unread=CASE WHEN ?22 THEN unread ELSE ?16 END, starred=CASE WHEN ?22 THEN starred ELSE ?17 END,
                    important=?18, important_src=?19, from_self=?20, list_unsubscribe=?23 WHERE id=?21",
                 params![m.folder, mailbox, m.thread_hint, m.message_id, m.in_reply_to, refs_json, from_name,
-                        from_email, to_json, cc_json, m.date, m.subject, ns, m.text, m.html, m.unread,
+                        from_email, to_json, cc_json, m.date, m.subject, ns, text, html, m.unread,
                         m.starred, important, src, from_self, id,
                         tx.query_row("SELECT EXISTS(SELECT 1 FROM pending_ops WHERE message_id=?1)", [id], |r| r.get::<_, bool>(0))?,
                         m.list_unsubscribe],
@@ -1001,7 +1018,7 @@ fn upsert_message(
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24)",
                 params![account_id, thread_id, m.remote_id, m.folder, mailbox, m.thread_hint, m.message_id,
                         m.in_reply_to, refs_json, from_name, from_email, to_json, cc_json, m.date, m.subject,
-                        ns, m.text, m.html, m.unread, m.starred, important, src, from_self, m.list_unsubscribe],
+                        ns, text, html, m.unread, m.starred, important, src, from_self, m.list_unsubscribe],
             )?;
             let id = tx.last_insert_rowid();
             tx.execute(

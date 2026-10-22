@@ -313,7 +313,7 @@ fn proton_form(kite: &Kite, t: Theme, cx: &mut Context<Kite>) -> AnyElement {
                 ))
                 .child(
                     button("proton-verify", "Open verification page", t).on_click(
-                        cx.listener(move |_, _, _, cx| cx.open_url(&url)),
+                        cx.listener(move |_, _, _, cx| crate::html::open_url(cx, &url)),
                     ),
                 )
                 .child(

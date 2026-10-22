@@ -195,15 +195,7 @@ impl SignIn {
                     .downcast_ref::<api::ApiError>()
                     .and_then(|e| e.challenge())
                 {
-                    let url = if challenge.web_url.is_empty() {
-                        let methods = challenge.methods.join(",");
-                        format!(
-                            "https://verify.proton.me/?methods={methods}&token={}",
-                            challenge.token
-                        )
-                    } else {
-                        challenge.web_url.clone()
-                    };
+                    let url = verify_url(&challenge);
                     self.challenge = Some(challenge);
                     self.pending = Pending::Srp;
                     return Ok(Step::HumanVerification { url });
@@ -309,6 +301,29 @@ impl SignIn {
         });
         Ok(Step::Done)
     }
+}
+
+/// The page the reader solves the 9001 challenge in. Proton's `WebUrl` is used only
+/// when it really is a Proton verify page over https; anything else falls back to the
+/// URL Bridge builds, with token and methods percent-encoded.
+fn verify_url(challenge: &api::Challenge) -> String {
+    let trusted = reqwest::Url::parse(&challenge.web_url)
+        .ok()
+        .is_some_and(|url| {
+            url.scheme() == "https"
+                && matches!(
+                    url.host_str(),
+                    Some("verify.proton.me" | "account.proton.me")
+                )
+        });
+    if trusted {
+        return challenge.web_url.clone();
+    }
+    let mut url = reqwest::Url::parse("https://verify.proton.me/").expect("constant URL");
+    url.query_pairs_mut()
+        .append_pair("methods", &challenge.methods.join(","))
+        .append_pair("token", &challenge.token);
+    url.to_string()
 }
 
 /// The backend for one Proton account.
@@ -912,6 +927,10 @@ fn remote_msg(keys: &Keyring, message: &api::Message) -> Result<(RemoteMsg, Opti
     {
         match keys.decrypt(&message.body) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(error) if error.is::<crypto::TooLarge>() => {
+                warning = Some("message is too large to decrypt".to_string());
+                "too large to decrypt".to_string()
+            }
             Err(_) => {
                 warning = Some("could not decrypt; showing the original body".to_string());
                 message.body.clone()

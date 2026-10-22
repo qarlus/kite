@@ -437,7 +437,8 @@ fn mailto_unsubscribe_uses_receiving_account_archives_exact_sender_undo_and_futu
     let dir = temp_dir();
     let account = local_account(&dir);
     let store = Store::open(&dir.join("kite.db")).unwrap();
-    let header = "<mailto:leave@newsletter.example?subject=Stop%20mail&body=Remove%20me>";
+    let header =
+        "<mailto:leave+news%2Btest@newsletter.example?subject=Stop%20mail&body=Remove%20me>";
     store
         .apply_deltas(
             account.id,
@@ -482,12 +483,18 @@ fn mailto_unsubscribe_uses_receiving_account_archives_exact_sender_undo_and_futu
             .len(),
         1
     );
-    let pending = store.outbox_due(i64::MAX).unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].1.account_id, account.id);
-    assert_eq!(pending[0].1.to[0].email, "leave@newsletter.example");
-    assert_eq!(pending[0].1.subject, "Stop mail");
-    assert_eq!(pending[0].1.body, "Remove me");
+    // A mailto target comes back for the reader: nothing is ever sent on its own,
+    // and the header's subject/body are dropped entirely.
+    let Some(kite_core::api::Unsubscribe::Compose { account: who, to }) = result.action else {
+        panic!("expected a compose action, got {:?}", result.action)
+    };
+    assert_eq!(who, account.id);
+    assert_eq!(to.len(), 1);
+    assert_eq!(to[0].email, "leave+news+test@newsletter.example");
+    assert!(
+        store.outbox_due(i64::MAX).unwrap().is_empty(),
+        "mailto unsubscribe never queues a send"
+    );
     engine.undo(result.undo).unwrap();
     assert_eq!(engine.threads(&inbox, 0, 10).unwrap().len(), 2);
     drop(store);
@@ -520,13 +527,12 @@ fn mailto_unsubscribe_uses_receiving_account_archives_exact_sender_undo_and_futu
 }
 
 #[test]
-fn unsubscribe_refuses_private_addresses_before_archiving() {
+fn unsubscribe_post_refuses_private_addresses() {
     use kite_core::sync::Delta;
     for url in [
         "https://127.0.0.1/unsubscribe",
         "https://10.0.0.1/unsubscribe",
         "https://[::ffff:127.0.0.1]/unsubscribe",
-        "http://example.com/unsubscribe",
     ] {
         let dir = temp_dir();
         let account = local_account(&dir);
@@ -549,9 +555,41 @@ fn unsubscribe_refuses_private_addresses_before_archiving() {
             folder: None,
         };
         let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
-        assert!(engine.unsubscribe(thread).is_err(), "must refuse {url}");
-        assert_eq!(engine.threads(&inbox, 0, 10).unwrap().len(), 1);
+        // The POST waits on the reader's confirm, so `unsubscribe` only reports it.
+        let result = engine.unsubscribe(thread).unwrap();
+        let Some(kite_core::api::Unsubscribe::Post { url: target, .. }) = result.action else {
+            panic!("expected a POST action for {url}")
+        };
+        assert!(
+            engine.unsubscribe_post(&target).is_err(),
+            "must refuse {url}"
+        );
     }
+    // Non-https targets are refused outright, before anything is archived.
+    let dir = temp_dir();
+    let account = local_account(&dir);
+    let store = Store::open(&dir.join("kite.db")).unwrap();
+    store
+        .apply_deltas(
+            account.id,
+            &[Delta::Upsert(Box::new(newsletter(
+                "plain-http",
+                "<http://example.com/unsubscribe>",
+            )))],
+        )
+        .unwrap();
+    let engine = engine(&dir);
+    let inbox = View {
+        account_id: Some(account.id),
+        mailbox: Mailbox::Inbox,
+        split: None,
+        query: None,
+        folder: None,
+    };
+    let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
+    assert!(engine.unsubscribe(thread).is_err());
+    assert_eq!(engine.threads(&inbox, 0, 10).unwrap().len(), 1);
+    assert!(engine.unsubscribe_post("http://example.com/x").is_err());
 }
 
 #[test]
@@ -670,11 +708,15 @@ fn one_click_unsubscribe_posts_rfc8058_body_over_https() {
         folder: None,
     };
     let thread = engine.threads(&inbox, 0, 10).unwrap()[0].id;
-    let result = engine.unsubscribe(thread);
+    let result = engine.unsubscribe(thread).unwrap();
+    let Some(kite_core::api::Unsubscribe::Post { url, host }) = result.action else {
+        panic!("expected a one-click POST action")
+    };
+    assert_eq!(host, "127.0.0.1");
+    engine.unsubscribe_post(&url).unwrap();
     let request = rx.recv_timeout(Duration::from_secs(2));
     let _ = child.kill();
     let _ = child.wait();
-    let result = result.unwrap();
     let (header, body) = request.unwrap();
     assert!(header.starts_with("POST /leave HTTP/1.1"));
     assert!(

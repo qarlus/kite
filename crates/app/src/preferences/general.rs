@@ -209,7 +209,7 @@ fn updates(kite: &Kite, cx: &mut Context<Kite>) -> AnyElement {
                     if cfg!(all(windows, target_arch = "x86_64")) {
                         this.install_update(cx);
                     } else {
-                        cx.open_url("https://github.com/qarlus/kite/releases/latest");
+                        crate::html::open_url(cx, "https://github.com/qarlus/kite/releases/latest");
                     }
                 },
             )));

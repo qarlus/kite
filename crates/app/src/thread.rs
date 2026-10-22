@@ -367,11 +367,20 @@ impl Kite {
     ) {
         let href = href.trim();
         if let Some(addr) = crate::html::mailto(href) {
-            self.open_compose(window, cx);
-            if let Some(compose) = &self.compose {
-                compose.to.update(cx, |state, cx| {
-                    state.set_value(addr, window, cx);
-                });
+            // Like a reply: a draft already being written is never clobbered.
+            if self.has_draft(cx) {
+                self.open_compose(window, cx);
+                self.toast("Draft kept", cx);
+            } else {
+                self.compose = None;
+                self.compose_address(
+                    Addr {
+                        name: String::new(),
+                        email: addr,
+                    },
+                    window,
+                    cx,
+                );
             }
             return;
         }
@@ -388,7 +397,7 @@ impl Kite {
             cx.notify();
             return;
         }
-        cx.open_url(&crate::html::clean_url(href));
+        crate::html::open_url(cx, &crate::html::clean_url(href));
     }
 
     /// The browser-style status pill at the reading pane's bottom-left, shown while a link
@@ -486,7 +495,7 @@ impl Kite {
                             crate::preferences::button("link-confirm-open", "Open anyway", t)
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.html_cache.confirm = None;
-                                    cx.open_url(&url);
+                                    crate::html::open_url(cx, &url);
                                 })),
                         )
                         .child(

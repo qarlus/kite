@@ -2344,6 +2344,22 @@ fn the_contact_card_counts_dates_reply_habits_recent_mail_and_files() {
     assert!(s.contact("", None).unwrap().is_none());
 }
 
+#[test]
+fn stored_text_and_html_are_capped_at_two_mebibytes() {
+    let s = Store::memory().unwrap();
+    let a = s.add_account(Provider::Proton, "me@x.com", "Me").unwrap();
+    let mut m = body(msg("big", "bob@b.com", "Huge", JAN2), &"x".repeat(3 << 20));
+    m.html = Some(format!("<b>{}</b>", "y".repeat(3 << 20)));
+    s.apply_deltas(a.id, &[up(m)]).unwrap();
+    let message = &s.thread(thread_id(&s, "Huge")).unwrap()[0];
+    assert_eq!(message.text.len(), 2 << 20, "text is stored capped");
+    assert_eq!(
+        message.html.as_deref().unwrap().len(),
+        2 << 20,
+        "html is stored capped"
+    );
+}
+
 // ------------------------------------------------------------------- drafts
 
 fn draft_to(account: Id, subject: &str, body: &str) -> Draft {
