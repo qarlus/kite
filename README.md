@@ -102,7 +102,7 @@ Kite ships with its own Microsoft registration, so this is only for developers w
 
 ### Releasing
 
-Releases are built, signed and published by CI (`.github/workflows/release.yml`) when a version tag is pushed. The tag must match the version in `Cargo.toml`, and the tag message becomes the release notes.
+Releases are built, signed and published by CI (`.github/workflows/release.yml`) when a version tag is pushed. The tag must match the version in `Cargo.toml`, and the tag message becomes the release notes. CI refuses a tag that does not point at a commit on `main`.
 
 ```sh
 # 1. Bump [workspace.package].version in Cargo.toml, then refresh Cargo.lock:
@@ -113,7 +113,12 @@ git tag -a v0.2.0 -m "What's new in 0.2.0"
 git push && git push --tags
 ```
 
-CI publishes `kite-windows-x86_64.exe`, its minisign signature, and `latest.json`, which installed copies of Kite check for updates.
+The workflow has two jobs. `build` needs no secrets and no write access: it checks the tag against `main` and the version, builds the exe, enforces the 24 MiB budget and uploads the exe with its SHA-256. `sign-and-publish` runs in the `release` environment (required reviewers), re-checks that checksum, signs with `KITE_UPDATE_KEY` and publishes `kite-windows-x86_64.exe`, its minisign signature and `latest.json`, which installed copies of Kite check for updates. Every third-party action is pinned to a commit SHA.
+
+Two settings in the repository make that safe, and both belong to the owner:
+
+- **Tag rulesets.** Only the owner may create or move `v*` tags, so no one else can ask CI to build and publish a release. GitHub › *Settings* › *Rules* › *Rulesets* › *New ruleset* › *New tag ruleset*: target `v*`, enable *Restrict creations* and *Restrict updates*, *Restrict deletions*, and *Bypass list* = repository admin only.
+- **The `release` environment.** GitHub › *Settings* › *Environments* › *New environment* › name it `release` › *Required reviewers*: add yourself (and any other release approver). Add the `KITE_UPDATE_KEY` secret to that environment only, so a workflow run that was not approved never sees the signing key.
 
 ### Project docs
 

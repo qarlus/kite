@@ -238,10 +238,29 @@ pub fn verify(path: &Path, signature: &str) -> Result<()> {
     Ok(())
 }
 
+/// The checks that make a release safe to move into place, repeated at install time so a
+/// replayed or relabelled manifest cannot install bytes the running build should refuse.
+/// `current` is the version of the running build.
+#[doc(hidden)]
+pub fn check_install(release: &Release, current: &str) -> Result<()> {
+    let signature = Signature::decode(&release.windows.signature)?;
+    ensure!(
+        signature.trusted_comment() == format!("Kite {} windows-x86_64", release.version),
+        "Update signature does not match the release version and platform"
+    );
+    ensure!(
+        newer(&release.version, current)?,
+        "Update {} is not newer than {current}",
+        release.version
+    );
+    Ok(())
+}
+
 /// Swap only verified bytes; the UI must quit cleanly after this returns successfully.
+/// The signature travels in memory from the download, so no `.minisig` file has to survive.
 #[cfg(windows)]
-pub fn install(verified_exe: &Path) -> Result<()> {
-    let signature = fs::read_to_string(verified_exe.with_extension("minisig"))?;
+pub fn install(verified_exe: &Path, release: &Release) -> Result<()> {
+    check_install(release, env!("CARGO_PKG_VERSION"))?;
     let current = std::env::current_exe()?;
     let old = old_path(&current);
     ensure!(
@@ -259,7 +278,7 @@ pub fn install(verified_exe: &Path) -> Result<()> {
         std::io::copy(&mut File::open(verified_exe)?, &mut file)?;
         file.sync_all()?;
         drop(file);
-        verify(&stage, &signature)?;
+        verify(&stage, &release.windows.signature)?;
         fs::rename(&current, &old).context("Could not back up the running Kite executable")?;
         if let Err(error) = fs::rename(&stage, &current) {
             fs::rename(&old, &current)
@@ -281,7 +300,7 @@ pub fn install(verified_exe: &Path) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub fn install(_verified_exe: &Path) -> Result<()> {
+pub fn install(_verified_exe: &Path, _release: &Release) -> Result<()> {
     anyhow::bail!(
         "Automatic installation is not supported yet on this platform; download from GitHub"
     )
@@ -291,6 +310,23 @@ fn old_path(exe: &Path) -> PathBuf {
     let mut path = exe.as_os_str().to_os_string();
     path.push(".old");
     PathBuf::from(path)
+}
+
+/// An install that died between the two renames leaves the executable only as `.old`. Put it back
+/// before anything else runs, so a half-applied update cannot leave Kite unlaunchable.
+pub fn restore_old() -> Result<bool> {
+    restore_at(&std::env::current_exe()?)
+}
+
+/// Injectable path for integration tests; production passes the running executable.
+#[doc(hidden)]
+pub fn restore_at(current: &Path) -> Result<bool> {
+    let old = old_path(current);
+    if !old.exists() || current.exists() {
+        return Ok(false);
+    }
+    fs::rename(&old, current).context("Could not restore the previous Kite executable")?;
+    Ok(true)
 }
 
 pub fn cleanup_old() -> Result<()> {
@@ -319,7 +355,7 @@ pub fn install_release(release: &Release) -> Result<()> {
     );
     let result = (|| {
         let path = blocking(download_and_verify(release, &crate::engine::data_dir()))?;
-        let result = install(&path);
+        let result = install(&path, release);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("minisig"));
         result
