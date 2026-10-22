@@ -516,7 +516,7 @@ impl Kite {
     /// list column it acts on.
     fn thread_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
-        const GROUPS: [&[(u8, IconName, &str)]; 5] = [
+        const GROUPS: [&[(u8, IconName, &str)]; 6] = [
             &[
                 (keys::cmd::DONE, IconName::Archive, "Mark done"),
                 (keys::cmd::TRASH, IconName::Trash, "Trash"),
@@ -530,6 +530,8 @@ impl Kite {
                 (keys::cmd::REPLY_ALL, IconName::ReplyAll, "Reply all"),
                 (keys::cmd::FORWARD, IconName::Forward, "Forward"),
             ],
+            // Ctrl+U was the only way to unsubscribe, so click-first readers never found it.
+            &[(keys::cmd::UNSUBSCRIBE, IconName::MailOpen, "Unsubscribe")],
             // Shift+S is a single key, so click-first mode has no other way to summarize. It
             // goes away when AI is off, the rule the palette and the cheat sheet keep.
             &[(keys::cmd::AI_SUMMARY, IconName::Sparkles, "Summarize")],
