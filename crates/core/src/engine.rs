@@ -330,6 +330,7 @@ impl Engine {
 
     pub fn open_with(dir: &Path, secrets: Secrets, opts: Options) -> Result<Arc<Engine>> {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+        crate::attachments::sweep(&crate::attachments::temp_root());
         let path = dir.join("kite.db");
         let writer = Store::open(&path)?;
         let reader = Store::open(&path)?;
@@ -364,6 +365,41 @@ impl Engine {
             });
         let _ = inner.wake.try_send(false);
         Ok(Arc::new(Engine { inner }))
+    }
+
+    fn stage_attachment(&self, id: Id, reveal: bool) -> Result<PathBuf> {
+        let crate::store::AttachmentSource {
+            account_id,
+            message,
+            attachment,
+            name,
+            size,
+        } = self
+            .inner
+            .read(|s| s.attachment(id))?
+            .context("no such attachment")?;
+        anyhow::ensure!(
+            reveal || !crate::attachments::blocked(&crate::attachments::file_name(&name)),
+            "This attachment can't be opened safely. Use Show in folder instead."
+        );
+        anyhow::ensure!(
+            (0..=crate::attachments::MAX_DOWNLOAD as i64).contains(&size),
+            "Attachment is too large (limit: 50 MB)"
+        );
+        let account = self
+            .inner
+            .read(Store::accounts)?
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .context("account was removed")?;
+        let mut backend = backend_for(&self.inner, &account)?;
+        let bytes = run_async(backend.attachment(&message, &attachment))?;
+        persist_tokens(&self.inner, account_id, &mut backend)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= crate::attachments::MAX_DOWNLOAD,
+            "Attachment is too large (limit: 50 MB)"
+        );
+        crate::attachments::stage(&crate::attachments::temp_root(), &name, &bytes)
     }
 
     fn wake(&self) {
@@ -1540,29 +1576,11 @@ impl Mail for Engine {
     }
 
     fn open_attachment(&self, id: Id) -> Result<()> {
-        let (account_id, message, attachment, name) = self
-            .inner
-            .read(|s| s.attachment(id))?
-            .context("no such attachment")?;
-        let account = self
-            .inner
-            .read(Store::accounts)?
-            .into_iter()
-            .find(|a| a.id == account_id)
-            .context("account was removed")?;
-        let mut backend = backend_for(&self.inner, &account)?;
-        let bytes = run_async(backend.attachment(&message, &attachment))?;
-        persist_tokens(&self.inner, account_id, &mut backend)?;
-        let dir = std::env::temp_dir().join("kite");
-        std::fs::create_dir_all(&dir)?;
-        let file = dir.join(
-            Path::new(&name)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("attachment"),
-        );
-        std::fs::write(&file, &bytes)?;
-        open_path(&file)
+        open_path(&self.stage_attachment(id, false)?)
+    }
+
+    fn reveal_attachment(&self, id: Id) -> Result<()> {
+        crate::attachments::reveal(&self.stage_attachment(id, true)?)
     }
 
     fn fetch_image(&self, url: &str) -> Result<Vec<u8>> {

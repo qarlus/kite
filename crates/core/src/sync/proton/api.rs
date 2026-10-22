@@ -171,6 +171,18 @@ impl Api {
         headers: &[(&str, &str)],
         bearer: Option<&str>,
     ) -> Result<Value> {
+        let response = self.request(method, path, body, headers, bearer).await?;
+        self.json_response(response, false).await
+    }
+
+    async fn request(
+        &mut self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+        headers: &[(&str, &str)],
+        bearer: Option<&str>,
+    ) -> Result<reqwest::Response> {
         if let Some(error) = self
             .cooldown
             .lock()
@@ -204,6 +216,14 @@ impl Api {
         {
             self.server_time = Some(time);
         }
+        Ok(response)
+    }
+
+    async fn json_response(
+        &mut self,
+        response: reqwest::Response,
+        attachment: bool,
+    ) -> Result<Value> {
         let status = response.status().as_u16();
         let retry_at = matches!(status, 429 | 503).then(|| {
             let now = crate::auth::now_ms();
@@ -225,7 +245,11 @@ impl Api {
             now.saturating_add(delay)
                 .saturating_add(rand::thread_rng().gen_range(0..=10_000))
         });
-        let text = response.text().await.unwrap_or_default();
+        let text = if attachment {
+            String::from_utf8_lossy(&crate::attachments::download(response).await?).into_owned()
+        } else {
+            response.text().await.unwrap_or_default()
+        };
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
         if (200..300).contains(&status) && !is_error_code(&value) {
             return Ok(value);
@@ -385,15 +409,31 @@ impl Api {
         serde_json::from_value(value["Message"].clone()).context("Proton message")
     }
 
-    pub async fn attachment(&mut self, id: &str) -> Result<AttachmentData> {
-        let value = self
-            .call(
-                reqwest::Method::GET,
-                &format!("/mail/v4/attachments/{id}"),
-                None,
-            )
-            .await?;
-        serde_json::from_value(value["Attachment"].clone()).context("Proton attachment")
+    pub async fn attachment(&mut self, id: &str) -> Result<Vec<u8>> {
+        for attempt in 0..2 {
+            let uid = self.uid.clone();
+            let access = self.access.clone();
+            anyhow::ensure!(!access.is_empty(), "not signed in to Proton");
+            let response = self
+                .request(
+                    reqwest::Method::GET,
+                    &format!("/mail/v4/attachments/{id}"),
+                    None,
+                    &[("x-pm-uid", &uid)],
+                    Some(&access),
+                )
+                .await?;
+            if response.status().is_success() {
+                return crate::attachments::download(response).await;
+            }
+            let error = self.json_response(response, true).await;
+            match error {
+                Err(e) if attempt == 0 && is_auth_expired(&e) => self.refresh_auth().await?,
+                Err(e) => return Err(e),
+                Ok(_) => bail!("Proton attachment download failed"),
+            }
+        }
+        bail!("Proton attachment authentication failed")
     }
 
     pub async fn latest_event(&mut self) -> Result<String> {
@@ -741,13 +781,6 @@ pub struct AttachmentMeta {
     pub size: i64,
     #[serde(rename = "MIMEType", default)]
     pub mime_type: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct AttachmentData {
-    #[serde(default)]
-    pub data: String,
     #[serde(default)]
     pub key_packets: String,
 }

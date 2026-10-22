@@ -814,7 +814,7 @@ async fn delta_sync_pages_maps_fields_and_deletes() {
             200,
             json!({ "responses": [
                 { "id": "0", "status": 200, "body": { "value": [
-                    { "id": "a1", "name": "report.pdf", "contentType": "application/pdf", "size": 1234 }
+                    { "id": "a1", "name": "re\u{202e}port\u{2069}\u{200f}\u{7}\u{80}.pdf", "contentType": "application/pdf", "size": 1234 }
                 ] } }
             ] }),
         ),
@@ -2468,4 +2468,79 @@ async fn scheduled_view_reschedule_and_send_now_delete_handed_over_graph_item_fi
         fake.path("/me/messages/expired-sent").is_empty(),
         "expired mail is not cancelled or resent"
     );
+}
+
+#[tokio::test]
+async fn attachment_download_limits_streamed_bytes_without_content_length() {
+    let limit = kite_core::attachments::MAX_DOWNLOAD as usize;
+    for size in [limit, limit + 1] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fake = Fake {
+            base: format!("http://{}", listener.local_addr().unwrap()),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = socket.read(&mut buffer).await.unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&buffer[..n]);
+            }
+            socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            let chunk = vec![42; 64 * 1024];
+            let mut remaining = size;
+            while remaining > 0 {
+                let n = remaining.min(chunk.len());
+                if socket
+                    .write_all(format!("{n:x}\r\n").as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(&chunk[..n]).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+                remaining -= n;
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        let result = graph(&fake).attachment("m1", "a1").await;
+        if size == limit {
+            let bytes = result.unwrap();
+            assert_eq!(bytes.len(), limit);
+            assert!(bytes.iter().all(|b| *b == 42));
+        } else {
+            let Err(error) = result else {
+                panic!("oversized response was accepted")
+            };
+            assert!(error.to_string().contains("50 MB"));
+        }
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn attachment_download_rejects_oversized_content_length() {
+    for status in [200, 500] {
+        let fake = Fake::start(move |_, _| {
+            Reply::raw(
+                status,
+                "application/octet-stream",
+                vec![0; kite_core::attachments::MAX_DOWNLOAD as usize + 1],
+            )
+        })
+        .await;
+        let result = graph(&fake).attachment("m", "a").await;
+        let Err(error) = result else {
+            panic!("oversized response was accepted");
+        };
+        assert!(error.to_string().contains("50 MB"), "{status}: {error}");
+    }
 }

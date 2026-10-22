@@ -68,7 +68,7 @@ impl SecretKey {
 
     fn decrypt_message(&self, message: Message<'_>) -> Result<Vec<u8>> {
         let message = message.decrypt(&self.passphrase(), &self.key)?;
-        plaintext(message)
+        plaintext(message, u64::MAX)
     }
 }
 
@@ -133,9 +133,13 @@ impl Keyring {
         for secret in self.all() {
             let result = Message::from_bytes(data)
                 .map_err(anyhow::Error::from)
-                .and_then(|message| secret.decrypt_message(message));
+                .and_then(|message| {
+                    message
+                        .decrypt(&secret.passphrase(), &secret.key)
+                        .map_err(anyhow::Error::from)
+                });
             match result {
-                Ok(plain) => return Ok(plain),
+                Ok(message) => return plaintext(message, crate::attachments::MAX_DOWNLOAD),
                 Err(error) => last = Some(error.context(format!("key {}", secret.id))),
             }
         }
@@ -307,14 +311,19 @@ pub fn session_key_packet(public_key: &SignedPublicKey, session_key: &str) -> Re
 
 /// Reads the whole plaintext out of a decrypted message, decompressing first when the
 /// sender wrapped it.
-fn plaintext(mut message: Message<'_>) -> Result<Vec<u8>> {
+fn plaintext(mut message: Message<'_>, limit: u64) -> Result<Vec<u8>> {
     if message.is_compressed() {
         message = message.decompress().context("decompress Proton message")?;
     }
     let mut out = Vec::new();
     message
+        .take(limit.saturating_add(1))
         .read_to_end(&mut out)
         .context("read Proton message")?;
+    anyhow::ensure!(
+        out.len() as u64 <= limit,
+        "Attachment is too large (limit: 50 MB)"
+    );
     Ok(out)
 }
 

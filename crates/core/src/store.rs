@@ -206,6 +206,14 @@ pub struct ReplyCtx {
     pub cc: Vec<Addr>,
 }
 
+pub struct AttachmentSource {
+    pub account_id: Id,
+    pub message: String,
+    pub attachment: String,
+    pub name: String,
+    pub size: i64,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -1601,14 +1609,22 @@ impl Store {
         Ok(out)
     }
 
-    pub fn attachment(&self, id: Id) -> Result<Option<(Id, String, String, String)>> {
+    pub fn attachment(&self, id: Id) -> Result<Option<AttachmentSource>> {
         Ok(self
             .conn
             .query_row(
-                "SELECT m.account_id, m.remote_id, a.remote_id, a.name
+                "SELECT m.account_id, m.remote_id, a.remote_id, a.name, a.size
                  FROM attachments a JOIN messages m ON m.id=a.message_id WHERE a.id=?1",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok(AttachmentSource {
+                        account_id: r.get(0)?,
+                        message: r.get(1)?,
+                        attachment: r.get(2)?,
+                        name: r.get(3)?,
+                        size: r.get(4)?,
+                    })
+                },
             )
             .optional()?)
     }

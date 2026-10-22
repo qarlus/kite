@@ -1761,7 +1761,14 @@ fn contacts_and_attachments_round_trip() {
     let tid = s.threads(&view(Mailbox::Inbox), 0, 5).unwrap()[0].id;
     let att = s.thread(tid).unwrap()[0].attachments[0].clone();
     assert_eq!(att.name, "report.pdf");
-    let (acct, remote_msg, remote_att, name) = s.attachment(att.id).unwrap().unwrap();
+    let kite_core::store::AttachmentSource {
+        account_id: acct,
+        message: remote_msg,
+        attachment: remote_att,
+        name,
+        size,
+    } = s.attachment(att.id).unwrap().unwrap();
+    assert_eq!(size, att.size as i64);
     assert_eq!(
         (
             acct,
