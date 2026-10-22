@@ -111,7 +111,12 @@ pub trait Mail: Send + Sync + 'static {
     fn contact(&self, _email: &str, _exclude: Option<Id>) -> Result<Option<ContactCard>> {
         Ok(None)
     }
+    /// Blocking: download and open a safe attachment on a background executor.
     fn open_attachment(&self, id: Id) -> Result<()>;
+    /// Download without launching the file, then select it in the OS file manager.
+    fn reveal_attachment(&self, _id: Id) -> Result<()> {
+        anyhow::bail!("Showing attachments in a folder is not available")
+    }
     /// One remote image for HTML mail, fetched only when the reader allowed remote images for
     /// that message. Blocking; call it on the background executor.
     fn fetch_image(&self, _url: &str) -> Result<Vec<u8>> {

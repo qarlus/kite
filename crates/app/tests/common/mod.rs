@@ -57,6 +57,7 @@ pub struct Fixture {
     pub proton_answers: Mutex<Vec<String>>,
     pub settings_path: Mutex<Option<std::path::PathBuf>>,
     pub attachments_opened: Mutex<Vec<Id>>,
+    pub attachments_revealed: Mutex<Vec<Id>>,
     /// URLs the UI asked the engine to fetch as remote images, in order.
     pub images_fetched: Mutex<Vec<String>>,
     pub refreshes: AtomicI64,
@@ -169,6 +170,7 @@ impl Fixture {
             proton_answers: Mutex::new(Vec::new()),
             settings_path: Mutex::new(None),
             attachments_opened: Mutex::new(Vec::new()),
+            attachments_revealed: Mutex::new(Vec::new()),
             images_fetched: Mutex::new(Vec::new()),
             image_bytes: Mutex::new(PNG.to_vec()),
             refreshes: AtomicI64::new(0),
@@ -306,6 +308,17 @@ impl Fixture {
     }
 
     /// Replaces the latest message's HTML body, so image handling can be exercised.
+    pub fn set_attachments(&self, thread: Id, attachments: Vec<Attachment>) {
+        self.messages
+            .lock()
+            .unwrap()
+            .get_mut(&thread)
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .attachments = attachments;
+    }
+
     pub fn set_message_html(&self, thread: Id, html: &str) {
         if let Some(message) = self
             .messages
@@ -1230,6 +1243,11 @@ impl Mail for Fixture {
             recent,
             files,
         }))
+    }
+
+    fn reveal_attachment(&self, id: Id) -> anyhow::Result<()> {
+        self.attachments_revealed.lock().unwrap().push(id);
+        Ok(())
     }
 
     fn open_attachment(&self, id: Id) -> anyhow::Result<()> {

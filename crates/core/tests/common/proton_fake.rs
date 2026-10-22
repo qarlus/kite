@@ -118,10 +118,21 @@ fn cached_key(id: &'static str) -> TestKey {
 /// Splits an encrypted message the way Proton stores attachments: the SEIPD data packet
 /// on one side, the PKESK that unlocks its session key on the other.
 fn encrypt_split(public: &SignedPublicKey, plaintext: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    encrypt_split_with(public, plaintext, false)
+}
+
+fn encrypt_split_with(
+    public: &SignedPublicKey,
+    plaintext: &[u8],
+    compressed: bool,
+) -> (Vec<u8>, Vec<u8>) {
     use pgp::packet::{PacketTrait as _, PublicKeyEncryptedSessionKey};
     let mut rng = rand::thread_rng();
-    let builder = MessageBuilder::from_bytes("", plaintext.to_vec())
+    let mut builder = MessageBuilder::from_bytes("", plaintext.to_vec())
         .seipd_v1(&mut rng, SymmetricKeyAlgorithm::AES256);
+    if compressed {
+        builder.compression(pgp::types::CompressionAlgorithm::ZIP);
+    }
     let session = pgp::composed::RawSessionKey::from(builder.session_key().as_ref().to_vec());
     let data = builder.to_vec(&mut rng).expect("encrypt data packet");
     let subkey = public
@@ -303,6 +314,7 @@ pub struct FakeAttachment {
     pub mime_type: String,
     pub data: Vec<u8>,
     pub key_packets: String,
+    pub declared_size: Option<usize>,
 }
 
 pub struct World {
@@ -409,11 +421,25 @@ impl World {
             mime_type: "application/octet-stream".into(),
             data: encrypted,
             key_packets: b64(&key_packets),
+            declared_size: None,
         };
         if let Some(message) = self.messages.iter_mut().find(|m| m.id == message_id) {
             message.attachments.push(attachment);
         }
         id
+    }
+
+    pub fn add_compressed_attachment(&mut self, message: &str, name: &str, bytes: &[u8]) {
+        let (data, key_packets) = encrypt_split_with(&self.public_key(), bytes, true);
+        let message = self.messages.iter_mut().find(|m| m.id == message).unwrap();
+        message.attachments.push(FakeAttachment {
+            id: format!("att-{name}"),
+            name: name.into(),
+            mime_type: "application/octet-stream".into(),
+            data,
+            key_packets: b64(&key_packets),
+            declared_size: Some(1),
+        });
     }
 
     /// Adds a message, encrypted to the account's address key like Proton does, and reports
@@ -666,8 +692,13 @@ async fn handle(mut sock: tokio::net::TcpStream, world: Arc<Mutex<World>>) {
     let retry = retry
         .map(|r| format!("Retry-After: {r}\r\n"))
         .unwrap_or_default();
+    let content_type = if request.path.starts_with("/api/mail/v4/attachments/") && status == 200 {
+        "application/octet-stream"
+    } else {
+        "application/json"
+    };
     let head = format!(
-        "HTTP/1.1 {status} X\r\nDate: {date}\r\n{retry}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} X\r\nDate: {date}\r\n{retry}Content-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         payload.len()
     );
     let _ = sock.write_all(head.as_bytes()).await;
@@ -1011,13 +1042,7 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                 .flat_map(|message| message.attachments.iter())
                 .find(|attachment| attachment.id == id);
             match found {
-                Some(attachment) => ok(json!({
-                    "Attachment": {
-                        "ID": attachment.id,
-                        "Data": b64(&attachment.data),
-                        "KeyPackets": attachment.key_packets,
-                    }
-                })),
+                Some(attachment) => (200, attachment.data.clone()),
                 None => error(404, 2001, "Attachment not found"),
             }
         }
@@ -1036,8 +1061,9 @@ fn route(world: &mut World, request: &Request) -> (u16, Vec<u8>) {
                             .map(|attachment| json!({
                                 "ID": attachment.id,
                                 "Name": attachment.name,
-                                "Size": attachment.data.len(),
+                                "Size": attachment.declared_size.unwrap_or(attachment.data.len()),
                                 "MIMEType": attachment.mime_type,
+                                "KeyPackets": attachment.key_packets,
                             }))
                             .collect::<Vec<_>>()
                     );

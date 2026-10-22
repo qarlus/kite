@@ -569,15 +569,30 @@ impl Proton {
 
     pub async fn attachment(
         &mut self,
-        _remote_msg_id: &str,
+        remote_msg_id: &str,
         remote_att_id: &str,
     ) -> Result<Vec<u8>> {
         self.load_keys().await?;
+        let message = self.api.message(remote_msg_id).await?;
+        let meta = message
+            .attachments
+            .iter()
+            .find(|a| a.id == remote_att_id)
+            .context("no such Proton attachment")?;
+        anyhow::ensure!(
+            meta.size <= crate::attachments::MAX_DOWNLOAD as i64,
+            "Attachment is too large (limit: 50 MB)"
+        );
         let data = self.api.attachment(remote_att_id).await?;
         let keys = self.keys.as_ref().context("Proton keys are not loaded")?;
-        let mut packets = crypto::unb64(&data.key_packets)?;
-        packets.extend(crypto::unb64(&data.data)?);
-        keys.decrypt_packets(&packets)
+        let mut packets = crypto::unb64(&meta.key_packets)?;
+        packets.extend(data);
+        let bytes = keys.decrypt_packets(&packets)?;
+        anyhow::ensure!(
+            bytes.len() as u64 <= crate::attachments::MAX_DOWNLOAD,
+            "Attachment is too large (limit: 50 MB)"
+        );
+        Ok(bytes)
     }
 
     /// Creates a Proton folder for `Mail::create_folder` and returns its label id.
@@ -1024,11 +1039,7 @@ fn remote_msg(keys: &Keyring, message: &api::Message) -> Result<(RemoteMsg, Opti
                 .iter()
                 .map(|attachment| RemoteAttachment {
                     remote_id: attachment.id.clone(),
-                    name: if attachment.name.is_empty() {
-                        "attachment".to_string()
-                    } else {
-                        attachment.name.clone()
-                    },
+                    name: crate::attachments::file_name(&attachment.name),
                     mime: if attachment.mime_type.is_empty() {
                         "application/octet-stream".to_string()
                     } else {

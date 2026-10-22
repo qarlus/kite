@@ -473,11 +473,14 @@ impl Graph {
             .auth_send(|http, token| http.get(&url).bearer_auth(token))
             .await?;
         let status = res.status();
+        let bytes = crate::attachments::download(res).await?;
         if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            bail!("attachment download failed ({status}): {}", clip(&text));
+            bail!(
+                "attachment download failed ({status}): {}",
+                clip(&String::from_utf8_lossy(&bytes))
+            );
         }
-        Ok(res.bytes().await?.to_vec())
+        Ok(bytes)
     }
 
     /// Events on the local day, expressed as a UTC instant range for `tz_offset_min`.
@@ -859,7 +862,7 @@ fn addrs(v: &Value) -> Vec<Addr> {
 fn remote_attachment(v: &Value) -> Option<RemoteAttachment> {
     Some(RemoteAttachment {
         remote_id: v["id"].as_str()?.to_string(),
-        name: v["name"].as_str().unwrap_or("attachment").to_string(),
+        name: crate::attachments::file_name(v["name"].as_str().unwrap_or("attachment")),
         mime: v["contentType"]
             .as_str()
             .unwrap_or("application/octet-stream")

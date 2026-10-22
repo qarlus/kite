@@ -9,11 +9,13 @@ use crate::list::when;
 use crate::theme::{MAX_COL, RADIUS, RADIUS_SM, Theme};
 use chrono::{DateTime, Local, TimeZone as _};
 use gpui_kit::assets::IconName;
+use gpui_kit::component::button::Button;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{Icon, Sizable};
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use kite_core::attachments;
 use kite_core::model::{Addr, Id, Message, PRIVATE_TAG};
 use std::ops::Range;
 use std::sync::Arc;
@@ -155,6 +157,26 @@ impl HtmlCache {
 }
 
 impl Kite {
+    fn attachment_action(&mut self, id: Id, reveal: bool, cx: &mut Context<Self>) {
+        let mail = self.mail.clone();
+        let task = cx.background_executor().spawn(async move {
+            if reveal {
+                mail.reveal_attachment(id)
+            } else {
+                mail.open_attachment(id)
+            }
+        });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                this.update(cx, |this, cx| {
+                    this.toast(format!("Attachment: {error}"), cx)
+                })
+                .ok();
+            }
+        })
+        .detach();
+    }
+
     /// The Blitz render width: the reading pane's column, edge to edge, so wide tables and long
     /// lines are never clipped.
     pub(crate) fn body_width(&self) -> f32 {
@@ -1072,10 +1094,14 @@ impl Kite {
             tail = tail.child(div().flex().flex_wrap().gap_2().children(
                 message.attachments.iter().map(|attachment| {
                     let id = attachment.id;
-                    div()
+                    let name = attachments::file_name(&attachment.name);
+                    let warning = attachments::warning(&name, &attachment.mime);
+                    let blocked = attachments::blocked(&name);
+                    let label = warning.clone();
+                    let chip = div()
                         .id(format!("attachment-{id}"))
                         .test_support()
-                        .aria_label(format!("{} ({} bytes)", attachment.name, attachment.size))
+                        .aria_label(format!("{} ({} bytes)", name, attachment.size))
                         .flex()
                         .items_center()
                         .gap_1p5()
@@ -1092,26 +1118,33 @@ impl Kite {
                                 .with_size(px(12.))
                                 .text_color(t.fg2),
                         )
-                        .child(attachment.name.clone())
+                        .when_some(warning, |d, warning| {
+                            d.child(div()
+                                .id(format!("attachment-warning-{id}"))
+                                .test_support()
+                                .aria_label(warning.clone())
+                                .child(Icon::new(IconName::ShieldAlert).with_size(px(12.)).text_color(t.danger))
+                                .tooltip(move |window, cx| Tooltip::new(warning.clone()).build(window, cx)))
+                        })
+                        .child(name)
                         .child(div().text_color(t.fg2).child(format_size(attachment.size)))
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let mail = this.mail.clone();
-                            let task = cx
-                                .background_executor()
-                                .spawn(async move { mail.open_attachment(id) });
-                            cx.spawn(async move |this, cx| {
-                                if let Err(error) = task.await {
-                                    this.update(cx, |this, cx| {
-                                        this.toast(
-                                            format!("Could not open attachment: {error}"),
-                                            cx,
-                                        )
-                                    })
-                                    .ok();
-                                }
-                            })
-                            .detach();
-                        }))
+                            if blocked {
+                                this.toast("This attachment can't be opened safely. Use Show in folder instead.", cx);
+                                return;
+                            }
+                            this.attachment_action(id, false, cx);
+                        }));
+                    div().flex().items_center().gap_1().child(chip)
+                        .when(blocked, |d| d.child(
+                            Button::new(format!("attachment-reveal-{id}"))
+                                .accessibility_label("Show in folder")
+                                .small()
+                                .icon(IconName::Folder)
+                                .tooltip(format!("Show in folder · {}", label.as_deref().unwrap_or_default()))
+                                .on_click(cx.listener(move |this, _, _, cx| this.attachment_action(id, true, cx)))
+                        ))
+
                 }),
             ));
         }

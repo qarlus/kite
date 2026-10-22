@@ -631,6 +631,14 @@ fn an_attachment_is_decrypted_through_the_backend() {
         &["0", "5"],
     );
     world.add_attachment(&id, "numbers.txt", b"42");
+    let raw_name = format!("{}\u{202e}\u{200f}\u{7}.txt", "n".repeat(160));
+    world
+        .messages
+        .iter_mut()
+        .find(|m| m.id == id)
+        .unwrap()
+        .attachments[0]
+        .name = raw_name;
     let server = rt.block_on(fake::serve(world));
     let login = server.login();
     rt.block_on(async {
@@ -660,6 +668,21 @@ fn an_attachment_is_decrypted_through_the_backend() {
             })
             .expect("the delta carries the attachment");
         assert_eq!(attachment, "att-numbers.txt");
+        let meta = deltas
+            .iter()
+            .find_map(|delta| match delta {
+                Delta::Upsert(m) => m.attachments.first(),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(meta.name.chars().count(), 120);
+        assert!(meta.name.ends_with(".txt"));
+        assert!(
+            !meta
+                .name
+                .chars()
+                .any(|c| c.is_control() || c == '\u{202e}' || c == '\u{200f}')
+        );
         let bytes = client
             .attachment(&message, &attachment)
             .await
@@ -1658,4 +1681,71 @@ fn proton_retains_unsubscribe_headers_and_scheduled_send_stays_local() {
         "Proton schedules must not send early"
     );
     assert!(engine.cancel_send(id).unwrap().is_some());
+}
+
+#[test]
+fn proton_attachment_download_rejects_oversized_raw_bodies() {
+    let rt = runtime();
+    let mut world = World::new();
+    let id = world.add_message(
+        "Large attachment",
+        ("Alice", "alice@proton.me"),
+        "body",
+        &["0"],
+    );
+    world.add_attachment(&id, "large.bin", b"42");
+    let limit = kite_core::attachments::MAX_DOWNLOAD as usize;
+    world
+        .messages
+        .iter_mut()
+        .find(|m| m.id == id)
+        .unwrap()
+        .attachments[0]
+        .data = vec![0; limit + 1];
+    world
+        .messages
+        .iter_mut()
+        .find(|m| m.id == id)
+        .unwrap()
+        .attachments[0]
+        .declared_size = Some(1);
+    world.add_compressed_attachment(&id, "expanded.bin", &vec![0; limit + 1]);
+    let server = rt.block_on(fake::serve(world));
+    let login = server.login();
+    rt.block_on(async {
+        use kite_core::sync::proton::{SignIn, Step};
+        let mut sign_in = SignIn::new(
+            &server.url,
+            "kite-test@0.1.0",
+            &login.email,
+            &login.password,
+        );
+        assert!(matches!(sign_in.start().await.unwrap(), Step::Done));
+        let signed = sign_in.take().unwrap();
+        let mut client = kite_core::sync::proton::Proton::new(
+            &server.url,
+            "kite-test@0.1.0",
+            &signed.email,
+            &signed.credentials,
+        );
+        let error = client.attachment(&id, "att-large.bin").await.unwrap_err();
+        assert!(
+            error.to_string().contains("50 MB"),
+            "oversized Proton response was not capped"
+        );
+        let error = client
+            .attachment(&id, "att-expanded.bin")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("50 MB"), "{error:#}");
+        server.world().faults.insert(
+            "/api/mail/v4/attachments/att-large.bin".into(),
+            (500, 2001, "x".repeat(limit + 1), None),
+        );
+        let error = client.attachment(&id, "att-large.bin").await.unwrap_err();
+        assert!(
+            error.to_string().contains("50 MB"),
+            "oversized Proton response was not capped"
+        );
+    });
 }

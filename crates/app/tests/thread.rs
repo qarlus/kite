@@ -503,3 +503,75 @@ async fn resizing_the_window_re_renders_a_body_at_its_new_width(cx: &mut TestApp
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn unsafe_attachments_warn_and_cannot_launch(cx: &mut TestAppContext) {
+    let fixture = Fixture::new(1);
+    fixture.set_attachments(
+        1,
+        vec![
+            kite_core::model::Attachment {
+                id: 701,
+                name: "invoice.exe".into(),
+                mime: "application/pdf".into(),
+                size: 12,
+            },
+            kite_core::model::Attachment {
+                id: 702,
+                name: "photo.pdf".into(),
+                mime: "image/png".into(),
+                size: 12,
+            },
+            kite_core::model::Attachment {
+                id: 703,
+                name: "report.pdf".into(),
+                mime: "application/pdf".into(),
+                size: 12,
+            },
+        ],
+    );
+    let (window, _) = mount(cx, fixture.clone());
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        assert!(
+            window
+                .find("attachment-warning-701")
+                .label()
+                .unwrap()
+                .contains(".exe")
+        );
+        assert!(
+            window
+                .find("attachment-warning-702")
+                .label()
+                .unwrap()
+                .contains(".pdf")
+        );
+        assert!(window.try_find("attachment-warning-703").is_none());
+        assert_eq!(
+            window.find("attachment-reveal-701").label(),
+            Some("Show in folder")
+        );
+        window.click("attachment-701", cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(window.into(), "enter");
+    cx.run_until_parked();
+    assert!(fixture.attachments_opened.lock().unwrap().is_empty());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("attachment-reveal-701", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fixture.attachments_revealed.lock().unwrap(), vec![701]);
+    assert!(fixture.attachments_opened.lock().unwrap().is_empty());
+    cx.update_window(window.into(), |_, window, cx| {
+        window.render_frame(cx);
+        window.click("attachment-703", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(*fixture.attachments_opened.lock().unwrap(), vec![703]);
+}
